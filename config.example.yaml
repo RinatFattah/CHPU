@@ -1,0 +1,27 @@
+# AI 3D Pipeline — пример конфигурации
+# Скопируйте в config.yaml и заполните своими значениями.
+# config.yaml добавлен в .gitignore — ключи туда не попадут.
+
+# ── OpenAI API ──────────────────────────────────────────────────────────────────
+OPENAI_API_KEY: "sk-..."
+# base_url для совместимых API (LM Studio, vLLM, Azure и др.)
+# OPENAI_BASE_URL: "http://localhost:1234/v1"
+OPENAI_MODEL: "gpt-4o"
+OPENAI_TEMPERATURE: 0.1
+OPENAI_MAX_TOKENS: 1500
+
+# ── Blender MCP ─────────────────────────────────────────────────────────────────
+BLENDER_HOST: "localhost"
+BLENDER_PORT: 9876
+
+# ── API Server ──────────────────────────────────────────────────────────────────
+SERVER_HOST: "0.0.0.0"
+SERVER_PORT: 8765
+OUTPUT_DIR: "~/details"
+
+# ── G-Code / параметры фрезерования ────────────────────────────────────────────
+TOOL_DIAMETER: 6.0
+FEED_RATE: 800
+SPINDLE_SPEED: 12000
+DEPTH_OF_CUT: 1.0
+SAFE_HEIGHT: 10.0

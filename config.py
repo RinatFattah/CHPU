@@ -4,20 +4,12 @@ config.py — Конфигурация AI 3D Pipeline
 Приоритет значений (от низшего к высшему):
   1. Дефолты в этом файле
   2. Переменные окружения (OPENAI_API_KEY, OPENAI_BASE_URL)
-  3. JSON-файл конфига, переданный через --config
+  3. YAML-файл конфига, переданный через --config
 
-Формат JSON-файла (все ключи необязательны):
-  {
-    "OPENAI_API_KEY": "sk-...",
-    "OPENAI_BASE_URL": "http://localhost:1234/v1",
-    "OPENAI_MODEL": "gpt-4o-mini",
-    "OUTPUT_DIR": "C:/Users/denis/details",
-    ...
-  }
+Формат YAML-файла (все ключи необязательны), см. config.example.yaml.
 """
 
 import os
-import json
 import sys
 
 # ── OpenAI API ──────────────────────────────────────────────────────────────────
@@ -48,10 +40,11 @@ SAFE_HEIGHT    = 10.0   # мм — безопасная высота при хо
 
 
 def load(path: str) -> None:
-    """Загружает конфиг из JSON-файла, переопределяя текущие значения."""
+    """Загружает конфиг из YAML-файла, переопределяя текущие значения."""
+    import yaml
     module = sys.modules[__name__]
     with open(path, encoding="utf-8") as f:
-        data = json.load(f)
+        data = yaml.safe_load(f) or {}
     unknown = []
     for key, value in data.items():
         if hasattr(module, key) and not key.startswith("_"):
