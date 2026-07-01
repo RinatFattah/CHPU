@@ -19,7 +19,10 @@ OPENAI_API_KEY  = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
 OPENAI_MODEL       = "gpt-4o"
 OPENAI_TEMPERATURE = 0.1
-OPENAI_MAX_TOKENS  = 1500
+# ВАЖНО: reasoning-модели (deepseek-reasoner, deepseek-v4-flash, o1 и т.п.) тратят
+# основную часть бюджета на внутренние рассуждения. При малом лимите на сам код
+# не остаётся токенов → пустой или обрезанный ответ. Держите запас.
+OPENAI_MAX_TOKENS  = 8000
 
 # ── Blender MCP ─────────────────────────────────────────────────────────────────
 BLENDER_HOST = "localhost"

@@ -27,7 +27,7 @@ if "--config" in sys.argv and "config_loaded" not in st.session_state:
         except Exception as e:
             st.error(f"Ошибка загрузки конфига {_path!r}: {e}")
 
-from server_3d import ask_llm, clean_code, run_in_blender, generate_gcode, read_stl_bounds
+from server_3d import generate_valid_code, run_in_blender, generate_gcode, read_stl_bounds
 
 # ── Страница ───────────────────────────────────────────────────────────────────
 
@@ -134,12 +134,11 @@ if run:
 
         st.write("⏳ Шаг 1/3 — LLM генерирует Blender-код...")
         try:
-            raw_code = ask_llm(description, stl_path)
-            generated_code = clean_code(raw_code)
+            generated_code = generate_valid_code(description, stl_path)
             st.write(f"✅ Код получен ({len(generated_code)} символов)")
         except Exception as e:
             status.update(label="Ошибка на шаге 1", state="error")
-            st.error(f"OpenAI: {e}")
+            st.error(f"Генерация кода: {e}")
             st.stop()
 
         st.write("⏳ Шаг 2/3 — Blender создаёт 3D-модель...")

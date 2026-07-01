@@ -41,9 +41,12 @@ def ask_llm(description: str, stl_path: str) -> str:
    - Цилиндр-резак должен быть ВЫШЕ и НИЖЕ пластины: depth = толщина+0.01
    - location=(x, y, 0) — по центру пластины по Z
    - Применить модификатор и удалить резак
-5. Экспорт в конце:
+5. Экспорт в конце (совместимо с Blender 3.x и 4.1+):
    bpy.ops.object.select_all(action='SELECT')
-   bpy.ops.export_mesh.stl(filepath="{stl_path}", use_selection=True)
+   try:
+       bpy.ops.wm.stl_export(filepath="{stl_path}", export_selected_objects=True)
+   except Exception:
+       bpy.ops.export_mesh.stl(filepath="{stl_path}", use_selection=True)
 
 Только чистый Python, без markdown, без объяснений.
 Начни с: import bpy
@@ -72,8 +75,12 @@ def ask_llm(description: str, stl_path: str) -> str:
 
 
 def clean_code(code: str) -> str:
-    code = re.sub(r"```python\s*", "", code)
-    code = re.sub(r"```\s*", "", code)
+    # Берём только тело код-блока ```...```, отбрасывая прозу до и после.
+    m = re.search(r"```(?:python)?\s*\n(.*?)```", code, re.DOTALL)
+    if m:
+        code = m.group(1)
+    else:
+        code = re.sub(r"```(?:python)?", "", code)
     return code.strip()
 
 

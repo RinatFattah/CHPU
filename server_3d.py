@@ -71,9 +71,12 @@ def build_blender_prompt(description: str, stl_path: str) -> str:
    bpy.ops.object.modifier_apply(modifier="hole")
    # Шаг D: удалить резак
    bpy.data.objects.remove(cutter, do_unlink=True)
-5. Экспорт:
+5. Экспорт (совместимо с Blender 3.x и 4.1+):
    bpy.ops.object.select_all(action="SELECT")
-   bpy.ops.export_mesh.stl(filepath="{stl_path}", use_selection=True)
+   try:
+       bpy.ops.wm.stl_export(filepath="{stl_path}", export_selected_objects=True)
+   except Exception:
+       bpy.ops.export_mesh.stl(filepath="{stl_path}", use_selection=True)
 
 Только чистый Python без markdown.
 Начни с: import bpy
@@ -101,9 +104,33 @@ def ask_llm(description: str, stl_path: str) -> str:
 
 
 def clean_code(code: str) -> str:
-    code = re.sub(r"```python\s*", "", code)
-    code = re.sub(r"```\s*", "", code)
+    # Если модель обернула код в ```...``` — берём ТОЛЬКО содержимое блока,
+    # отбрасывая любую прозу до и после (частая причина SyntaxError в Blender).
+    m = re.search(r"```(?:python)?\s*\n(.*?)```", code, re.DOTALL)
+    if m:
+        code = m.group(1)
+    else:
+        code = re.sub(r"```(?:python)?", "", code)
     return code.strip()
+
+
+def generate_valid_code(description: str, stl_path: str, attempts: int = 2) -> str:
+    """Генерирует Blender-код и проверяет его синтаксис перед отправкой в Blender.
+    При SyntaxError повторяет запрос (модель недетерминирована)."""
+    last_err = "неизвестная ошибка"
+    for _ in range(attempts):
+        code = clean_code(ask_llm(description, stl_path))
+        if not code.strip():
+            last_err = "пустой ответ модели (не хватило бюджета OPENAI_MAX_TOKENS?)"
+            continue
+        try:
+            compile(code, "<generated>", "exec")
+            return code
+        except SyntaxError as e:
+            last_err = f"синтаксическая ошибка, строка {e.lineno}: {e.msg}"
+    raise RuntimeError(
+        f"LLM не вернул корректный код после {attempts} попыток ({last_err})"
+    )
 
 
 def run_in_blender(code: str) -> dict:
@@ -227,12 +254,11 @@ def make_detail(req: DetailRequest):
 
     os.makedirs(config.OUTPUT_DIR, exist_ok=True)
 
-    # Шаг 1: LLM → код
+    # Шаг 1: LLM → код (с проверкой синтаксиса и повтором при ошибке)
     try:
-        raw_code = ask_llm(req.description, stl_path)
-        code     = clean_code(raw_code)
+        code = generate_valid_code(req.description, stl_path)
     except Exception as e:
-        raise HTTPException(500, f"Ошибка OpenAI: {e}")
+        raise HTTPException(500, f"Ошибка генерации кода: {e}")
 
     # Шаг 2: Blender → STL
     try:

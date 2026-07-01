@@ -43,8 +43,12 @@ def ask_llm(description: str, stl_path: str) -> str:
    obj = bpy.context.active_object
    obj.scale = (длина/2, ширина/2, толщина/2)
    bpy.ops.object.transform_apply(scale=True)
-6. В конце экспортируй:
-   bpy.ops.export_mesh.stl(filepath="{stl_path}")
+6. В конце экспортируй (совместимо с Blender 3.x и 4.1+):
+   bpy.ops.object.select_all(action="SELECT")
+   try:
+       bpy.ops.wm.stl_export(filepath="{stl_path}", export_selected_objects=True)
+   except Exception:
+       bpy.ops.export_mesh.stl(filepath="{stl_path}", use_selection=True)
 
 Только чистый Python код без markdown и объяснений.
 Импорты в начале: import bpy, import math
@@ -72,8 +76,12 @@ def ask_llm(description: str, stl_path: str) -> str:
 
 
 def clean_code(code: str) -> str:
-    code = re.sub(r"```python\s*", "", code)
-    code = re.sub(r"```\s*", "", code)
+    # Берём только тело код-блока ```...```, отбрасывая прозу до и после.
+    m = re.search(r"```(?:python)?\s*\n(.*?)```", code, re.DOTALL)
+    if m:
+        code = m.group(1)
+    else:
+        code = re.sub(r"```(?:python)?", "", code)
     return code.strip()
 
 

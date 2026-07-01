@@ -8,7 +8,9 @@ OPENAI_API_KEY: "sk-..."
 # OPENAI_BASE_URL: "http://localhost:1234/v1"
 OPENAI_MODEL: "gpt-4o"
 OPENAI_TEMPERATURE: 0.1
-OPENAI_MAX_TOKENS: 1500
+# Reasoning-моделям (deepseek-reasoner, deepseek-v4-flash, o1 и т.п.) нужен большой
+# запас: рассуждения съедают бюджет, и на код токенов может не остаться.
+OPENAI_MAX_TOKENS: 8000
 
 # ── Blender MCP ─────────────────────────────────────────────────────────────────
 BLENDER_HOST: "localhost"
