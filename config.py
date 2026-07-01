@@ -1,11 +1,24 @@
 """
 config.py — Конфигурация AI 3D Pipeline
 
-Чувствительные данные (API-ключ) передаются через переменные окружения.
-Всё остальное задаётся здесь и применяется во всех скриптах pipeline.
+Приоритет значений (от низшего к высшему):
+  1. Дефолты в этом файле
+  2. Переменные окружения (OPENAI_API_KEY, OPENAI_BASE_URL)
+  3. JSON-файл конфига, переданный через --config
+
+Формат JSON-файла (все ключи необязательны):
+  {
+    "OPENAI_API_KEY": "sk-...",
+    "OPENAI_BASE_URL": "http://localhost:1234/v1",
+    "OPENAI_MODEL": "gpt-4o-mini",
+    "OUTPUT_DIR": "C:/Users/denis/details",
+    ...
+  }
 """
 
 import os
+import json
+import sys
 
 # ── OpenAI API ──────────────────────────────────────────────────────────────────
 # Ключ берётся из переменной окружения: export OPENAI_API_KEY=sk-...
@@ -32,3 +45,18 @@ FEED_RATE      = 800    # мм/мин — рабочая подача
 SPINDLE_SPEED  = 12000  # об/мин — скорость шпинделя
 DEPTH_OF_CUT   = 1.0    # мм — глубина за один проход
 SAFE_HEIGHT    = 10.0   # мм — безопасная высота при холостых перемещениях
+
+
+def load(path: str) -> None:
+    """Загружает конфиг из JSON-файла, переопределяя текущие значения."""
+    module = sys.modules[__name__]
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    unknown = []
+    for key, value in data.items():
+        if hasattr(module, key) and not key.startswith("_"):
+            setattr(module, key, value)
+        else:
+            unknown.append(key)
+    if unknown:
+        print(f"[config] Неизвестные ключи (проигнорированы): {', '.join(unknown)}")

@@ -11,6 +11,7 @@ import json
 import struct
 import socket
 import datetime
+import argparse
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
@@ -20,12 +21,18 @@ import uvicorn
 
 import config
 
-os.makedirs(config.OUTPUT_DIR, exist_ok=True)
+# Клиент создаётся лениво — после того как config может быть переопределён через --config
+_client: OpenAI | None = None
 
-client = OpenAI(
-    api_key=config.OPENAI_API_KEY,
-    base_url=config.OPENAI_BASE_URL,
-)
+
+def get_client() -> OpenAI:
+    global _client
+    if _client is None:
+        _client = OpenAI(
+            api_key=config.OPENAI_API_KEY,
+            base_url=config.OPENAI_BASE_URL,
+        )
+    return _client
 
 app = FastAPI(title="3D Pipeline API", version="2.0")
 
@@ -75,7 +82,7 @@ def build_blender_prompt(description: str, stl_path: str) -> str:
 
 
 def ask_llm(description: str, stl_path: str) -> str:
-    response = client.chat.completions.create(
+    response = get_client().chat.completions.create(
         model=config.OPENAI_MODEL,
         temperature=config.OPENAI_TEMPERATURE,
         max_tokens=config.OPENAI_MAX_TOKENS,
@@ -218,6 +225,8 @@ def make_detail(req: DetailRequest):
     stl_path   = os.path.join(config.OUTPUT_DIR, f"{name}.stl")
     gcode_path = os.path.join(config.OUTPUT_DIR, f"{name}.gcode")
 
+    os.makedirs(config.OUTPUT_DIR, exist_ok=True)
+
     # Шаг 1: LLM → код
     try:
         raw_code = ask_llm(req.description, stl_path)
@@ -293,8 +302,22 @@ def list_details():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="3D Pipeline API Server")
+    parser.add_argument(
+        "--config", metavar="FILE",
+        help="Путь к JSON-файлу конфигурации (переопределяет дефолты и env-переменные)"
+    )
+    args = parser.parse_args()
+
+    if args.config:
+        config.load(args.config)
+        print(f"[config] Загружен файл: {args.config}")
+
     if not config.OPENAI_API_KEY:
-        print("⚠  OPENAI_API_KEY не задан — установите переменную окружения")
+        print("⚠  OPENAI_API_KEY не задан — укажите в конфиг-файле или переменной окружения")
+
+    os.makedirs(config.OUTPUT_DIR, exist_ok=True)
+
     print(f"🚀 3D Pipeline API Server")
     print(f"   Model:   {config.OPENAI_MODEL} @ {config.OPENAI_BASE_URL}")
     print(f"   Blender: {config.BLENDER_HOST}:{config.BLENDER_PORT}")
