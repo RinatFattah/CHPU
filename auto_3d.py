@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
 """
 auto_3d.py — Текст → 3D деталь → STL
-Использует Ollama (qwen3:14b) для генерации Blender Python кода.
+Использует OpenAI API для генерации Blender Python кода.
 Запуск: python3 auto_3d.py
 """
 
-import requests
 import socket
 import json
 import re
 import sys
+import os
+from openai import OpenAI
 
-# ── Настройки ─────────────────────────────────────────────────────────────────
-OLLAMA_URL   = "http://192.168.88.50:11435"
-OLLAMA_MODEL = "qwen2.5-coder:14b"
-BLENDER_HOST = "localhost"
-BLENDER_PORT = 9876
-DEFAULT_STL  = "/home/rb/detail.stl"
+import config
 
-# ── Ollama ────────────────────────────────────────────────────────────────────
-def ask_ollama(description: str, stl_path: str) -> str:
+client = OpenAI(
+    api_key=config.OPENAI_API_KEY,
+    base_url=config.OPENAI_BASE_URL,
+)
+
+DEFAULT_STL = os.path.join(os.path.expanduser("~"), "detail.stl")
+
+
+# ── LLM ───────────────────────────────────────────────────────────────────────
+def ask_llm(description: str, stl_path: str) -> str:
     prompt = f"""Напиши Python-скрипт для Blender (bpy) который создаёт 3D деталь.
 Задача: {description}
 
@@ -45,31 +49,31 @@ def ask_ollama(description: str, stl_path: str) -> str:
 Только чистый Python код без markdown и объяснений.
 Импорты в начале: import bpy, import math
 """
-
     try:
-        r = requests.post(
-            f"{OLLAMA_URL}/api/generate",
-            json={
-                "model": OLLAMA_MODEL,
-                "prompt": prompt,
-                "stream": False,
-                "options": {"temperature": 0.1, "num_predict": 1024},
-            },
-            timeout=300,
+        response = client.chat.completions.create(
+            model=config.OPENAI_MODEL,
+            temperature=config.OPENAI_TEMPERATURE,
+            max_tokens=config.OPENAI_MAX_TOKENS,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Ты эксперт по Blender Python API (bpy). "
+                        "Пиши только чистый Python-код без markdown и объяснений."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
         )
-        r.raise_for_status()
-        return r.json()["response"]
+        return response.choices[0].message.content
     except Exception as e:
-        print(f"❌ Ошибка Ollama: {e}")
+        print(f"❌ Ошибка OpenAI: {e}")
         sys.exit(1)
 
 
 def clean_code(code: str) -> str:
-    """Убираем markdown-обёртку если модель добавила."""
     code = re.sub(r"```python\s*", "", code)
     code = re.sub(r"```\s*", "", code)
-    # Убираем <think>...</think> (qwen3 thinking mode)
-    code = re.sub(r"<think>.*?</think>", "", code, flags=re.DOTALL)
     return code.strip()
 
 
@@ -78,10 +82,9 @@ def run_in_blender(code: str) -> dict:
     try:
         s = socket.socket()
         s.settimeout(60)
-        s.connect((BLENDER_HOST, BLENDER_PORT))
+        s.connect((config.BLENDER_HOST, config.BLENDER_PORT))
         cmd = json.dumps({"type": "execute_code", "params": {"code": code}})
         s.send(cmd.encode())
-        # Читаем ответ (может быть большим)
         chunks = []
         while True:
             try:
@@ -89,7 +92,6 @@ def run_in_blender(code: str) -> dict:
                 if not chunk:
                     break
                 chunks.append(chunk)
-                # Пробуем распарсить — если успешно, выходим
                 try:
                     json.loads(b"".join(chunks))
                     break
@@ -105,9 +107,13 @@ def run_in_blender(code: str) -> dict:
 
 # ── Главная программа ─────────────────────────────────────────────────────────
 def main():
+    if not config.OPENAI_API_KEY:
+        print("❌ OPENAI_API_KEY не задан — установите переменную окружения")
+        sys.exit(1)
+
     print("=" * 60)
     print("  AUTO 3D — Текст → Blender → STL")
-    print(f"  Модель: {OLLAMA_MODEL} @ {OLLAMA_URL}")
+    print(f"  Модель: {config.OPENAI_MODEL} @ {config.OPENAI_BASE_URL}")
     print("=" * 60)
 
     description = input("\n📝 Опишите деталь: ").strip()
@@ -118,8 +124,8 @@ def main():
     stl_input = input(f"📁 Путь для STL [{DEFAULT_STL}]: ").strip()
     stl_path  = stl_input if stl_input else DEFAULT_STL
 
-    print(f"\n⏳ Генерирую код через {OLLAMA_MODEL}...")
-    raw_code = ask_ollama(description, stl_path)
+    print(f"\n⏳ Генерирую код через {config.OPENAI_MODEL}...")
+    raw_code = ask_llm(description, stl_path)
     code     = clean_code(raw_code)
 
     print("\n─── Сгенерированный код ─────────────────────────────────")
@@ -136,9 +142,7 @@ def main():
 
     if result.get("status") == "success":
         print(f"\n✅ Готово! STL сохранён: {stl_path}")
-        # Показываем размер файла
         try:
-            import os
             size = os.path.getsize(stl_path)
             print(f"   Размер файла: {size:,} байт")
         except Exception:
