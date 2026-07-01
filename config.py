@@ -56,3 +56,6 @@ def load(path: str) -> None:
             unknown.append(key)
     if unknown:
         print(f"[config] Неизвестные ключи (проигнорированы): {', '.join(unknown)}")
+
+    # Раскрываем ~ в путях: значения из YAML не проходят через expanduser сами.
+    module.OUTPUT_DIR = os.path.expanduser(module.OUTPUT_DIR)
