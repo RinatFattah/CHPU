@@ -10,16 +10,24 @@ import json
 import re
 import sys
 import os
+import argparse
 from openai import OpenAI
 
 import config
 
-client = OpenAI(
-    api_key=config.OPENAI_API_KEY,
-    base_url=config.OPENAI_BASE_URL,
-)
+_client: OpenAI | None = None
 
 DEFAULT_STL = os.path.join(os.path.expanduser("~"), "detail.stl")
+
+
+def get_client() -> OpenAI:
+    global _client
+    if _client is None:
+        _client = OpenAI(
+            api_key=config.OPENAI_API_KEY,
+            base_url=config.OPENAI_BASE_URL,
+        )
+    return _client
 
 
 # ── LLM ───────────────────────────────────────────────────────────────────────
@@ -54,7 +62,7 @@ def ask_llm(description: str, stl_path: str) -> str:
 Импорты в начале: import bpy, import math
 """
     try:
-        response = client.chat.completions.create(
+        response = get_client().chat.completions.create(
             model=config.OPENAI_MODEL,
             temperature=config.OPENAI_TEMPERATURE,
             max_tokens=config.OPENAI_MAX_TOKENS,
@@ -162,4 +170,16 @@ def main():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Text to STL generator via Blender MCP")
+    parser.add_argument(
+        "--config",
+        metavar="FILE",
+        help="Путь к YAML-файлу конфигурации",
+    )
+    args = parser.parse_args()
+
+    if args.config:
+        config.load(args.config)
+        print(f"[config] Загружен файл: {args.config}")
+
     main()

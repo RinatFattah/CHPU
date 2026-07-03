@@ -8,6 +8,7 @@ import sys
 import os
 import subprocess
 import tempfile
+import argparse
 
 import config
 
@@ -179,4 +180,25 @@ def main():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="STL to G-Code converter")
+    parser.add_argument("stl_path", nargs="?", help="Путь к STL-файлу")
+    parser.add_argument("gcode_path", nargs="?", help="Путь к выходному G-Code файлу")
+    parser.add_argument(
+        "--config",
+        metavar="FILE",
+        help="Путь к YAML-файлу конфигурации",
+    )
+    args = parser.parse_args()
+
+    if args.config:
+        config.load(args.config)
+        print(f"[config] Загружен файл: {args.config}")
+
+    if args.stl_path:
+        sys.argv = [sys.argv[0], args.stl_path]
+        if args.gcode_path:
+            sys.argv.append(args.gcode_path)
+    else:
+        sys.argv = [sys.argv[0]]
+
     main()

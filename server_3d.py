@@ -331,7 +331,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="3D Pipeline API Server")
     parser.add_argument(
         "--config", metavar="FILE",
-        help="Путь к JSON-файлу конфигурации (переопределяет дефолты и env-переменные)"
+        help="Путь к YAML-файлу конфигурации (переопределяет дефолты и env-переменные)"
     )
     args = parser.parse_args()
 
