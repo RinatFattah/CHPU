@@ -1,42 +1,40 @@
 #!/usr/bin/env python3
 """
-server_3d.py — API сервер для 3D pipeline на WS-BLENDER
+server_3d.py — API сервер для 3D pipeline
 Принимает описание детали → возвращает STL + G-Code файлы
 Запуск: python3 server_3d.py
 """
 
 import os
 import re
-import sys
 import json
 import struct
 import socket
-import requests
 import datetime
+import argparse
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from openai import OpenAI
 import uvicorn
 
-# ── Настройки ──────────────────────────────────────────────────────────────────
-OLLAMA_URL    = "http://192.168.88.50:11435"
-OLLAMA_MODEL  = "qwen2.5-coder:14b"
-BLENDER_HOST  = "localhost"
-BLENDER_PORT  = 9876
-OUTPUT_DIR    = "/home/rb/details"
-SERVER_PORT   = 8765
+import config
 
-# Параметры фрезерования
-TOOL_DIAMETER  = 6.0
-FEED_RATE      = 800
-SPINDLE_SPEED  = 12000
-DEPTH_OF_CUT   = 1.0
-SAFE_HEIGHT    = 10.0
+# Клиент создаётся лениво — после того как config может быть переопределён через --config
+_client: OpenAI | None = None
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-app = FastAPI(title="3D Pipeline API", version="1.0")
+def get_client() -> OpenAI:
+    global _client
+    if _client is None:
+        _client = OpenAI(
+            api_key=config.OPENAI_API_KEY,
+            base_url=config.OPENAI_BASE_URL,
+        )
+    return _client
+
+app = FastAPI(title="3D Pipeline API", version="2.0")
 
 
 class DetailRequest(BaseModel):
@@ -46,8 +44,8 @@ class DetailRequest(BaseModel):
 
 # ── Вспомогательные функции ────────────────────────────────────────────────────
 
-def ask_ollama(description: str, stl_path: str) -> str:
-    prompt = f"""Напиши Python-скрипт для Blender (bpy) для создания 3D детали.
+def build_blender_prompt(description: str, stl_path: str) -> str:
+    return f"""Напиши Python-скрипт для Blender (bpy) для создания 3D детали.
 Задача: {description}
 
 ТОЧНЫЕ правила:
@@ -73,35 +71,72 @@ def ask_ollama(description: str, stl_path: str) -> str:
    bpy.ops.object.modifier_apply(modifier="hole")
    # Шаг D: удалить резак
    bpy.data.objects.remove(cutter, do_unlink=True)
-5. Экспорт:
+5. Экспорт (совместимо с Blender 3.x и 4.1+):
    bpy.ops.object.select_all(action="SELECT")
-   bpy.ops.export_mesh.stl(filepath="{stl_path}", use_selection=True)
+   try:
+       bpy.ops.wm.stl_export(filepath="{stl_path}", export_selected_objects=True)
+   except Exception:
+       bpy.ops.export_mesh.stl(filepath="{stl_path}", use_selection=True)
 
 Только чистый Python без markdown.
 Начни с: import bpy
          import math
 """
-    r = requests.post(
-        f"{OLLAMA_URL}/api/generate",
-        json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False,
-              "options": {"temperature": 0.1, "num_predict": 1500}},
-        timeout=300,
+
+
+def ask_llm(description: str, stl_path: str) -> str:
+    response = get_client().chat.completions.create(
+        model=config.OPENAI_MODEL,
+        temperature=config.OPENAI_TEMPERATURE,
+        max_tokens=config.OPENAI_MAX_TOKENS,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Ты эксперт по Blender Python API (bpy). "
+                    "Пиши только чистый Python-код без markdown и объяснений."
+                ),
+            },
+            {"role": "user", "content": build_blender_prompt(description, stl_path)},
+        ],
     )
-    r.raise_for_status()
-    return r.json()["response"]
+    return response.choices[0].message.content
 
 
 def clean_code(code: str) -> str:
-    code = re.sub(r"```python\s*", "", code)
-    code = re.sub(r"```\s*", "", code)
-    code = re.sub(r"<think>.*?</think>", "", code, flags=re.DOTALL)
+    # Если модель обернула код в ```...``` — берём ТОЛЬКО содержимое блока,
+    # отбрасывая любую прозу до и после (частая причина SyntaxError в Blender).
+    m = re.search(r"```(?:python)?\s*\n(.*?)```", code, re.DOTALL)
+    if m:
+        code = m.group(1)
+    else:
+        code = re.sub(r"```(?:python)?", "", code)
     return code.strip()
+
+
+def generate_valid_code(description: str, stl_path: str, attempts: int = 2) -> str:
+    """Генерирует Blender-код и проверяет его синтаксис перед отправкой в Blender.
+    При SyntaxError повторяет запрос (модель недетерминирована)."""
+    last_err = "неизвестная ошибка"
+    for _ in range(attempts):
+        code = clean_code(ask_llm(description, stl_path))
+        if not code.strip():
+            last_err = "пустой ответ модели (не хватило бюджета OPENAI_MAX_TOKENS?)"
+            continue
+        try:
+            compile(code, "<generated>", "exec")
+            return code
+        except SyntaxError as e:
+            last_err = f"синтаксическая ошибка, строка {e.lineno}: {e.msg}"
+    raise RuntimeError(
+        f"LLM не вернул корректный код после {attempts} попыток ({last_err})"
+    )
 
 
 def run_in_blender(code: str) -> dict:
     s = socket.socket()
     s.settimeout(60)
-    s.connect((BLENDER_HOST, BLENDER_PORT))
+    s.connect((config.BLENDER_HOST, config.BLENDER_PORT))
     cmd = json.dumps({"type": "execute_code", "params": {"code": code}})
     s.send(cmd.encode())
     chunks = []
@@ -147,11 +182,11 @@ def generate_gcode(stl_path: str, gcode_path: str) -> int:
     lines = [
         f"; G-Code: {os.path.basename(stl_path)}",
         f"; Деталь: {width:.1f} x {height:.1f} x {depth:.1f} мм",
-        f"; Фреза: d={TOOL_DIAMETER}мм, подача={FEED_RATE}мм/мин",
+        f"; Фреза: d={config.TOOL_DIAMETER}мм, подача={config.FEED_RATE}мм/мин",
         "",
         "G21 G90 G17 G94",
-        f"G0 Z{SAFE_HEIGHT:.1f}",
-        f"M3 S{SPINDLE_SPEED}",
+        f"G0 Z{config.SAFE_HEIGHT:.1f}",
+        f"M3 S{config.SPINDLE_SPEED}",
         "G4 P2",
         "",
         "; === Контурная обработка ===",
@@ -160,17 +195,17 @@ def generate_gcode(stl_path: str, gcode_path: str) -> int:
     z = 0.0
     pass_num = 0
     while z > -depth:
-        z = max(-depth, z - DEPTH_OF_CUT)
+        z = max(-depth, z - config.DEPTH_OF_CUT)
         pass_num += 1
         lines += [
             f"; Проход {pass_num} Z={z:.2f}",
             f"G0 X{xmin:.3f} Y{ymin:.3f}",
-            f"G1 Z{z:.3f} F{FEED_RATE//4}",
-            f"G1 X{xmax:.3f} Y{ymin:.3f} F{FEED_RATE}",
+            f"G1 Z{z:.3f} F{config.FEED_RATE//4}",
+            f"G1 X{xmax:.3f} Y{ymin:.3f} F{config.FEED_RATE}",
             f"G1 X{xmax:.3f} Y{ymax:.3f}",
             f"G1 X{xmin:.3f} Y{ymax:.3f}",
             f"G1 X{xmin:.3f} Y{ymin:.3f}",
-            f"G0 Z{SAFE_HEIGHT:.1f}",
+            f"G0 Z{config.SAFE_HEIGHT:.1f}",
         ]
 
     lines += ["M5", "G0 X0 Y0", "M30"]
@@ -185,28 +220,22 @@ def generate_gcode(stl_path: str, gcode_path: str) -> int:
 @app.get("/health")
 def health():
     """Проверка работоспособности сервера."""
-    # Проверяем Blender
     try:
         s = socket.socket()
         s.settimeout(3)
-        s.connect((BLENDER_HOST, BLENDER_PORT))
+        s.connect((config.BLENDER_HOST, config.BLENDER_PORT))
         s.close()
         blender_ok = True
     except Exception:
         blender_ok = False
 
-    # Проверяем Ollama
-    try:
-        r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=5)
-        ollama_ok = r.status_code == 200
-    except Exception:
-        ollama_ok = False
+    openai_ok = bool(config.OPENAI_API_KEY)
 
     return {
-        "status": "ok",
+        "status":  "ok",
         "blender": "✅" if blender_ok else "❌",
-        "ollama":  "✅" if ollama_ok  else "❌",
-        "model":   OLLAMA_MODEL,
+        "openai":  "✅" if openai_ok  else "❌ (OPENAI_API_KEY не задан)",
+        "model":   config.OPENAI_MODEL,
     }
 
 
@@ -216,20 +245,20 @@ def make_detail(req: DetailRequest):
     Создаёт 3D деталь по текстовому описанию.
     Возвращает пути к STL и G-Code файлам.
     """
-    # Генерируем имя файла
     ts   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     name = req.name or f"detail_{ts}"
     name = re.sub(r"[^a-zA-Z0-9_]", "_", name)
 
-    stl_path   = f"{OUTPUT_DIR}/{name}.stl"
-    gcode_path = f"{OUTPUT_DIR}/{name}.gcode"
+    stl_path   = os.path.join(config.OUTPUT_DIR, f"{name}.stl")
+    gcode_path = os.path.join(config.OUTPUT_DIR, f"{name}.gcode")
 
-    # Шаг 1: Ollama → код
+    os.makedirs(config.OUTPUT_DIR, exist_ok=True)
+
+    # Шаг 1: LLM → код (с проверкой синтаксиса и повтором при ошибке)
     try:
-        raw_code = ask_ollama(req.description, stl_path)
-        code     = clean_code(raw_code)
+        code = generate_valid_code(req.description, stl_path)
     except Exception as e:
-        raise HTTPException(500, f"Ошибка Ollama: {e}")
+        raise HTTPException(500, f"Ошибка генерации кода: {e}")
 
     # Шаг 2: Blender → STL
     try:
@@ -250,17 +279,14 @@ def make_detail(req: DetailRequest):
     except Exception as e:
         raise HTTPException(500, f"Ошибка G-Code: {e}")
 
-    stl_size   = os.path.getsize(stl_path)
-    gcode_size = os.path.getsize(gcode_path)
-
     return {
-        "status":     "ok",
-        "name":       name,
-        "stl_path":   stl_path,
-        "gcode_path": gcode_path,
-        "stl_size":   stl_size,
-        "gcode_lines": gcode_lines,
-        "gcode_size": gcode_size,
+        "status":           "ok",
+        "name":             name,
+        "stl_path":         stl_path,
+        "gcode_path":       gcode_path,
+        "stl_size":         os.path.getsize(stl_path),
+        "gcode_lines":      gcode_lines,
+        "gcode_size":       os.path.getsize(gcode_path),
         "blender_code_len": len(code),
     }
 
@@ -268,7 +294,7 @@ def make_detail(req: DetailRequest):
 @app.get("/file/stl/{name}")
 def get_stl(name: str):
     """Скачать STL файл."""
-    path = f"{OUTPUT_DIR}/{name}.stl"
+    path = os.path.join(config.OUTPUT_DIR, f"{name}.stl")
     if not os.path.exists(path):
         raise HTTPException(404, "STL не найден")
     return FileResponse(path, filename=f"{name}.stl",
@@ -278,7 +304,7 @@ def get_stl(name: str):
 @app.get("/file/gcode/{name}")
 def get_gcode(name: str):
     """Скачать G-Code файл."""
-    path = f"{OUTPUT_DIR}/{name}.gcode"
+    path = os.path.join(config.OUTPUT_DIR, f"{name}.gcode")
     if not os.path.exists(path):
         raise HTTPException(404, "G-Code не найден")
     return FileResponse(path, filename=f"{name}.gcode",
@@ -289,7 +315,7 @@ def get_gcode(name: str):
 def list_details():
     """Список всех созданных деталей."""
     files = []
-    for f in sorted(Path(OUTPUT_DIR).glob("*.stl")):
+    for f in sorted(Path(config.OUTPUT_DIR).glob("*.stl")):
         gcode = f.with_suffix(".gcode")
         files.append({
             "name":       f.stem,
@@ -302,10 +328,26 @@ def list_details():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="3D Pipeline API Server")
+    parser.add_argument(
+        "--config", metavar="FILE",
+        help="Путь к YAML-файлу конфигурации (переопределяет дефолты и env-переменные)"
+    )
+    args = parser.parse_args()
+
+    if args.config:
+        config.load(args.config)
+        print(f"[config] Загружен файл: {args.config}")
+
+    if not config.OPENAI_API_KEY:
+        print("⚠  OPENAI_API_KEY не задан — укажите в конфиг-файле или переменной окружения")
+
+    os.makedirs(config.OUTPUT_DIR, exist_ok=True)
+
     print(f"🚀 3D Pipeline API Server")
-    print(f"   Ollama:  {OLLAMA_URL} ({OLLAMA_MODEL})")
-    print(f"   Blender: {BLENDER_HOST}:{BLENDER_PORT}")
-    print(f"   Output:  {OUTPUT_DIR}")
-    print(f"   API:     http://192.168.88.18:{SERVER_PORT}")
-    print(f"   Docs:    http://192.168.88.18:{SERVER_PORT}/docs")
-    uvicorn.run(app, host="0.0.0.0", port=SERVER_PORT)
+    print(f"   Model:   {config.OPENAI_MODEL} @ {config.OPENAI_BASE_URL}")
+    print(f"   Blender: {config.BLENDER_HOST}:{config.BLENDER_PORT}")
+    print(f"   Output:  {config.OUTPUT_DIR}")
+    print(f"   API:     http://{config.SERVER_HOST}:{config.SERVER_PORT}")
+    print(f"   Docs:    http://localhost:{config.SERVER_PORT}/docs")
+    uvicorn.run(app, host=config.SERVER_HOST, port=config.SERVER_PORT)

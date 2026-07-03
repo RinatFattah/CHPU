@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Виртуальные окружения
+venv/
+.venv/
+env/
+.env/
+
+# Конфиг с секретами (шаблон — config.example.yaml — коммитится)
+config.yaml
+config.local.yaml
+*.local.yaml
+
+# Переменные окружения
+.env
+.env.*
+
+# Выходные файлы pipeline
+*.stl
+*.gcode
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
