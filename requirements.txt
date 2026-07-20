@@ -1,16 +1,6 @@
-# AI 3D Pipeline — зависимости Python
+# CAM: CAD-модель → G-Code — зависимости Python
 # Установка: pip install -r requirements.txt
-
-# API-сервер
-fastapi>=0.100.0
-uvicorn[standard]>=0.23.0
-pydantic>=2.0.0
-
-# OpenAI-совместимый клиент (работает с OpenAI, DeepSeek, LM Studio и др.)
-openai>=1.0.0
+# FreeCAD ставится отдельно (AppImage), см. README.md
 
 # YAML-конфиг
 pyyaml>=6.0
-
-# Streamlit UI (опционально — нужен только для app_streamlit.py)
-streamlit>=1.35.0

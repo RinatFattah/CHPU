@@ -1,319 +1,98 @@
-# AI 3D Pipeline
+# CAM: CAD-модель → G-Code (FreeCAD)
 
-Пайплайн для генерации простой 3D-детали по текстовому описанию:
+Генерация управляющей программы (G-Code) для 3-осевого фрезерного станка с ЧПУ
+**по готовой CAD-модели детали**. Траектория на вход не подаётся — она строится
+по модели. Стратегия — **3D-обработка по поверхности**: фреза следует за фактической
+геометрией (наклоны, конусы, купола, рельеф).
 
-`текст -> Blender Python -> Blender MCP -> STL -> G-Code`
+```
+деталь.prt (Siemens NX)
+   │  экспорт из NX: File → Export → STEP (AP214/AP242)
+   ▼
+деталь.step ──► python run_cam.py деталь.step ──► деталь.gcode
+                     (FreeCAD Path/CAM, headless)
+```
 
-Репозиторий собран как рабочий стенд для быстрого прототипирования деталей под фрезерование. Основная идея: LLM генерирует `bpy`-скрипт, Blender строит STL, после чего пайплайн формирует базовый G-Code.
-
-## Что внутри
-
-- `server_3d.py` - FastAPI API-сервер (`/health`, `/make`, `/list`, скачивание STL/G-Code)
-- `app_streamlit.py` - Streamlit UI для ручной работы через браузер
-- `auto_3d.py` - интерактивный CLI: текст -> STL
-- `pipeline_3d.py` - интерактивный CLI: текст -> STL -> G-Code
-- `stl_to_gcode.py` - standalone-конвертер STL -> G-Code
-- `config.py` - дефолтные настройки и загрузка YAML-конфига
-- `config.example.yaml` - шаблон локального конфига
-- `AI_3D_Pipeline_Standup_Guide.docx` - исходная развёрнутая документация
-
-## Архитектура
-
-1. Пользователь задаёт описание детали.
-2. Скрипт отправляет prompt в OpenAI API или совместимый endpoint.
-3. LLM возвращает Python-код для Blender (`bpy`).
-4. Код выполняется в Blender через `blender-mcp` по сокету (`host:port` из конфига).
-5. Blender экспортирует STL.
-6. Пайплайн читает геометрию STL и строит простой контурный G-Code по габаритам модели.
-
-Важно: G-Code здесь не является полноценным CAM-процессингом. Это базовая генерация по bounding box модели, подходящая для демонстрации и простых сценариев, но не для сложной производственной обработки без дополнительной проверки.
+Siemens NX `.prt` — закрытый формат, FreeCAD его не читает; мост — экспорт STEP из NX
+(одна операция, геометрия без потерь).
 
 ## Требования
 
-- Python 3.10+
-- Blender 3.x или 4.x
-- blender-mcp аддон (установка описана ниже)
-- OpenAI API key или совместимый API-ключ (`OPENAI_BASE_URL`)
-- для веб-интерфейса: Streamlit (входит в `requirements.txt`)
-- для `stl_to_gcode.py`: FreeCAD не обязателен, есть fallback на простой генератор
+- Python 3.10+ и `pyyaml` (`pip install -r requirements.txt`)
+- **FreeCAD 1.0+** — CAM-движок (установка ниже)
 
-## Установка
+## Установка FreeCAD (AppImage, без root)
 
-```bash
-python -m venv .venv
-. .venv/Scripts/activate   # Windows
-# source .venv/bin/activate  # Linux / macOS
-pip install -r requirements.txt
-```
-
-Создайте локальный конфиг:
+FreeCAD **отсутствует в репозиториях Ubuntu 24.04**, а snap-версия ломается в headless
+из-за рассинхрона Qt. Рабочий способ — официальный AppImage:
 
 ```bash
-copy config.example.yaml config.yaml   # Windows
-# cp config.example.yaml config.yaml   # Linux / macOS
+mkdir -p ~/freecad-appimage && cd ~/freecad-appimage
+# взять свежий Linux-x86_64 AppImage со страницы https://github.com/FreeCAD/FreeCAD/releases
+wget https://github.com/FreeCAD/FreeCAD/releases/download/1.1.1/FreeCAD_1.1.1-Linux-x86_64-py311.AppImage
+chmod +x FreeCAD_*.AppImage
+./FreeCAD_*.AppImage --appimage-extract     # распаковка в squashfs-root/
 ```
 
-Заполните минимум в `config.yaml`:
-
-- `OPENAI_API_KEY` — ключ от API (см. раздел ниже)
-- `OPENAI_BASE_URL` — URL endpoint (см. раздел ниже)
-- `OPENAI_MODEL` — имя модели
-- `OUTPUT_DIR` — папка для STL и G-Code файлов
-
-`config.yaml` уже исключён из git и предназначен для локальных секретов.
-
-## Настройка Blender MCP
-
-Blender MCP — это аддон для Blender, который открывает JSON-сокет (по умолчанию на порту 9876) и принимает Python-код для выполнения внутри Blender. Пайплайн общается с ним напрямую через этот сокет.
-
-### Шаги установки
-
-1. **Скачать аддон** — `blender-mcp` лежит на GitHub: <https://github.com/ahujasid/blender-mcp>
-   Нужен файл `addon.py` из репозитория (или zip).
-
-2. **Установить в Blender**:
-   - Открыть Blender → `Edit` → `Preferences` → `Add-ons` → `Install`
-   - Указать скачанный `addon.py`
-   - Поставить галочку напротив аддона `Blender MCP`
-
-3. **Запустить сервер** — в боковой панели Blender (клавиша `N`) появится вкладка `MCP`:
-   - Нажать `Start MCP Server`
-   - В консоли Blender увидите `MCP Server started on port 9876`
-
-4. **Оставить Blender открытым** — пока сервер работает, Blender должен быть запущен. Его окно можно свернуть, но не закрывать.
-
-### Проверка
-
-После запуска сервера проверьте подключение:
-
-```bash
-python -c "import socket,json; s=socket.socket(); s.connect(('localhost',9876)); print('OK')"
-```
-
-Или через `/health` endpoint после запуска `server_3d.py`.
-
-### Настройка порта
-
-По умолчанию — `9876`. Если порт занят, измените в настройках аддона и синхронизируйте с конфигом:
-
-```yaml
-BLENDER_HOST: "localhost"
-BLENDER_PORT: 9876
-```
-
-## OpenAI-совместимый API
-
-Пайплайн не привязан к конкретному провайдеру — он использует стандартный OpenAI Chat Completions API. Любой endpoint, совместимый с форматом OpenAI, подойдёт: сам OpenAI, DeepSeek, LM Studio, vLLM, Azure OpenAI и другие.
-
-### Конфигурация
-
-```yaml
-OPENAI_API_KEY: "sk-..."        # ключ от выбранного провайдера
-OPENAI_BASE_URL: "https://api.openai.com/v1"  # или другой endpoint
-OPENAI_MODEL: "gpt-4o"          # имя модели согласно API провайдера
-```
-
-### Примеры провайдеров
-
-| Провайдер | `OPENAI_BASE_URL` | Примечание |
-|---|---|---|
-| OpenAI | `https://api.openai.com/v1` | дефолт, модели `gpt-4o`, `gpt-4.1` и др. |
-| DeepSeek | `https://api.deepseek.com/v1` | модели `deepseek-chat`, `deepseek-v4-flash` |
-| LM Studio (локально) | `http://localhost:1234/v1` | любой ключ подойдёт (`lm-studio`) |
-| vLLM (локально) | `http://localhost:8000/v1` | имя модели из конфига vLLM |
-
-### Reasoning-модели и OPENAI_MAX_TOKENS
-
-Некоторые модели (DeepSeek R1, deepseek-v4-flash, OpenAI o1/o3) перед ответом генерируют внутренние рассуждения (`reasoning_content`). Эти рассуждения тратят токены из лимита `max_tokens`, и при малом значении на сам код токенов не остаётся — пайплайн получает пустой или обрезанный ответ.
-
-**Важно:** для reasoning-моделей установите `OPENAI_MAX_TOKENS: 8000` или выше. Значение по умолчанию в `config.py` уже выставлено в 8000 с учётом этого.
-
-```yaml
-OPENAI_MAX_TOKENS: 8000   # reasoning-модели без этого возвращают пустой ответ
-```
-
-## Конфигурация
-
-Приоритет значений:
-
-1. дефолты в `config.py`
-2. переменные окружения
-3. YAML-файл, переданный через `--config`
-
-Поддерживаются ключи:
-
-| Ключ | По умолчанию | Описание |
-|---|---|---|
-| `OPENAI_API_KEY` | `""` | API-ключ (лучше через env) |
-| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | endpoint |
-| `OPENAI_MODEL` | `gpt-4o` | имя модели |
-| `OPENAI_TEMPERATURE` | `0.1` | температура генерации |
-| `OPENAI_MAX_TOKENS` | `8000` | лимит токенов (не занижать для reasoning-моделей) |
-| `BLENDER_HOST` | `localhost` | хост Blender MCP |
-| `BLENDER_PORT` | `9876` | порт Blender MCP |
-| `SERVER_HOST` | `0.0.0.0` | хост FastAPI сервера |
-| `SERVER_PORT` | `8765` | порт FastAPI сервера |
-| `OUTPUT_DIR` | `~/details` | папка для STL и G-Code |
-| `TOOL_DIAMETER` | `6.0` | диаметр фрезы, мм |
-| `FEED_RATE` | `800` | рабочая подача, мм/мин |
-| `SPINDLE_SPEED` | `12000` | скорость шпинделя, об/мин |
-| `DEPTH_OF_CUT` | `1.0` | глубина за проход, мм |
-| `SAFE_HEIGHT` | `10.0` | безопасная высота, мм |
-
-`OUTPUT_DIR` поддерживает `~` и разворачивается в домашнюю директорию при загрузке конфига.
-
-## Быстрый старт
-
-### 1. Поднять Blender MCP
-
-Открыть Blender с установленным аддоном, нажать `Start MCP Server` в боковой панели. Blender должен остаться открытым.
-
-### 2. Запустить API
-
-```bash
-python server_3d.py --config config.yaml
-```
+`freecadcmd` окажется в `~/freecad-appimage/squashfs-root/usr/bin/freecadcmd` — этот
+путь ищется автоматически. Другое расположение — укажите в конфиге: `FREECAD_CMD: "/путь"`.
 
 Проверка:
 
 ```bash
-curl http://localhost:8765/health
+python -c "import freecad_cam; print(freecad_cam.find_freecadcmd())"
 ```
 
-Swagger:
-
-- `http://localhost:8765/docs`
-
-### 3. Сделать первую генерацию
+## Быстрый старт
 
 ```bash
-curl -X POST http://localhost:8765/make ^
-  -H "Content-Type: application/json" ^
-  -d "{\"description\":\"Пластина 100x50x5 мм с 4 отверстиями d6 мм по углам\",\"name\":\"plate_demo\"}"
+cp config.example.yaml config.yaml   # и подставить свою фрезу/подачу/стойку
+
+python run_cam.py деталь.step --config config.yaml
+# → деталь.gcode рядом с моделью
 ```
 
-### 4. Скачать результаты
+Флаги CLI: `--config FILE`, `--origin corner-top|center-top|model` (ноль программы),
+для мешей — `--mm` / `--meters` / `--scale N`.
 
-- `GET /file/stl/{name}`
-- `GET /file/gcode/{name}`
-- `GET /list`
+## Параметры
 
-## Другие способы запуска
+Все параметры генерации (инструмент, режимы резания, стратегия, ноль программы,
+постпроцессор) задаются в `config.yaml`. **Полный справочник с рекомендациями —
+[README_CAM.md](README_CAM.md).** Минимум, который нужно выставить под свой станок:
 
-### Streamlit UI
-
-```bash
-streamlit run app_streamlit.py -- --config config.yaml
+```yaml
+TOOL_DIAMETER: 6.0        # фреза, которая реально стоит в шпинделе
+FEED_RATE: 800            # подача под материал
+SPINDLE_SPEED: 12000
+POSTPROCESSOR: "grbl"     # диалект стойки: grbl / linuxcnc / fanuc / mach3_mach4 …
 ```
 
-Если путь к конфигу содержит пробелы или кириллицу — обязательно в кавычках:
+## Как это устроено
 
-```bash
-streamlit run app_streamlit.py -- --config "C:\Users\user\Documents\config.yaml"
-```
+| Файл | Роль |
+|---|---|
+| `run_cam.py` | CLI: модель → G-Code |
+| `freecad_cam.py` | хост: находит `freecadcmd`, передаёт параметры, разбирает результат |
+| `freecad_worker.py` | исполняется внутри FreeCAD: модель → тело → Path Job → Surface → постпроцессор |
+| `config.py` | дефолты параметров + загрузка YAML |
 
-Что умеет:
+FreeCAD работает **отдельным headless-процессом** — его Qt/OpenCASCADE не грузятся
+в основной Python. Ноль программы по умолчанию: X0 Y0 = угол габарита детали,
+Z0 = её верхняя плоскость (`ORIGIN: corner-top`).
 
-- загрузка YAML-конфига из UI
-- проверка доступности Blender и OpenAI
-- запуск генерации
-- скачивание STL и G-Code
-- просмотр последних сгенерированных деталей
+## Проверка перед станком
 
-### CLI: текст -> STL
+1. Прогнать G-Code в симуляторе: [CAMotics](https://camotics.org) или
+   [ncviewer.com](https://ncviewer.com) — траектория, глубины, зарезы.
+2. Сверить `POSTPROCESSOR` с контроллером станка.
+3. Выставить ноль на станке по соглашению `ORIGIN` (угол детали, Z0 = верх).
+4. Контроля столкновений нет — пробный проход над заготовкой обязателен.
 
-```bash
-python auto_3d.py --config config.yaml
-```
+## Ограничения
 
-### CLI: текст -> STL -> G-Code
-
-```bash
-python pipeline_3d.py --config config.yaml
-```
-
-### CLI: готовый STL -> G-Code
-
-```bash
-python stl_to_gcode.py part.stl part.gcode --config config.yaml
-```
-
-## API
-
-### `GET /health`
-
-Проверяет:
-
-- доступность Blender MCP
-- наличие `OPENAI_API_KEY`
-- текущую модель
-
-### `POST /make`
-
-Тело запроса:
-
-```json
-{
-  "description": "Пластина 100x50x5 мм с 4 отверстиями d6 мм по углам",
-  "name": "plate_demo"
-}
-```
-
-Ответ содержит:
-
-- имя детали
-- путь к STL
-- путь к G-Code
-- размер STL
-- размер G-Code
-- число строк G-Code
-- длину сгенерированного Blender-кода
-
-### `GET /file/stl/{name}`
-
-Скачивание STL.
-
-### `GET /file/gcode/{name}`
-
-Скачивание G-Code.
-
-### `GET /list`
-
-Список ранее созданных деталей из `OUTPUT_DIR`.
-
-## Известные грабли
-
-| Проблема | Причина | Решение |
-|---|---|---|
-| Пустой ответ модели, ошибка «шаг 2» | Reasoning-модель потратила все токены на рассуждения | Поднять `OPENAI_MAX_TOKENS` до 8000+ |
-| `bpy.ops.export_mesh.stl` не найден | Оператор удалён в Blender 4.1+ | Prompt уже содержит fallback на `wm.stl_export` |
-| `~/details` не создаётся | `~` не разворачивается без `os.path.expanduser` | Исправлено в `config.load()`, не трогать |
-| Кириллица в пути к конфигу «съедает» слеши | Shell интерпретирует `\` как escape без кавычек | Всегда заключать путь в кавычки |
-| Streamlit: конфиг не загружается | Аргументы до `--` уходят в Streamlit, не в скрипт | Разделитель `--` перед `--config` обязателен |
-
-## Рекомендуемый сценарий handoff коллеге
-
-1. Установить Python-зависимости (`pip install -r requirements.txt`).
-2. Установить Blender и аддон blender-mcp (см. раздел выше).
-3. Скопировать `config.example.yaml` в `config.yaml`.
-4. Прописать ключ OpenAI (или DeepSeek), `OPENAI_BASE_URL`, `OPENAI_MODEL` и `OUTPUT_DIR`.
-5. Запустить Blender и стартовать MCP-сервер.
-6. Запустить `python server_3d.py --config config.yaml`.
-7. Проверить `GET /health` — должно быть `"blender": "✅"` и `"openai": "✅"`.
-8. Сгенерировать тестовую деталь через `/make` или Streamlit.
-9. Проверить STL и G-Code в `OUTPUT_DIR`.
-
-## Ограничения и риски
-
-- Качество результата сильно зависит от prompt и выбранной модели.
-- Генерация Blender-кода ограничена инструкциями в prompt, а не строгой схемой.
-- G-Code строится по габаритам STL и не учитывает сложную геометрию, стратегии обработки, крепёж, врезание и реальные CAM-ограничения.
-- Автотестов в репозитории пока нет; базовая верификация сейчас сводится к `compileall` и ручному запуску entrypoint-ов.
-- В `stl_to_gcode.py` ветка с FreeCAD обозначена как задел, но на практике чаще используется fallback-генератор.
-
-## Что стоит улучшить дальше
-
-- добавить smoke-тесты для API и CLI
-- вынести повторяющуюся pipeline-логику в общий модуль
-- отделить demo G-Code generator от полноценного CAM-контура
-- формализовать контракт Blender MCP и ожидаемый формат ответа
+- 3 оси, обработка сверху: поднутрения, обратная сторона, боковые элементы — недоступны.
+- Один инструмент на программу; черновая и чистовая не разделяются.
+- Оснастка (прижимы) не моделируется; заготовка = габарит модели.
+- Это автоматический генератор для типовых деталей, а не замена профессиональной
+  CAM-системы (NX, T-FLEX): многоось, стратегии, контроль столкновений — там.
