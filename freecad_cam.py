@@ -91,16 +91,19 @@ def generate_gcode_freecad(model_path: str, gcode_path: str) -> int:
         params_path = tmp.name
 
     # freecadcmd не исполняет скрипт по пути с не-ASCII символами (Windows: узкие
-    # char* в OCCT/Qt → "Unknown exception while processing file"). Репозиторий может
-    # лежать под кириллическим путём (…/Работа/…) — запускаем worker из временной
-    # ASCII-копии в %TEMP%.
-    fd, worker_path = tempfile.mkstemp(suffix="_worker.py")
-    os.close(fd)
-    shutil.copyfile(_WORKER, worker_path)
+    # char* в OCCT/Qt → "Unknown exception while processing file"). Если путь к
+    # worker'у ASCII (Linux, обычные пути) — запускаем его НАПРЯМУЮ, как раньше;
+    # временную ASCII-копию в %TEMP% делаем только когда путь не-ASCII (…/Работа/…).
+    worker_arg, worker_tmp = _WORKER, None
+    if not _WORKER.isascii():
+        fd, worker_tmp = tempfile.mkstemp(suffix="_worker.py")
+        os.close(fd)
+        shutil.copyfile(_WORKER, worker_tmp)
+        worker_arg = worker_tmp
 
     try:
         proc = subprocess.Popen(
-            [fc, worker_path],
+            [fc, worker_arg],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             # Windows: C++-слой FreeCAD (OCCT/Qt) пишет в консольной кодировке (не UTF-8);
             # errors="replace", чтобы поток чтения не падал на чужих байтах и не терял
@@ -121,7 +124,9 @@ def generate_gcode_freecad(model_path: str, gcode_path: str) -> int:
         proc._pump_thread.join(timeout=5)   # дочитать хвост вывода
         print(flush=True)                   # закрыть строку прогресса
     finally:
-        for _tmp in (params_path, worker_path):
+        for _tmp in (params_path, worker_tmp):
+            if not _tmp:                 # worker_tmp = None, если ASCII-копию не делали
+                continue
             try:
                 os.unlink(_tmp)
             except OSError:

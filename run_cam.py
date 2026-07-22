@@ -21,12 +21,14 @@ import config
 import freecad_cam
 
 # Windows: stdout по умолчанию cp1251 — печать Ø/кириллицы иначе падает с
-# UnicodeEncodeError. Переключаем консоль на UTF-8 (на Linux уже UTF-8 — no-op).
+# UnicodeEncodeError. Переключаем на UTF-8 ТОЛЬКО когда консоль не UTF-8; где stdout
+# уже UTF-8 (Linux/macOS), ничего не трогаем — поведение старого кода сохраняется.
 for _stream in (sys.stdout, sys.stderr):
-    try:
-        _stream.reconfigure(encoding="utf-8", errors="replace")
-    except (AttributeError, ValueError):
-        pass
+    if (getattr(_stream, "encoding", "") or "").lower().replace("-", "") != "utf8":
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
 
 SOLID_EXTS = {".step", ".stp", ".iges", ".igs", ".brep", ".brp"}
 

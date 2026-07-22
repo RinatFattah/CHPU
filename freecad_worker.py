@@ -29,13 +29,14 @@ import Mesh
 
 # FreeCAD форсирует stdout в кодировку консоли (на Windows-RU это cp1251), игнорируя
 # PYTHONUTF8. Символ Ø и прочие не-cp1251 знаки в log() иначе роняют worker с
-# UnicodeEncodeError. Переключаем на UTF-8 (хост читает пайп как UTF-8).
-# На Linux stdout уже UTF-8 — по сути no-op.
+# UnicodeEncodeError. Переключаем на UTF-8 ТОЛЬКО когда stdout не UTF-8; где он уже
+# UTF-8 (Linux), ничего не трогаем — старое поведение сохраняется.
 for _stream in (sys.stdout, sys.stderr):
-    try:
-        _stream.reconfigure(encoding="utf-8", errors="replace")
-    except (AttributeError, ValueError):
-        pass
+    if (getattr(_stream, "encoding", "") or "").lower().replace("-", "") != "utf8":
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
 
 SOLID_EXTS = {".step", ".stp", ".iges", ".igs", ".brep", ".brp"}
 
