@@ -84,6 +84,7 @@ def generate_gcode_freecad(model_path: str, gcode_path: str) -> int:
         "stepover": config.SURFACE_STEPOVER,
         "sample_interval": config.SURFACE_SAMPLE_INTERVAL,
         "postprocessor": config.POSTPROCESSOR,
+        "nx_export": config.NX_EXPORT,   # экспорт STEP деталь/заготовка в СК G-кода (для NX)
     }
 
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tmp:
