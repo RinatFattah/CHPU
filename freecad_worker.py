@@ -214,6 +214,520 @@ def write_partial(job, ops, p, note):
         log(f"warn: промежуточная запись не удалась: {e}")
 
 
+# ── Мёртвые зоны (keep-out): объёмы, куда инструменту нельзя ─────────────────────
+# Примитивы (в СК ПРОГРАММЫ — как у G-кода): запретные боксы (не входить),
+# рабочие боксы (не выходить; работаем в их пересечении), полупространства по
+# осям. Модель инструмента — вертикальный цилиндр Ø фрезы от кончика ВВЕРХ
+# (хвостовик/патрон не тоньше и не короче), поэтому:
+#   - запретный бокс закрывает и всё ПОД собой (сверху туда не подъехать);
+#     проезд НАД боксом (кончик выше его верха + зазор) разрешён;
+#   - потолки (Z gt, верх рабочего бокса) проверяются по КОНЧИКУ инструмента;
+#   - в XY зоны раздуваются на радиус фрезы + зазор m (KEEPOUT_MARGIN).
+# Ограничение АПРИОРНОЕ: зоны операций режутся ДО расчёта траекторий; гейт по
+# готовому G-коду (check_gcode_zones) — только страховка от дыр в этой логике.
+
+_ZONE_EPS = 1e-9
+
+
+def parse_zones(p):
+    """params → структура зон или None (зон нет). Рабочие боксы сразу
+    пересекаются в один; пустое пересечение — ошибка."""
+    boxes = [[float(v) for v in b] for b in (p.get("keepout_boxes") or [])]
+    works = [[float(v) for v in b] for b in (p.get("work_boxes") or [])]
+    half = [[str(a).upper(), str(c).lower(), float(v)]
+            for a, c, v in (p.get("keepout_halfspaces") or [])]
+    if not (boxes or works or half):
+        return None
+    work = None
+    for w in works:
+        if work is None:
+            work = list(w)
+        else:
+            work = [max(work[0], w[0]), max(work[1], w[1]), max(work[2], w[2]),
+                    min(work[3], w[3]), min(work[4], w[4]), min(work[5], w[5])]
+    if work is not None and (work[0] >= work[3] or work[1] >= work[4]
+                             or work[2] >= work[5]):
+        raise RuntimeError("пересечение рабочих боксов пусто — работать негде")
+    return {"boxes": boxes, "work": work, "half": half,
+            "m": float(p.get("keepout_margin", 0.5)),
+            "r": float(p["tool_diameter"]) / 2.0}
+
+
+def zone_z_floor(z):
+    """Пол для кончика инструмента (ниже нельзя): Z-lt полупространства и низ
+    рабочего бокса. -inf, если пола нет."""
+    floor = float("-inf")
+    if z["work"] is not None:
+        floor = max(floor, z["work"][2] + z["m"])
+    for a, c, v in z["half"]:
+        if a == "Z" and c == "lt":
+            floor = max(floor, v + z["m"])
+    return floor
+
+
+def zone_z_ceiling(z):
+    """Потолок для кончика (Z-gt полупространства, верх рабочего бокса).
+    None, если потолка нет. Хвостовик НЕ моделируется: потолок — по кончику."""
+    ceil_ = None
+    if z["work"] is not None:
+        ceil_ = z["work"][5] - z["m"]
+    for a, c, v in z["half"]:
+        if a == "Z" and c == "gt":
+            hv = v - z["m"]
+            ceil_ = hv if ceil_ is None else min(ceil_, hv)
+    return ceil_
+
+
+def zone_required_clearance(z):
+    """Минимальная высота холостых перемещений: выше верха всех запретных
+    боксов (проезд над боксом разрешён). None, если боксов нет."""
+    if not z["boxes"]:
+        return None
+    return max(b[5] for b in z["boxes"]) + z["m"]
+
+
+def op_clearance(p, start_z):
+    """ClearanceHeight операции: обычная формула, но не ниже проезда над
+    запретными боксами и не выше потолка зон (совместимость высот заранее
+    проверена check_zone_heights)."""
+    clr = start_z + p["safe_height"]
+    z = p.get("_zones")
+    if z:
+        rq = zone_required_clearance(z)
+        if rq is not None:
+            clr = max(clr, rq)
+        ceil_ = zone_z_ceiling(z)
+        if ceil_ is not None:
+            clr = min(clr, ceil_)
+    return clr
+
+
+def check_zone_heights(z, sb):
+    """Совместимость высот: потолок зон обязан оставлять место подходам
+    (верх заготовки + 3 мм на SafeHeight) и проезду над запретными боксами;
+    пол — быть ниже верха заготовки. Иначе — понятная ошибка сразу."""
+    ceil_ = zone_z_ceiling(z)
+    if ceil_ is not None:
+        need = sb.ZMax + 3.0
+        rq = zone_required_clearance(z)
+        if rq is not None and rq > need:
+            need = rq
+        if ceil_ < need - _ZONE_EPS:
+            raise RuntimeError(
+                f"потолок зон Z={ceil_:.2f} ниже необходимых {need:.2f} мм "
+                f"(подходы над заготовкой / проезд над запретными боксами) — "
+                f"обработка сверху невозможна, поправьте зоны")
+    floor = zone_z_floor(z)
+    if floor > sb.ZMax - _ZONE_EPS:
+        raise RuntimeError(f"пол зон Z={floor:.2f} не ниже верха заготовки "
+                           f"Z={sb.ZMax:.2f} — резать нечего")
+
+
+def warn_zone_sanity(z, sb):
+    """Ранняя ловля типовой ошибки «зоны заданы не в той СК»: зона, не
+    задевающая заготовку, скорее всего промахнулась. Зона, съевшая всю
+    заготовку, — ошибка сразу."""
+    g = z["r"] + z["m"]
+    for b in z["boxes"]:
+        if (b[0] - g > sb.XMax or b[3] + g < sb.XMin or
+                b[1] - g > sb.YMax or b[4] + g < sb.YMin or
+                b[5] + z["m"] < sb.ZMin):
+            log(f"warn: запретный бокс X {b[0]:g}..{b[3]:g} Y {b[1]:g}..{b[4]:g} "
+                f"Z {b[2]:g}..{b[5]:g} не задевает заготовку — проверьте, что "
+                f"его координаты в СК ПРОГРАММЫ (см. шапку G-кода)")
+    if z["work"] is not None:
+        w = z["work"]
+        if (w[0] + g > sb.XMax or w[3] - g < sb.XMin or
+                w[1] + g > sb.YMax or w[4] - g < sb.YMin):
+            raise RuntimeError("рабочий бокс не пересекает заготовку — работать "
+                               "негде (проверьте СК зон)")
+        if (w[0] + g > sb.XMin + 1e-6 or w[3] - g < sb.XMax - 1e-6 or
+                w[1] + g > sb.YMin + 1e-6 or w[4] - g < sb.YMax - 1e-6):
+            log("warn: рабочий бокс тесней заготовки — материал за его "
+                "пределами останется несрезанным")
+    for a, c, v in z["half"]:
+        if a == "Z":
+            continue
+        lo, hi = (sb.XMin, sb.XMax) if a == "X" else (sb.YMin, sb.YMax)
+        if (c == "lt" and v + g > hi) or (c == "gt" and v - g < lo):
+            raise RuntimeError(f"запрет {a} {'<' if c == 'lt' else '>'} {v:g} "
+                               f"накрывает всю заготовку — работать негде")
+
+
+def plug_stock_for_zones(doc, job, sb, z, p):
+    """Запретные КОЛОННЫ в заготовке — для планировщика Adaptive. Он сводит
+    заготовку к внешнему 2D-контуру (TechDraw.findShapeOutline) и считает всё
+    вне контура расчищенным воздухом: там он свободно ставит винтовой вход и
+    тянет линки НА ГЛУБИНЕ РЕЗА, игнорируя вырез из региона операции. Колонна
+    (бокс ⊕ m, на высоту заготовки — габарит не меняется) расширяет контур,
+    воздух в футпринте бокса становится «материалом», и Adaptive его объезжает.
+    Нужна только боксам, задевающим кромку/окрестность заготовки: внутри
+    силуэта и так материал. Заготовка при этом материализуется в статичную
+    Part::Feature (у параметрической присвоение Shape откатилось бы)."""
+    reach = float(p["tool_diameter"]) + float(p["rough_allowance"]) + z["m"] + 1.0
+    prisms = []
+    for b in z["boxes"]:
+        if (b[0] > sb.XMax + reach or b[3] < sb.XMin - reach or
+                b[1] > sb.YMax + reach or b[4] < sb.YMin - reach):
+            continue    # бокс далеко от заготовки — планировщику не мешает
+        g = z["m"]
+        prisms.append(Part.makeBox(b[3] - b[0] + 2 * g, b[4] - b[1] + 2 * g,
+                                   sb.ZLength,
+                                   FreeCAD.Vector(b[0] - g, b[1] - g, sb.ZMin)))
+    if not prisms:
+        return
+    try:
+        fused = job.Stock.Shape.fuse(prisms)
+    except Exception as e:
+        log(f"warn: запретные колонны не вплавились в заготовку ({e}) — "
+            f"вход/линки Adaptive у края прикроет только гейт")
+        return
+    stock_feat = doc.addObject("Part::Feature", "StockZoned")
+    stock_feat.Shape = fused
+    old = job.Stock
+    job.Stock = stock_feat
+    try:
+        doc.removeObject(old.Name)
+    except Exception:
+        pass
+    doc.recompute()
+    log(f"зоны: в заготовку вплавлено запретных колонн: {len(prisms)} — "
+        f"планировщик Adaptive не поведёт туда вход и линки (габарит прежний)")
+
+
+def _rect_face(x0, y0, x1, y1):
+    """Прямоугольная грань на плоскости Z=0 (там живут все 2D-зоны операций)."""
+    return Part.Face(Part.makePolygon([
+        FreeCAD.Vector(x0, y0, 0), FreeCAD.Vector(x1, y0, 0),
+        FreeCAD.Vector(x1, y1, 0), FreeCAD.Vector(x0, y1, 0),
+        FreeCAD.Vector(x0, y0, 0)]))
+
+
+def restrict_region(z, region, grow, final_z, name):
+    """АПРИОРНОЕ ограничение 2D-зоны операции (грани на Z=0): вычесть запретные
+    футпринты, раздутые на grow, и пересечь с рабочим боксом, сжатым на grow.
+    grow зависит от типа операции: Adaptive держит ДИСК фрезы внутри зоны —
+    достаточно зазора m; Profile ведёт ЦЕНТР снаружи контура на R+припуск —
+    нужно 2R+припуск+m. Запретный бокс участвует, только если операция
+    опускается ниже его верха (final_z < z1+m): выше бокса резать можно.
+    Возвращает (регион|None, менялся_ли: bool); None — зона съедена целиком."""
+    if z is None or region is None:
+        return region, False
+    changed = False
+    shape = region
+    if z["work"] is not None:
+        w = z["work"]
+        clipped = shape.common(_rect_face(w[0] + grow, w[1] + grow,
+                                          w[3] - grow, w[4] - grow))
+        if abs(clipped.Area - shape.Area) > 1e-6:
+            changed = True
+        shape = clipped
+    if shape.Area > 1e-9:
+        bb = shape.BoundBox
+        ex0, ey0, ex1, ey1 = bb.XMin - 1.0, bb.YMin - 1.0, bb.XMax + 1.0, bb.YMax + 1.0
+        rects = []
+        for b in z["boxes"]:
+            if final_z < b[5] + z["m"] - _ZONE_EPS:
+                rects.append((b[0] - grow, b[1] - grow, b[3] + grow, b[4] + grow))
+        for a, c, v in z["half"]:
+            if a == "Z":
+                continue
+            if a == "X":
+                rects.append((ex0, ey0, v + grow, ey1) if c == "lt"
+                             else (v - grow, ey0, ex1, ey1))
+            else:
+                rects.append((ex0, ey0, ex1, v + grow) if c == "lt"
+                             else (ex0, v - grow, ex1, ey1))
+        for r in rects:
+            if r[2] - r[0] < 1e-6 or r[3] - r[1] < 1e-6:
+                continue
+            cut = shape.cut(_rect_face(*r))
+            if abs(cut.Area - shape.Area) > 1e-6:
+                changed = True
+            shape = cut
+            if shape.Area < 1e-9:
+                break
+    faces = [f for f in shape.Faces if f.Area > 0.5]
+    if not faces:
+        log(f"{name}: зона операции целиком в мёртвой зоне — пропущено")
+        return None, True
+    if changed:
+        log(f"{name}: зона операции урезана мёртвыми зонами")
+        shape = faces[0] if len(faces) == 1 else Part.makeCompound(faces)
+    return shape, changed
+
+
+def surface_zone_block(z, rbb, final_z):
+    """Пускать ли Surface-черновую (террасы по грани: RoughSlope / узкий
+    RoughFace)? Операция расширяет границу зоны на BoundaryAdjustment=R
+    (это путь ЦЕНТРА, до 2R за контур грани при BoundaryEnforcement=False),
+    диск добавляет ещё R — рабочее пятно = bbox грани + ~3R. Внутри пятна
+    Surface объезжать зоны не умеет, поэтому при любом конфликте операция
+    пропускается ЦЕЛИКОМ (v1, консервативно — материал остаётся).
+    Возвращает строку-причину или None (можно работать)."""
+    if z is None:
+        return None
+    e = 3.0 * z["r"] + z["m"] + 0.2
+    x0, y0, x1, y1 = rbb.XMin - e, rbb.YMin - e, rbb.XMax + e, rbb.YMax + e
+    for b in z["boxes"]:
+        if final_z < b[5] + z["m"] - _ZONE_EPS and \
+                x1 > b[0] and b[3] > x0 and y1 > b[1] and b[4] > y0:
+            return (f"рабочее пятно задевает запретный бокс "
+                    f"X {b[0]:g}..{b[3]:g} Y {b[1]:g}..{b[4]:g}")
+    for a, c, v in z["half"]:
+        if a == "Z":
+            continue
+        lo, hi = (x0, x1) if a == "X" else (y0, y1)
+        if (c == "lt" and lo < v) or (c == "gt" and hi > v):
+            return (f"рабочее пятно пересекает запрет "
+                    f"{a} {'<' if c == 'lt' else '>'} {v:g}")
+    if z["work"] is not None:
+        w = z["work"]
+        if x0 < w[0] or y0 < w[1] or x1 > w[3] or y1 > w[4]:
+            return "рабочее пятно выходит за рабочий бокс"
+    return None
+
+
+def zone_header_lines(z):
+    """Строки шапки G-кода про зоны (латиницей — кириллицу в комментариях
+    понимает не каждая стойка)."""
+    if z is None:
+        return ""
+    out = [f"(Keepout: tool R{z['r']:g} mm + margin {z['m']:g} mm applied)"]
+    for b in z["boxes"]:
+        out.append(f"(Keepout box: X {b[0]:g}..{b[3]:g}  Y {b[1]:g}..{b[4]:g}  "
+                   f"Z {b[2]:g}..{b[5]:g}, no entry below Z {b[5]:g})")
+    if z["work"] is not None:
+        w = z["work"]
+        out.append(f"(Work box: X {w[0]:g}..{w[3]:g}  Y {w[1]:g}..{w[4]:g}  "
+                   f"Z {w[2]:g}..{w[5]:g}, stay inside)")
+    for a, c, v in z["half"]:
+        out.append(f"(Keepout: {a} {'<' if c == 'lt' else '>'} {v:g})")
+    return "\n".join(out) + "\n"
+
+
+def _arc_segments(p0, p1, arc, cw):
+    """Дуга G2/G3 (плоскость G17; I/J — инкрементальные от старта, как в
+    grbl-посте; поддержан и R-формат) → цепочка отрезков с хордой ≤ 0.2 мм.
+    Z интерполируется линейно (винтовые заходы Adaptive)."""
+    x0, y0, z0 = p0
+    x1, y1, z1 = p1
+    if "I" in arc or "J" in arc:
+        cx, cy = x0 + arc.get("I", 0.0), y0 + arc.get("J", 0.0)
+    else:
+        r = arc["R"]
+        dx, dy = x1 - x0, y1 - y0
+        d = math.hypot(dx, dy)
+        if d < 1e-9:
+            return []
+        h = math.sqrt(max(r * r - (d / 2.0) ** 2, 0.0))
+        px, py = -dy / d, dx / d
+        mx, my = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+
+        def sweep(c):
+            s = (math.atan2(y1 - c[1], x1 - c[0])
+                 - math.atan2(y0 - c[1], x0 - c[0]))
+            if cw:
+                while s > 1e-12:
+                    s -= 2 * math.pi
+            else:
+                while s < -1e-12:
+                    s += 2 * math.pi
+            return s
+        cands = sorted([(mx + px * h, my + py * h), (mx - px * h, my - py * h)],
+                       key=lambda c: abs(sweep(c)))
+        cx, cy = cands[0] if r >= 0 else cands[-1]  # R>0 — малая дуга, R<0 — большая
+    rad = math.hypot(x0 - cx, y0 - cy)
+    a0 = math.atan2(y0 - cy, x0 - cx)
+    s = math.atan2(y1 - cy, x1 - cx) - a0
+    if cw:
+        while s > -1e-9:     # нулевой свип по часовой = полный круг
+            s -= 2 * math.pi
+    else:
+        while s < 1e-9:
+            s += 2 * math.pi
+    n = max(2, int(math.ceil(abs(s) * max(rad, 1e-6) / 0.2)))
+    pts = [(cx + rad * math.cos(a0 + s * i / n),
+            cy + rad * math.sin(a0 + s * i / n),
+            z0 + (z1 - z0) * i / n) for i in range(n + 1)]
+    return list(zip(pts[:-1], pts[1:]))
+
+
+def _pt_seg_dist2d(p, a, b):
+    """Расстояние точка-отрезок в XY."""
+    ax, ay, bx, by = a[0], a[1], b[0], b[1]
+    dx, dy = bx - ax, by - ay
+    ll = dx * dx + dy * dy
+    if ll < 1e-18:
+        return math.hypot(p[0] - ax, p[1] - ay)
+    t = max(0.0, min(1.0, ((p[0] - ax) * dx + (p[1] - ay) * dy) / ll))
+    return math.hypot(p[0] - (ax + t * dx), p[1] - (ay + t * dy))
+
+
+def _seg_seg_dist2d(a0, a1, b0, b1):
+    """Расстояние отрезок-отрезок в XY (0 — пересекаются)."""
+    def orient(p, q, r):
+        return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+    d1, d2 = orient(b0, b1, a0), orient(b0, b1, a1)
+    d3, d4 = orient(a0, a1, b0), orient(a0, a1, b1)
+    if ((d1 > 0) != (d2 > 0)) and ((d3 > 0) != (d4 > 0)):
+        return 0.0
+    return min(_pt_seg_dist2d(a0, b0, b1), _pt_seg_dist2d(a1, b0, b1),
+               _pt_seg_dist2d(b0, a0, a1), _pt_seg_dist2d(b1, a0, a1))
+
+
+def _seg_rect_dist2d(p0, p1, x0, y0, x1, y1):
+    """Расстояние в XY от отрезка до прямоугольника (0 — задевает)."""
+    for px, py in (p0, p1):
+        if x0 <= px <= x1 and y0 <= py <= y1:
+            return 0.0
+    corners = ((x0, y0), (x1, y0), (x1, y1), (x0, y1))
+    return min(_seg_seg_dist2d(p0, p1, corners[i], corners[(i + 1) % 4])
+               for i in range(4))
+
+
+def check_gcode_zones(z, gcode):
+    """ГЕЙТ-страховка: проход по ГОТОВОМУ G-коду против зон в пространстве
+    кончика инструмента. Запретный бокс = прямоугольник, раздутый ДИСКОМ
+    R+m (углы скруглены — раздув квадратом ложно срабатывал бы на честном
+    обходе угла): точный тест «расстояние XY-отрезка до прямоугольника» на
+    части отрезка ниже потолка бокса. Дуги — сэмплинг; выпуклые ограничения
+    (рабочий бокс — эрозия диском даёт точный прямоугольник, полупространства)
+    — по концам отрезков (прямая между точками выпуклой области не выходит из
+    неё). Возвращает [(строка, (x,y,z), глубина_захода, описание)].
+    Априорное ограничение обязано давать пустой список — непустой означает
+    дыру в нём, а не «нормальную» ситуацию."""
+    import re
+    word_re = re.compile(r"([A-Za-z])\s*([+-]?(?:\d+\.?\d*|\.\d+))")
+    tol = 1e-3
+    g = z["r"] + z["m"]
+
+    # запретные боксы: (описание, x0, y0, x1, y1, потолок для кончика)
+    boxes = [(f"запретный бокс X {b[0]:g}..{b[3]:g} Y {b[1]:g}..{b[4]:g} "
+              f"(кончику нельзя ниже Z {b[5] + z['m']:g})",
+              b[0], b[1], b[3], b[4], b[5] + z["m"])
+             for b in z["boxes"]]
+    half = []
+    for a, c, v in z["half"]:
+        shift = g if a != "Z" else z["m"]
+        half.append((a, c, v, v + shift if c == "lt" else v - shift))
+    work = None
+    if z["work"] is not None:
+        w = z["work"]
+        work = (w[0] + g - tol, w[1] + g - tol, w[2] + z["m"] - tol,
+                w[3] - g + tol, w[4] - g + tol, w[5] - z["m"] + tol)
+
+    viol = []
+
+    def check_point(pt, ln):
+        if work is not None:
+            d = min(pt[0] - work[0], work[3] - pt[0], pt[1] - work[1],
+                    work[4] - pt[1], pt[2] - work[2], work[5] - pt[2])
+            if d < 0:
+                viol.append((ln, pt, -d, "выход за рабочий бокс"))
+        for a, c, v, lim in half:
+            i = {"X": 0, "Y": 1, "Z": 2}[a]
+            if c == "lt" and pt[i] < lim - tol:
+                viol.append((ln, pt, lim - pt[i], f"запрет {a} < {v:g}"))
+            elif c == "gt" and pt[i] > lim + tol:
+                viol.append((ln, pt, pt[i] - lim, f"запрет {a} > {v:g}"))
+
+    def check_seg(p0, p1, ln):
+        check_point(p1, ln)
+        for desc, bx0, by0, bx1, by1, zc in boxes:
+            # часть отрезка ниже потолка бокса (снизу бокс открыт)
+            zc_eff = zc - tol
+            z0, z1v = p0[2], p1[2]
+            if z0 >= zc_eff and z1v >= zc_eff:
+                continue
+            t0, t1 = 0.0, 1.0
+            dzt = z1v - z0
+            if abs(dzt) > 1e-12:
+                tc = (zc_eff - z0) / dzt
+                if z0 >= zc_eff:      # входит под потолок в точке tc
+                    t0 = max(t0, tc)
+                elif z1v >= zc_eff:   # выходит из-под потолка в точке tc
+                    t1 = min(t1, tc)
+            q0 = (p0[0] + (p1[0] - p0[0]) * t0, p0[1] + (p1[1] - p0[1]) * t0)
+            q1 = (p0[0] + (p1[0] - p0[0]) * t1, p0[1] + (p1[1] - p0[1]) * t1)
+            d = _seg_rect_dist2d(q0, q1, bx0, by0, bx1, by1)
+            if d < g - tol:
+                tm = (t0 + t1) / 2.0
+                pt = tuple(p0[i] + (p1[i] - p0[i]) * tm for i in range(3))
+                viol.append((ln, pt, g - d, desc))
+
+    pos = {"X": None, "Y": None, "Z": None}
+    mode = None
+    for ln, raw in enumerate(gcode.splitlines(), 1):
+        line = re.sub(r"\([^)]*\)", "", raw).split(";", 1)[0].strip()
+        if not line:
+            continue
+        target = dict(pos)
+        arc = {}
+        motion = None
+        moved = False
+        for letter, val in word_re.findall(line):
+            letter = letter.upper()
+            num = float(val)
+            if letter == "G":
+                gi = int(round(num))
+                if gi in (0, 1, 2, 3):
+                    mode = motion = gi
+                elif gi == 91:
+                    raise RuntimeError("гейт зон: G91 (инкрементальные "
+                                       "координаты) не поддерживается")
+                elif gi == 20:
+                    raise RuntimeError("гейт зон: G20 (дюймы) не поддерживается")
+            elif letter in ("X", "Y", "Z"):
+                target[letter] = num
+                moved = True
+            elif letter in ("I", "J", "K", "R"):
+                arc[letter] = num
+        if not moved:
+            continue
+        if motion is None:
+            motion = mode      # координаты без G-слова — модальный режим
+        p1 = (target["X"], target["Y"], target["Z"])
+        if motion is None or any(c is None for c in p1):
+            pos = target       # координаты ещё не определились — судить нечего
+            continue
+        if any(pos[k] is None for k in "XYZ"):
+            check_point(p1, ln)   # старт станка неизвестен — судим только точку
+        elif motion in (2, 3) and ("I" in arc or "J" in arc or "R" in arc):
+            p0 = (pos["X"], pos["Y"], pos["Z"])
+            for q0, q1 in _arc_segments(p0, p1, arc, motion == 2):
+                check_seg(q0, q1, ln)
+        else:
+            check_seg((pos["X"], pos["Y"], pos["Z"]), p1, ln)
+        pos = target
+    return viol
+
+
+def enforce_zone_gate(z, gcode, gcode_path):
+    """Прогоняет гейт; при нарушениях НЕ даёт программе выйти: целевой файл
+    удаляется (там мог остаться промежуточный G-код), забракованный код
+    сохраняется рядом как *.REJECTED.gcode, наверх уходит RuntimeError."""
+    viol = check_gcode_zones(z, gcode)
+    if not viol:
+        log("гейт мёртвых зон: нарушений нет")
+        return
+    viol.sort(key=lambda v: -v[2])
+    for ln, pt, depth, desc in viol[:5]:
+        log(f"ГЕЙТ: строка {ln}: X{pt[0]:.2f} Y{pt[1]:.2f} Z{pt[2]:.2f} — "
+            f"заход {depth:.2f} мм, {desc}")
+    rej = os.path.splitext(gcode_path)[0] + ".REJECTED.gcode"
+    with open(rej, "w", encoding="utf-8") as f:
+        f.write(gcode)
+    try:
+        os.unlink(gcode_path)
+    except OSError:
+        pass
+    raise RuntimeError(
+        f"гейт мёртвых зон: {len(viol)} наруш. — программа НЕ записана, "
+        f"забракованный код: {os.path.basename(rej)}. Это дыра в априорном "
+        f"ограничении, сообщите о ней")
+
+
 def _slice_faces(solid, z):
     """Сечение тела на высоте z как грани НА ПЛОСКОСТИ Z=0, с сохранением отверстий.
     Контуры собираются в грань все вместе (FaceMakerBullseye понимает вложенность):
@@ -357,7 +871,12 @@ def make_adaptive(doc, job, tc, name, region_shape, p, start_z, final_z, allowan
     op.StartDepth = start_z
     op.setExpression("FinalDepth", None)
     op.FinalDepth = final_z
-    op.ClearanceHeight.Value = start_z + p["safe_height"]
+    # ClearanceHeight/SafeHeight тоже привязаны экспрешеном к SetupSheet
+    # (сток-топ + 5/3): без setExpression(None) присвоение .Value молча
+    # откатывается на recompute — и подъём клиренса над боксами не доедет
+    op.setExpression("ClearanceHeight", None)
+    op.ClearanceHeight.Value = op_clearance(p, start_z)  # не ниже верха запретных боксов
+    op.setExpression("SafeHeight", None)
     op.SafeHeight.Value = start_z + 3.0
     doc.recompute()  # здесь Adaptive считает траекторию — самый долгий шаг
 
@@ -396,7 +915,12 @@ def make_profile(doc, job, tc, name, region_shape, p, start_z, final_z, allowanc
     op.StartDepth = start_z
     op.setExpression("FinalDepth", None)
     op.FinalDepth = final_z
-    op.ClearanceHeight.Value = start_z + p["safe_height"]
+    # ClearanceHeight/SafeHeight тоже привязаны экспрешеном к SetupSheet
+    # (сток-топ + 5/3): без setExpression(None) присвоение .Value молча
+    # откатывается на recompute — и подъём клиренса над боксами не доедет
+    op.setExpression("ClearanceHeight", None)
+    op.ClearanceHeight.Value = op_clearance(p, start_z)  # не ниже верха запретных боксов
+    op.setExpression("SafeHeight", None)
     op.SafeHeight.Value = start_z + 3.0
     doc.recompute()
 
@@ -438,7 +962,12 @@ def make_surface_rough(doc, job, tc, name, model_obj, face_idx, p,
     op.StartDepth = start_z
     op.setExpression("FinalDepth", None)
     op.FinalDepth = final_z
-    op.ClearanceHeight.Value = start_z + p["safe_height"]
+    # ClearanceHeight/SafeHeight тоже привязаны экспрешеном к SetupSheet
+    # (сток-топ + 5/3): без setExpression(None) присвоение .Value молча
+    # откатывается на recompute — и подъём клиренса над боксами не доедет
+    op.setExpression("ClearanceHeight", None)
+    op.ClearanceHeight.Value = op_clearance(p, start_z)  # не ниже верха запретных боксов
+    op.setExpression("SafeHeight", None)
     op.SafeHeight.Value = start_z + 3.0
     doc.recompute()
 
@@ -462,6 +991,13 @@ def make_roughing_ops(doc, job, tc, shape, p):
     sb = job.Stock.Shape.BoundBox
     start_z = sb.ZMax                      # верх заготовки
     floor_z = bb.ZMin + allowance          # дно + припуск
+    zones = p.get("_zones")
+    if zones:
+        zfl = zone_z_floor(zones)
+        if zfl > floor_z:
+            log(f"зоны: дно черновой поднято с {floor_z:.2f} до {zfl:.2f} — "
+                f"ниже пола зон материал останется")
+            floor_z = zfl
 
     sil = build_silhouette(shape, bb, p["rough_stepdown"])
     ops = []
@@ -509,9 +1045,18 @@ def make_roughing_ops(doc, job, tc, shape, p):
         except Exception as e:
             material = filled = None
             log(f"warn: зона контура не построилась: {e}")
+        # мёртвые зоны: из материала периметра вычитается запретный футпринт
+        # (Adaptive держит диск фрезы внутри зоны — хватает зазора m)
+        mat_cut = False
+        if material is not None:
+            material, mat_cut = restrict_region(zones, material,
+                                                zones["m"] if zones else 0.0,
+                                                floor_z, "контур")
         if material is not None and material.Area > 1.0:
             tool_d = float(p["tool_diameter"])
             margin_xy = min(sb.XLength - bb.XLength, sb.YLength - bb.YLength) / 2.0
+            ring = None
+            ring_cut = False
             if margin_xy >= 2.0 * tool_d:
                 # широкие поля: адаптивная выборка кольца. Зона выпускается за
                 # край заготовки (снаружи воздух) — иначе StockToLeave оставит
@@ -520,7 +1065,17 @@ def make_roughing_ops(doc, job, tc, shape, p):
                     ring = stock_filled.makeOffset2D(tool_d + allowance).cut(filled)
                 except Exception:
                     ring = material
-                ring_top = local_start(material)
+                ring, ring_cut = restrict_region(zones, ring,
+                                                 zones["m"] if zones else 0.0,
+                                                 floor_z, "контур (кольцо)")
+            # зоны задели периметр → Adaptive для контура НЕЛЬЗЯ: он считает
+            # всё вне силуэта заготовки расчищенным воздухом и свободно ходит
+            # там (вход/линки) НА ГЛУБИНЕ РЕЗА, игнорируя вырез из региона.
+            # Контурные петли (Profile) шорткатов по воздуху не строят.
+            force_loops = zones is not None and (mat_cut or ring_cut
+                                                 or ring is None)
+            if margin_xy >= 2.0 * tool_d and not force_loops:
+                ring_top = local_start(material) if ring is not None else None
                 if ring_top is None:
                     log("контур: материала по периметру нет — пропущено")
                 else:
@@ -537,6 +1092,10 @@ def make_roughing_ops(doc, job, tc, shape, p):
                 # гранями обводит только общий внешний контур). Одна петля
                 # снимает полосу шириной в фрезу; материал дальше (наплывы
                 # произвольной заготовки) добирают внешние петли.
+                if margin_xy >= 2.0 * tool_d:
+                    log("контур: мёртвые зоны задевают периметр — адаптивная "
+                        "выборка заменена контурными петлями (Adaptive свободно "
+                        "ходит по воздуху за краем заготовки на глубине реза)")
                 step = tool_d * float(p["rough_stepover"]) / 100.0
                 mb = material.BoundBox
                 pts = [v.Point for v in material.Vertexes]
@@ -559,6 +1118,16 @@ def make_roughing_ops(doc, job, tc, shape, p):
                         f"{dmax:.1f} мм от детали")
                 made = 0
                 for i, (k, lf) in enumerate(loop_faces, 1):
+                    name = f"RoughContour{i}" if len(loop_faces) > 1 else "RoughContour"
+                    # мёртвые зоны: Profile ведёт ЦЕНТР фрезы снаружи контура
+                    # петли на R+припуск, поэтому запрет раздувается на
+                    # 2R+припуск+m (иначе центр заедет в зону у её границы)
+                    lf, lf_cut = restrict_region(
+                        zones, lf,
+                        tool_d + allowance + (zones["m"] if zones else 0.0),
+                        floor_z, name)
+                    if lf is None:
+                        continue
                     # верх материала в полосе, которую метёт эта петля:
                     # петля выше него — чистый воздух, начинаем оттуда
                     loop_top = start_z
@@ -571,12 +1140,17 @@ def make_roughing_ops(doc, job, tc, shape, p):
                     if loop_top is None:
                         log(f"контур: петля {i} — материала нет, пропущена")
                         continue
-                    name = f"RoughContour{i}" if len(loop_faces) > 1 else "RoughContour"
-                    op = make_profile(doc, job, tc, name, lf, p,
-                                      loop_top, floor_z, allowance)
-                    if op:
-                        ops.append(op)
-                        made += 1
+                    # петля, разорванная зонами на куски: Profile с несколькими
+                    # гранями обводит только общий внешний контур (мост через
+                    # разрыв) — поэтому каждому куску своя операция
+                    parts = lf.Faces if (lf_cut and len(lf.Faces) > 1) else [lf]
+                    for j, pf in enumerate(parts, 1):
+                        pname = name if len(parts) == 1 else f"{name}p{j}"
+                        op = make_profile(doc, job, tc, pname, pf, p,
+                                          loop_top, floor_z, allowance)
+                        if op:
+                            ops.append(op)
+                            made += 1
                 if made:
                     write_partial(job, ops, p, f"готов контур ({made} петель)")
                 else:
@@ -585,6 +1159,10 @@ def make_roughing_ops(doc, job, tc, shape, p):
     # ── 2) сквозные вырезы любой формы, по очереди ──
     for i, region in enumerate(find_through_cuts(sil) if sil is not None else [], 1):
         rb = region.BoundBox
+        region, _ = restrict_region(zones, region, zones["m"] if zones else 0.0,
+                                    floor_z, f"RoughHole{i}")
+        if region is None:
+            continue
         hole_top = local_start(region)
         if hole_top is None:
             log(f"RoughHole{i}: над вырезом нет материала заготовки — пропущено")
@@ -606,18 +1184,32 @@ def make_roughing_ops(doc, job, tc, shape, p):
     include_top = sb.ZMax > bb.ZMax + 0.01
     for j, fc in enumerate(find_up_faces(shape, bb, include_top), 1):
         final = fc["z"] + allowance
-        face_top = local_start(fc["region"])
+        if zones:
+            zfl = zone_z_floor(zones)
+            if zfl > final:
+                final = zfl  # дно грани ниже пола зон — останавливаемся выше
+        region = fc["region"]
+        region, _ = restrict_region(zones, region, zones["m"] if zones else 0.0,
+                                    final, f"RoughFace{j}")
+        if region is None:
+            continue
+        face_top = local_start(region)
         if face_top is None or final >= face_top - 1e-6:
             if face_top is None:
                 log(f"RoughFace{j}: (Z={fc['z']:.1f}) материала над гранью нет — "
                     f"пропущено")
             continue  # грань вровень с верхом материала — снимать нечего
-        op = make_adaptive(doc, job, tc, f"RoughFace{j}", fc["region"], p,
+        op = make_adaptive(doc, job, tc, f"RoughFace{j}", region, p,
                            face_top, final, allowance)
         if not op:
             # грань уже фрезы (узкая полка) — адаптивной выборке негде
             # развернуться; снимаем материал над ней террасами по поверхности,
             # тем же приёмом, что и криволинейные грани
+            blk = surface_zone_block(zones, fc["region"].BoundBox, final)
+            if blk:
+                log(f"RoughFace{j}: узкая грань у мёртвой зоны ({blk}) — "
+                    f"пропущено, материал остаётся")
+                continue
             log(f"RoughFace{j}: узкая грань — перехожу на террасы по поверхности")
             op = make_surface_rough(doc, job, tc, f"RoughFace{j}", jm, fc["idx"], p,
                                     face_top, final, allowance)
@@ -673,12 +1265,20 @@ def make_roughing_ops(doc, job, tc, shape, p):
         ordered += _nearest_order([s for s in slopes if round(s["z"], 3) == lv],
                                   lambda s: (s["cx"], s["cy"]))
     for k, s in enumerate(ordered, 1):
+        slope_final = s["zmin"] + allowance
+        if zones:
+            slope_final = max(slope_final, zone_z_floor(zones))
+            blk = surface_zone_block(zones, s["rect"].BoundBox, slope_final)
+            if blk:
+                log(f"RoughSlope{k}: {blk} — пропущено, материал остаётся "
+                    f"(Surface не умеет объезжать зоны)")
+                continue
         slope_top = local_start(s["rect"])  # верх материала над зоной грани
         if slope_top is None:
             log(f"RoughSlope{k}: материала над гранью нет — пропущено")
             continue
         op = make_surface_rough(doc, job, tc, f"RoughSlope{k}", jm, s["idx"], p,
-                                slope_top, s["zmin"] + allowance, allowance)
+                                slope_top, slope_final, allowance)
         if op:
             ops.append(op)
             write_partial(job, ops, p, f"готова криволинейная грань {k} "
@@ -712,6 +1312,7 @@ def make_layered_ops(doc, job, tc, shape, p):
     bb = shape.BoundBox
     sb = job.Stock.Shape.BoundBox
     ops = []
+    zones = p.get("_zones")
 
     ssil = build_silhouette(job.Stock.Shape, sb, step)
     if ssil is None:
@@ -722,6 +1323,12 @@ def make_layered_ops(doc, job, tc, shape, p):
 
     # ── 1) характерные уровни детали ──
     bottom = bb.ZMin + allowance
+    if zones:
+        zfl = zone_z_floor(zones)
+        if zfl > bottom:
+            log(f"зоны: дно послойной черновой поднято с {bottom:.2f} до "
+                f"{zfl:.2f} — ниже пола зон материал останется")
+            bottom = zfl
     levels = {sb.ZMax, bottom}
     slant_spans = []
     for f in shape.Faces:
@@ -828,6 +1435,12 @@ def make_layered_ops(doc, job, tc, shape, p):
         f"({levels[0]:.1f}..{levels[-1]:.1f}), до склейки {len(bands)}")
 
     for bi, (top_z, bot_z, region) in enumerate(merged, 1):
+        # мёртвые зоны: запретный футпринт по низу ИМЕННО этого диапазона —
+        # боксы, чей верх ниже диапазона, рез выше себя не ограничивают
+        region, _ = restrict_region(zones, region, zones["m"] if zones else 0.0,
+                                    bot_z, f"диапазон {bi}")
+        if region is None:
+            continue
         faces = _nearest_order([f for f in region.Faces if f.Area > 1.0],
                                lambda f: (f.CenterOfMass.x, f.CenterOfMass.y))
         for ri, rf in enumerate(faces, 1):
@@ -896,6 +1509,17 @@ def mill(doc, feat, p, stock_solid=None):
         stock_note = f"деталь + поля {margin}/{p.get('stock_margin_top', 0.0)} мм"
         log(f"заготовка: {sb.XLength:.1f} x {sb.YLength:.1f} x {sb.ZLength:.1f} мм "
             f"({stock_note})")
+    zones = p.get("_zones")
+    if zones:
+        if p.get("finish"):
+            # дублирует гард хоста: worker могут запустить и в обход run_cam
+            raise RuntimeError("мёртвые зоны поддерживаются только для черновой "
+                               "(v1) — отключите чистовую (--no-finish)")
+        check_zone_heights(zones, sb)   # потолок/пол зон против высот заготовки
+        warn_zone_sanity(zones, sb)     # зоны мимо заготовки = вероятно, не та СК
+        plug_stock_for_zones(doc, job, sb, zones, p)  # колонны от воздушных
+        # шорткатов Adaptive за краем заготовки (вход/линки на глубине реза)
+
     tc = job.Tools.Group[0]
     tool_d = float(p["tool_diameter"])
     set_prop(tc.Tool, "Diameter", FreeCAD.Units.Quantity(f"{tool_d} mm"))
@@ -927,6 +1551,7 @@ def mill(doc, feat, p, stock_solid=None):
         f"X0 Y0 Z0 = {p.get('origin', 'corner-top')})\n"
         f"(Tool: {tool_desc}, feed {p['feed_rate']:g} mm/min, "
         f"spindle {p['spindle_speed']:g} rpm)\n"
+        + zone_header_lines(zones)
     )
 
     ops = []
@@ -1039,6 +1664,13 @@ def main():
     with open(os.environ["FREECAD_WORKER_PARAMS"]) as f:
         p = json.load(f)
 
+    p["_zones"] = parse_zones(p)   # мёртвые зоны (или None) — в СК программы
+    if p["_zones"]:
+        z = p["_zones"]
+        log(f"мёртвые зоны: запретных боксов {len(z['boxes'])}, "
+            f"рабочий бокс: {'да' if z['work'] is not None else 'нет'}, "
+            f"полупространств {len(z['half'])}; отступ R{z['r']:g}+{z['m']:g} мм")
+
     doc = FreeCAD.newDocument("CAM")
     solid = load_model(p["model_path"], p.get("scale_to_mm", 1.0))
     if not solid.isValid():
@@ -1101,6 +1733,9 @@ def main():
             log(f"verify-export: не удалось ({e})")
 
     gcode = mill(doc, feat, p, stock_solid)
+
+    if p["_zones"]:
+        enforce_zone_gate(p["_zones"], gcode, p["gcode_path"])
 
     with open(p["gcode_path"], "w", encoding="utf-8") as f:
         f.write(gcode)

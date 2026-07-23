@@ -67,6 +67,21 @@ def main():
     ap.add_argument("--no-orient", action="store_true",
                     help="не поворачивать деталь (по умолчанию она кладётся "
                          "самой большой плоской гранью вниз)")
+    ap.add_argument("--keepout-box", nargs=6, type=float, action="append",
+                    metavar=("X0", "Y0", "Z0", "X1", "Y1", "Z1"),
+                    help="запретный бокс (НЕ ВХОДИТЬ) в СК программы; можно повторять. "
+                         "Инструмент не зайдёт и ПОД бокс (сверху не подъехать)")
+    ap.add_argument("--work-box", nargs=6, type=float, action="append",
+                    metavar=("X0", "Y0", "Z0", "X1", "Y1", "Z1"),
+                    help="рабочий бокс (НЕ ВЫХОДИТЬ) в СК программы; несколько — "
+                         "работа в их пересечении")
+    ap.add_argument("--keepout-halfspace", nargs=3, action="append",
+                    metavar=("AXIS", "CMP", "VALUE"),
+                    help="запретное полупространство: ось X/Y/Z, lt/gt, отсечка; "
+                         "пример: --keepout-halfspace Z lt 5 (запрещено z<5)")
+    ap.add_argument("--keepout-margin", type=float, metavar="MM",
+                    help="страховочный зазор вокруг зон сверх радиуса фрезы "
+                         "(дефолт из конфига: 0.5 мм)")
     ap.add_argument("--nx-export", action="store_true",
                     help="доп. сохранить деталь и заготовку в STEP в системе координат "
                          "G-кода (для симуляции в NX): рядом лягут <out>_part.step / _stock.step")
@@ -106,6 +121,26 @@ def main():
         config.NX_EXPORT = True
     if args.verify_export:
         config.VERIFY_EXPORT = True
+    if args.keepout_margin is not None:
+        config.KEEPOUT_MARGIN = args.keepout_margin
+    # зоны из CLI ДОБАВЛЯЮТСЯ к зонам из YAML: ограничения накапливаются
+    if args.keepout_box:
+        config.KEEPOUT_BOXES = list(config.KEEPOUT_BOXES) + [list(b) for b in args.keepout_box]
+    if args.work_box:
+        config.WORK_BOXES = list(config.WORK_BOXES) + [list(b) for b in args.work_box]
+    if args.keepout_halfspace:
+        config.KEEPOUT_HALFSPACES = (list(config.KEEPOUT_HALFSPACES)
+                                     + [list(h) for h in args.keepout_halfspace])
+
+    try:
+        zones_present = config.normalize_zones()
+    except ValueError as e:
+        print(f"❌ Мёртвые зоны: {e}")
+        sys.exit(1)
+    if zones_present and config.FINISH:
+        print("❌ Мёртвые зоны пока поддерживаются только для черновой обработки:")
+        print("   чистовой проход (Path Surface) не умеет их объезжать — добавьте --no-finish.")
+        sys.exit(1)
 
     if not config.ROUGH_ENABLED and not config.FINISH:
         print("❌ Нечего делать: --no-rough и --no-finish вместе отключают все операции.")
@@ -161,6 +196,18 @@ def main():
               if config.FINISH else "выключена (включить: --finish или FINISH: true)")
     print(f"Чистовая: {finish}")
     print(f"Ноль:     {config.ORIGIN}")
+    if zones_present:
+        print(f"Зоны:     отступ = радиус фрезы {config.TOOL_DIAMETER / 2.0:g} мм "
+              f"+ зазор {config.KEEPOUT_MARGIN:g} мм; СК зон = СК ПРОГРАММЫ "
+              f"(шапка G-кода)")
+        for b in config.KEEPOUT_BOXES:
+            print(f"  запрет: бокс X {b[0]:g}..{b[3]:g}  Y {b[1]:g}..{b[4]:g}  "
+                  f"Z {b[2]:g}..{b[5]:g} (не входить; под бокс — тоже нельзя)")
+        for b in config.WORK_BOXES:
+            print(f"  работа: бокс X {b[0]:g}..{b[3]:g}  Y {b[1]:g}..{b[4]:g}  "
+                  f"Z {b[2]:g}..{b[5]:g} (не выходить)")
+        for h in config.KEEPOUT_HALFSPACES:
+            print(f"  запрет: {h[0]} {'<' if h[1] == 'lt' else '>'} {h[2]:g}")
     print(f"Пост:     {config.POSTPROCESSOR}")
     print("Обработка...")
 

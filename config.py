@@ -59,6 +59,21 @@ SURFACE_CUT_PATTERN     = "Offset"  # рисунок строчек: Offset / Zi
 SURFACE_STEPOVER        = 40        # % диаметра фрезы между строчками (чистовая: 10–25)
 SURFACE_SAMPLE_INTERVAL = 0.5       # мм — разрешение сэмплинга (мельче = глаже/дольше)
 
+# ── Мёртвые зоны (keep-out): куда инструменту нельзя ─────────────────────────────
+# Все координаты — В СИСТЕМЕ КООРДИНАТ ПРОГРАММЫ (после авто-ориентации и сдвига
+# нуля) — той же, что у G-кода и строк (Stock box)/(Part) в его шапке. Снять их
+# можно с первого пробного прогона или из экспорта --nx-export/--verify-export.
+# Зоны из CLI ДОБАВЛЯЮТСЯ к зонам из YAML (ограничения накапливаются).
+# Инструмент считается вертикальным цилиндром Ø фрезы от кончика ВВЕРХ: запрет
+# действует и ПОД боксом (сверху туда не подъехать), а зона автоматически
+# расширяется на радиус фрезы + KEEPOUT_MARGIN.
+KEEPOUT_BOXES = []       # запретные боксы, НЕ ВХОДИТЬ: [[x0,y0,z0, x1,y1,z1], ...]
+WORK_BOXES = []          # рабочие боксы, НЕ ВЫХОДИТЬ: [[x0,y0,z0, x1,y1,z1], ...]
+                         # несколько — работаем в их пересечении
+KEEPOUT_HALFSPACES = []  # запретные полупространства: [["Z","lt",5.0], ...] —
+                         # ось X/Y/Z + lt/gt + отсечка ("Z lt 5" = запрещено z<5)
+KEEPOUT_MARGIN = 0.5     # мм — страховочный зазор вокруг зон СВЕРХ радиуса фрезы
+
 # ── Система координат ────────────────────────────────────────────────────────────
 # Ноль программы. Детали из NX часто лежат в координатах сборки/станка (за метры от
 # нуля) — поэтому по умолчанию модель нормализуется:
@@ -102,3 +117,61 @@ def load(path: str) -> None:
             unknown.append(key)
     if unknown:
         print(f"[config] Неизвестные ключи (проигнорированы): {', '.join(unknown)}")
+
+
+def normalize_zones() -> bool:
+    """Канонизирует мёртвые зоны на месте (KEEPOUT_BOXES / WORK_BOXES /
+    KEEPOUT_HALFSPACES) и валидирует их. Возвращает True, если зоны заданы.
+    Бросает ValueError с понятным сообщением при ошибке формата.
+    Канон: бокс = [x0,y0,z0,x1,y1,z1] с отсортированными парами координат;
+    полупространство = ["X"|"Y"|"Z", "lt"|"gt", float]."""
+    module = sys.modules[__name__]
+
+    def _norm_box(box, kind):
+        try:
+            vals = [float(v) for v in box]
+        except (TypeError, ValueError):
+            raise ValueError(f"{kind}: ожидаю 6 чисел, получено {box!r}")
+        if len(vals) != 6:
+            raise ValueError(f"{kind}: ожидаю 6 чисел (x0 y0 z0 x1 y1 z1), "
+                             f"получено {len(vals)}: {box!r}")
+        lo = [min(vals[i], vals[i + 3]) for i in range(3)]
+        hi = [max(vals[i], vals[i + 3]) for i in range(3)]
+        return lo + hi
+
+    keepout = [_norm_box(b, "запретный бокс") for b in (KEEPOUT_BOXES or [])]
+    work = [_norm_box(b, "рабочий бокс") for b in (WORK_BOXES or [])]
+
+    half = []
+    for h in (KEEPOUT_HALFSPACES or []):
+        try:
+            axis, cmp_, value = h
+        except (TypeError, ValueError):
+            raise ValueError(f"полупространство: ожидаю [ось, lt/gt, отсечка], "
+                             f"получено {h!r}")
+        axis = str(axis).upper()
+        cmp_ = {"lt": "lt", "<": "lt", "gt": "gt", ">": "gt"}.get(str(cmp_).lower())
+        if axis not in ("X", "Y", "Z") or cmp_ is None:
+            raise ValueError(f"полупространство {h!r}: ось — X/Y/Z, сравнение — lt/gt")
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"полупространство {h!r}: отсечка — число")
+        half.append([axis, cmp_, value])
+
+    # рабочий бокс тесней 2*(радиус+зазор) по XY (или 2*зазор по Z) — фрезе
+    # физически негде работать: ловим до запуска FreeCAD
+    shrink_xy = 2.0 * (float(TOOL_DIAMETER) / 2.0 + float(KEEPOUT_MARGIN))
+    shrink_z = 2.0 * float(KEEPOUT_MARGIN)
+    for b in work:
+        sizes = (b[3] - b[0], b[4] - b[1], b[5] - b[2])
+        if sizes[0] <= shrink_xy or sizes[1] <= shrink_xy or sizes[2] <= shrink_z:
+            raise ValueError(
+                f"рабочий бокс {sizes[0]:g}x{sizes[1]:g}x{sizes[2]:g} мм меньше "
+                f"двойного (радиус фрезы + зазор) = {shrink_xy:g} мм по XY / "
+                f"{shrink_z:g} мм по Z — внутри не остаётся места для инструмента")
+
+    module.KEEPOUT_BOXES = keepout
+    module.WORK_BOXES = work
+    module.KEEPOUT_HALFSPACES = half
+    return bool(keepout or work or half)

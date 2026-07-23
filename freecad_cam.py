@@ -75,6 +75,14 @@ def generate_gcode_freecad(model_path: str, gcode_path: str) -> int:
     if not fc:
         raise RuntimeError("freecadcmd не найден (укажите FREECAD_CMD в конфиге)")
 
+    # мёртвые зоны: канонизация (идемпотентна — run_cam уже мог вызвать) + гард
+    zones_present = config.normalize_zones()   # ValueError уйдёт наверх как есть
+    if zones_present and config.FINISH:
+        raise RuntimeError(
+            "мёртвые зоны поддерживаются только для черновой (v1): чистовой "
+            "Path Surface не умеет их объезжать — отключите чистовую "
+            "(--no-finish / FINISH: false)")
+
     params = {
         "model_path": os.path.abspath(model_path),
         "gcode_path": os.path.abspath(gcode_path),
@@ -103,6 +111,12 @@ def generate_gcode_freecad(model_path: str, gcode_path: str) -> int:
         "postprocessor": config.POSTPROCESSOR,
         "nx_export": config.NX_EXPORT,   # экспорт STEP деталь/заготовка в СК G-кода (для NX)
         "verify_export": config.VERIFY_EXPORT,  # эталон+маски (STEP) в СК G-кода (для verify.py)
+
+        # мёртвые зоны (канон из config.normalize_zones, СК программы)
+        "keepout_boxes": config.KEEPOUT_BOXES,
+        "work_boxes": config.WORK_BOXES,
+        "keepout_halfspaces": config.KEEPOUT_HALFSPACES,
+        "keepout_margin": config.KEEPOUT_MARGIN,
     }
 
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tmp:
