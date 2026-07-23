@@ -68,6 +68,9 @@ def main():
     ap.add_argument("--nx-export", action="store_true",
                     help="доп. сохранить деталь и заготовку в STEP в системе координат "
                          "G-кода (для симуляции в NX): рядом лягут <out>_part.step / _stock.step")
+    ap.add_argument("--verify-export", action="store_true",
+                    help="доп. сохранить эталон и маски достижимости граней в STL (в СК "
+                         "G-кода) для verify.py: <out>_part.stl / _reachable.stl / _unreachable.stl")
     args = ap.parse_args()
 
     if args.config:
@@ -97,6 +100,8 @@ def main():
         config.AUTO_ORIENT = False
     if args.nx_export:
         config.NX_EXPORT = True
+    if args.verify_export:
+        config.VERIFY_EXPORT = True
 
     ext = os.path.splitext(args.model)[1].lower()
     if ext == ".prt":

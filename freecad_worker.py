@@ -972,6 +972,83 @@ def mill(doc, feat, p, stock_solid=None):
     return p["_gcode_header"] + export_gcode(job, ops, p["postprocessor"])
 
 
+# ── Экспорт эталона и масок достижимости для verify.py (флаг --verify-export) ─────
+def _mesh_shape(shape, lin=0.1):
+    """Тесселляция BREP → Mesh. Через MeshPart, с откатом на Shape.tessellate."""
+    try:
+        import MeshPart
+        return MeshPart.meshFromShape(Shape=shape, LinearDeflection=lin,
+                                      AngularDeflection=0.5)
+    except Exception:
+        verts, facets = shape.tessellate(lin)
+        m = Mesh.Mesh()
+        for a, b, c in facets:
+            m.addFacet(verts[a], verts[b], verts[c])
+        return m
+
+
+def _write_faces_stl(solid, idxs, path, lin=0.1):
+    """Пишет подмножество граней тела в STL. Возвращает False, если граней нет."""
+    if not idxs:
+        return False
+    comp = Part.makeCompound([solid.Faces[i] for i in idxs])
+    _mesh_shape(comp, lin).write(path)
+    return True
+
+
+def classify_reachable_faces(solid):
+    """Делит грани детали на достижимые сверху (3-осевой установ, ось +Z) и
+    недостижимые («второй установ»). Достижимо: нормаль смотрит вверх ИЛИ грань —
+    вертикальная стенка, и сверху не накрыта материалом. Недостижимо: нормаль вниз
+    (низ детали, подрезы, низ нависаний) или грань накрыта телом при взгляде сверху.
+    Внешняя нормаль определяется геометрически (проба по обе стороны грани), а не по
+    флагу Orientation — устойчиво к тому, как ориентированы грани в импортированном
+    STEP. Возвращает (reachable_idx, unreachable_idx) — индексы в solid.Faces."""
+    UP = 0.01
+    reachable, unreachable = [], []
+    for i, f in enumerate(solid.Faces):
+        if f.Area < 1e-3:
+            continue
+        try:
+            u0, u1, v0, v1 = f.ParameterRange
+            mid = f.valueAt((u0 + u1) / 2, (v0 + v1) / 2)
+            n = f.normalAt((u0 + u1) / 2, (v0 + v1) / 2)
+            n.normalize()
+        except Exception:
+            unreachable.append(i)          # не смогли оценить — в «второй установ»
+            continue
+        eps = 1e-3
+        p_out = FreeCAD.Vector(mid.x + n.x * eps, mid.y + n.y * eps, mid.z + n.z * eps)
+        p_in = FreeCAD.Vector(mid.x - n.x * eps, mid.y - n.y * eps, mid.z - n.z * eps)
+        nz = n.z
+        # если «наружу» по нормали оказался материал, а «внутрь» — воздух, нормаль
+        # смотрит внутрь тела → берём её со знаком минус (истинная внешняя нормаль)
+        if solid.isInside(p_out, 1e-6, True) and not solid.isInside(p_in, 1e-6, True):
+            nz = -nz
+        probe = FreeCAD.Vector(mid.x, mid.y, f.BoundBox.ZMax + 0.3)
+        covered = solid.isInside(probe, 1e-6, True)
+        if covered or nz < -UP:
+            unreachable.append(i)
+        else:
+            reachable.append(i)
+    return reachable, unreachable
+
+
+def export_verify_stl(solid, base):
+    """Пишет эталон (watertight) и маски достижимых/недостижимых граней в STL
+    рядом с G-кодом — вход для verify.py. Всё в текущей (ориентированной, сдвинутой)
+    СК, ровно как у G-кода и у результата симуляции."""
+    _mesh_shape(solid).write(base + "_part.stl")
+    log(f"verify-export: эталон → {os.path.basename(base)}_part.stl")
+    reach, unreach = classify_reachable_faces(solid)
+    if _write_faces_stl(solid, reach, base + "_reachable.stl"):
+        log(f"verify-export: достижимые грани ({len(reach)}) → "
+            f"{os.path.basename(base)}_reachable.stl")
+    if _write_faces_stl(solid, unreach, base + "_unreachable.stl"):
+        log(f"verify-export: недостижимые грани, второй установ ({len(unreach)}) → "
+            f"{os.path.basename(base)}_unreachable.stl")
+
+
 def main():
     with open(os.environ["FREECAD_WORKER_PARAMS"]) as f:
         p = json.load(f)
@@ -1030,6 +1107,12 @@ def main():
             log(f"NX-export: заготовка → {os.path.basename(base)}_stock.step")
         else:
             log("NX-export: заготовка = бокс, STEP не пишу — создай блок в NX по шапке (Stock box)")
+
+    if p.get("verify_export"):
+        try:
+            export_verify_stl(solid, os.path.splitext(p["gcode_path"])[0])
+        except Exception as e:
+            log(f"verify-export: не удалось ({e})")
 
     gcode = mill(doc, feat, p, stock_solid)
 
