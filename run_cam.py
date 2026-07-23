@@ -65,6 +65,9 @@ def main():
     ap.add_argument("--no-orient", action="store_true",
                     help="не поворачивать деталь (по умолчанию она кладётся "
                          "самой большой плоской гранью вниз)")
+    ap.add_argument("--nx-export", action="store_true",
+                    help="доп. сохранить деталь и заготовку в STEP в системе координат "
+                         "G-кода (для симуляции в NX): рядом лягут <out>_part.step / _stock.step")
     args = ap.parse_args()
 
     if args.config:
@@ -92,6 +95,8 @@ def main():
         config.STOCK_FILE = args.stock
     if args.no_orient:
         config.AUTO_ORIENT = False
+    if args.nx_export:
+        config.NX_EXPORT = True
 
     ext = os.path.splitext(args.model)[1].lower()
     if ext == ".prt":

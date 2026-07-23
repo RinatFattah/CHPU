@@ -74,6 +74,9 @@ POSTPROCESSOR   = "grbl"  # диалект G-Code: grbl / linuxcnc / fanuc / mac
 FREECAD_CMD     = ""      # путь к freecadcmd; пусто → автопоиск (AppImage/PATH/snap)
 FREECAD_TIMEOUT = 3600    # сек — таймаут на расчёт траектории (черновая Adaptive
                           # на сложной детали может считаться десятки минут)
+# Экспорт детали и заготовки в STEP в системе координат G-кода (после ориентации и
+# сдвига нуля) — для симуляции в NX: рядом с G-кодом лягут <out>_part.step / _stock.step.
+NX_EXPORT = False
 # Только для мешей (.stl/.obj): множитель единиц → мм (STL в метрах = 1000,
 # STL в мм = 1.0). Для STEP/IGES игнорируется — единицы несёт сам файл.
 STL_SCALE_TO_MM = 1000.0

@@ -1015,6 +1015,22 @@ def main():
     feat.Shape = solid
     doc.recompute()
 
+    # Опционально: экспорт детали и заготовки в STEP в ТЕКУЩЕЙ (ориентированной,
+    # сдвинутой) системе координат — ровно в той, что у G-кода. Для симуляции в NX:
+    # импортируешь эти STEP, MCS в нуле — и всё встаёт под траекторию.
+    if p.get("nx_export"):
+        base = os.path.splitext(p["gcode_path"])[0]
+        Part.export([feat], base + "_part.step")
+        log(f"NX-export: деталь → {os.path.basename(base)}_part.step")
+        if stock_solid is not None:
+            sfeat = doc.addObject("Part::Feature", "Stock")
+            sfeat.Shape = stock_solid
+            doc.recompute()
+            Part.export([sfeat], base + "_stock.step")
+            log(f"NX-export: заготовка → {os.path.basename(base)}_stock.step")
+        else:
+            log("NX-export: заготовка = бокс, STEP не пишу — создай блок в NX по шапке (Stock box)")
+
     gcode = mill(doc, feat, p, stock_solid)
 
     with open(p["gcode_path"], "w", encoding="utf-8") as f:
