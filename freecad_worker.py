@@ -981,7 +981,7 @@ def make_surface_rough(doc, job, tc, name, model_obj, face_idx, p,
     return op if n > 2 else None
 
 
-def make_roughing_ops(doc, job, tc, shape, p):
+def make_roughing_ops(doc, job, tc, shape, p, region_stock=None):
     """Черновая «по-человечески» — раздельными операциями в порядке техпроцесса:
       1. RoughContour — контур: материал между силуэтом детали и краем заготовки
          (существует только при STOCK_MARGIN > 0);
@@ -1006,7 +1006,11 @@ def make_roughing_ops(doc, job, tc, shape, p):
 
     sil = build_silhouette(shape, bb, p["rough_stepdown"])
     ops = []
-    stock_shape = job.Stock.Shape
+    # регионы строим от НЕпроплюженной заготовки (region_stock): запретные
+    # колонны нужны только планировщику Adaptive (job.Stock), а в геометрии
+    # регионов они дали бы «ореол» — кольцо ⊕ Ø вокруг колонн, т.е. холостые
+    # заезды далеко за реальную заготовку
+    stock_shape = region_stock if region_stock is not None else job.Stock.Shape
 
     def local_start(region_shape):
         """Локальный верх материала над зоной: колонна над зоной ∩ заготовка.
@@ -1043,7 +1047,7 @@ def make_roughing_ops(doc, job, tc, shape, p):
                                    "Part::FaceMakerBullseye")
             # силуэт ЗАГОТОВКИ: для бокса это прямоугольник, для произвольной
             # заготовки из файла — её реальный контур в плане
-            stock_sil = build_silhouette(job.Stock.Shape, sb, p["rough_stepdown"])
+            stock_sil = build_silhouette(stock_shape, sb, p["rough_stepdown"])
             stock_filled = Part.makeFace([f.OuterWire for f in stock_sil.Faces],
                                          "Part::FaceMakerBullseye")
             material = stock_filled.cut(filled)  # реальный материал по периметру
@@ -1281,7 +1285,7 @@ def make_roughing_ops(doc, job, tc, shape, p):
     return ops
 
 
-def make_layered_ops(doc, job, tc, shape, p):
+def make_layered_ops(doc, job, tc, shape, p, region_stock=None):
     """ЭКСПЕРИМЕНТ (--rough-mode layers): послойная черновая «как технолог в NX
     делает Cavity Mill». Ничего не угадывает про типы фич — на каждой высоте
     ответ точный:  материал(Z) = проекция заготовки − тень детали выше Z.
@@ -1298,7 +1302,8 @@ def make_layered_ops(doc, job, tc, shape, p):
     ops = []
     zones = p.get("_zones")
 
-    ssil = build_silhouette(job.Stock.Shape, sb, step)
+    region_stock = region_stock if region_stock is not None else job.Stock.Shape
+    ssil = build_silhouette(region_stock, sb, step)
     if ssil is None:
         log("warn: силуэт заготовки не построился — послойная черновая невозможна")
         return ops
@@ -1371,7 +1376,7 @@ def make_layered_ops(doc, job, tc, shape, p):
             pass
         stock_sec = None
         for z in (top_z - eps, bot_z + eps):
-            for fc in _slice_faces(job.Stock.Shape, z):
+            for fc in _slice_faces(region_stock, z):
                 stock_sec = fc if stock_sec is None else stock_sec.fuse(fc)
         if stock_sec is None:
             continue  # заготовки на этих высотах нет
@@ -1494,6 +1499,7 @@ def mill(doc, feat, p, stock_solid=None):
         log(f"заготовка: {sb.XLength:.1f} x {sb.YLength:.1f} x {sb.ZLength:.1f} мм "
             f"({stock_note})")
     zones = p.get("_zones")
+    region_stock = None
     if zones:
         if p.get("finish"):
             # дублирует гард хоста: worker могут запустить и в обход run_cam
@@ -1501,6 +1507,7 @@ def mill(doc, feat, p, stock_solid=None):
                                "(v1) — отключите чистовую (--no-finish)")
         check_zone_heights(zones, sb)   # потолок/пол зон против высот заготовки
         warn_zone_sanity(zones, sb)     # зоны мимо заготовки = вероятно, не та СК
+        region_stock = job.Stock.Shape  # геометрия регионов — БЕЗ колонн
         plug_stock_for_zones(doc, job, sb, zones, p)  # колонны от воздушных
         # шорткатов Adaptive за краем заготовки (вход/линки на глубине реза)
 
@@ -1541,9 +1548,9 @@ def mill(doc, feat, p, stock_solid=None):
     ops = []
     if p.get("rough_enabled", True):        # припуск (в т.ч. 0 = до номинала) — отдельно
         if p.get("rough_mode", "stages") == "layers":
-            ops.extend(make_layered_ops(doc, job, tc, feat.Shape, p))
+            ops.extend(make_layered_ops(doc, job, tc, feat.Shape, p, region_stock))
         else:
-            ops.extend(make_roughing_ops(doc, job, tc, feat.Shape, p))
+            ops.extend(make_roughing_ops(doc, job, tc, feat.Shape, p, region_stock))
     else:
         log("черновая отключена (--no-rough)")
 
