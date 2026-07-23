@@ -43,9 +43,13 @@ post-simulation machined mesh (STL/STEP from NX ISV or CAMotics) to the nominal 
 against an allowance. Signed deviation split into GOUGE (below nominal, must be ~0) and
 EXCESS (above nominal, must be <= allowance), checked ONLY on REACHABLE surfaces.
 `run_cam.py --verify-export` writes the nominal + reachable/unreachable face masks as
-STL in G-code coords (`<out>_part.stl` / `_reachable.stl` / `_unreachable.stl`); verify
-masks out second-setup zones (grey on the `_deviation.ply` colour map). Both inputs
-MUST be in the same frame (the G-code frame). The reachability classifier uses a
+STEP (exact BREP) in G-code coords (`<out>_part.step` / `_reachable.step` /
+`_unreachable.step`) — via `Shape.exportStep`, NOT `Part.export([rawShape])` which needs
+document objects and silently writes ~empty STEP for raw shapes. verify tessellates STEP
+inputs via FreeCAD (one batch freecadcmd call, `--deflection`, default 0.03 mm); STL
+loads directly. The IPW is faceted regardless, so the compare is mesh-based (STEP is just
+the container). verify masks out second-setup zones (grey on the `_deviation.ply` colour
+map). Both inputs MUST be in the same frame (the G-code frame). The reachability classifier uses a
 GEOMETRIC outward-normal test (probe both sides of the face — robust to STEP face
 orientation), NOT face.Orientation, and also corrects the worker's warn-accounting gap
 where down-facing horizontal faces slipped through `is_handled`. Signed distance is
@@ -76,10 +80,11 @@ it lives in git history if ever needed.
   (env var `FREECAD_WORKER_PARAMS`), parses `[worker]` output markers.
 - `freecad_worker.py` - runs **inside** FreeCAD's interpreter: model → solid →
   origin normalization → Path Job → Surface op → postprocessor → G-Code. Under
-  `--verify-export` also writes nominal + reachability masks (STL) via
-  `export_verify_stl` / `classify_reachable_faces`.
-- `verify.py` - standalone (numpy/scipy/trimesh, no FreeCAD): machined mesh ↔ nominal,
-  allowance/gouge check, colour deviation map. See `--from-export`.
+  `--verify-export` also writes nominal + reachability masks as STEP via
+  `export_verify` / `classify_reachable_faces` (`Shape.exportStep`).
+- `verify.py` - standalone math (numpy/scipy/trimesh); reads STEP via FreeCAD
+  tessellation (one batch call), STL directly. machined mesh ↔ nominal, allowance/gouge
+  check, colour deviation map. `--from-export` finds `.step`, else `.stl`.
 - `config.py` - parameter defaults + YAML loading (`--config`).
 - `README_CAM.md` - operator-facing parameter reference. **Keep in sync** when
   changing CAM params. `README.md` - main handoff doc.
@@ -102,12 +107,15 @@ it lives in git history if ever needed.
   on Ubuntu 24.04; the snap is broken headless (Qt symbol mismatch vs kf6-core24).
 - FreeCAD's CAM has **no lathe/turning operations** — turning was prototyped and
   removed; don't promise it.
-- Verification deps (numpy/scipy/trimesh) are for `verify.py` only — the core pipeline
-  still needs just pyyaml + FreeCAD. `rtree`/`embree` are NOT installed, so verify never
-  uses trimesh's rtree proximity path (would be silently slow); it uses
-  `closest_point_naive` (exact, chunked) or surface-sample + cKDTree.
-- Generated verification outputs are gitignored: `*.stl` (masks + machined) already,
-  `*_deviation.ply` added. Masks/machined/deviation are artifacts — never commit them.
+- Verification math deps (numpy/scipy/trimesh) are for `verify.py`; STEP inputs also need
+  FreeCAD (tessellation). Core pipeline still needs just pyyaml + FreeCAD. `rtree`/`embree`
+  NOT installed → verify never uses trimesh's rtree proximity path (silently slow); it
+  uses `closest_point_naive` (exact, chunked) or surface-sample + cKDTree. `freecad_cam.
+  find_freecadcmd` now also globs Windows installs (`AppData\Local\Programs\FreeCAD*`,
+  `Program Files\FreeCAD*`) — so run_cam/verify find FreeCAD on Windows without config.yaml.
+- Generated outputs are gitignored: `*.gcode`, `*.stl`, `*.step` (nx-export + verify-export
+  outputs), `*.mpf`, `*_deviation.ply`. Inputs use `.stp` (tracked); `.step` here is always
+  generated. Never commit masks/machined/deviation/mpf.
 
 ## Verification
 

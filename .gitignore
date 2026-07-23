@@ -19,9 +19,11 @@ config.local.yaml
 .env
 .env.*
 
-# Выходные файлы pipeline
+# Выходные файлы pipeline (входы — .stp; .step/.stl/.mpf здесь всегда генерируются)
 *.stl
+*.step
 *.gcode
+*.mpf
 *_deviation.ply
 
 # IDE

@@ -132,11 +132,12 @@ M17
 в припуск — скриптом `verify.py`, без NX.
 
 1. На шаге 1 «Перед NX» добавь к команде флаг **`--verify-export`** — рядом с G-кодом
-   лягут `out_part.stl` (эталон) и маски `out_reachable.stl` / `out_unreachable.stl`.
-2. Результат из Фазы 6 выгрузи как **STL** (для verify проще), напр. `machined.stl`.
+   лягут `out_part.step` (эталон) и маски `out_reachable.step` / `out_unreachable.step`.
+2. Результат из Фазы 6 у тебя уже в **STEP** (AP242) — им и пользуйся, напр.
+   `machined.step` (STL тоже принимается).
 3. В терминале:
    ```
-   python verify.py machined.stl --from-export out --allowance 0.5
+   python verify.py machined.step --from-export out --allowance 0.5
    ```
 4. Вердикт: **зарез** ниже номинала должен быть ≈ 0, **избыток** над номиналом ≤ припуска
    (на достижимых поверхностях; зоны второго установа исключаются по маске). Файл
