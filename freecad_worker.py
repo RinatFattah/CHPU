@@ -798,7 +798,12 @@ def make_adaptive(doc, job, tc, name, region_shape, p, start_z, final_z, allowan
     op.StartDepth = start_z
     op.setExpression("FinalDepth", None)
     op.FinalDepth = final_z
+    # ClearanceHeight/SafeHeight тоже привязаны экспрешеном к SetupSheet
+    # (сток-топ + 5/3): без setExpression(None) присвоение .Value молча
+    # откатывается на recompute — и подъём клиренса над боксами не доедет
+    op.setExpression("ClearanceHeight", None)
     op.ClearanceHeight.Value = op_clearance(p, start_z)  # не ниже верха запретных боксов
+    op.setExpression("SafeHeight", None)
     op.SafeHeight.Value = start_z + 3.0
     doc.recompute()  # здесь Adaptive считает траекторию — самый долгий шаг
 
@@ -837,7 +842,12 @@ def make_profile(doc, job, tc, name, region_shape, p, start_z, final_z, allowanc
     op.StartDepth = start_z
     op.setExpression("FinalDepth", None)
     op.FinalDepth = final_z
+    # ClearanceHeight/SafeHeight тоже привязаны экспрешеном к SetupSheet
+    # (сток-топ + 5/3): без setExpression(None) присвоение .Value молча
+    # откатывается на recompute — и подъём клиренса над боксами не доедет
+    op.setExpression("ClearanceHeight", None)
     op.ClearanceHeight.Value = op_clearance(p, start_z)  # не ниже верха запретных боксов
+    op.setExpression("SafeHeight", None)
     op.SafeHeight.Value = start_z + 3.0
     doc.recompute()
 
@@ -879,7 +889,12 @@ def make_surface_rough(doc, job, tc, name, model_obj, face_idx, p,
     op.StartDepth = start_z
     op.setExpression("FinalDepth", None)
     op.FinalDepth = final_z
+    # ClearanceHeight/SafeHeight тоже привязаны экспрешеном к SetupSheet
+    # (сток-топ + 5/3): без setExpression(None) присвоение .Value молча
+    # откатывается на recompute — и подъём клиренса над боксами не доедет
+    op.setExpression("ClearanceHeight", None)
     op.ClearanceHeight.Value = op_clearance(p, start_z)  # не ниже верха запретных боксов
+    op.setExpression("SafeHeight", None)
     op.SafeHeight.Value = start_z + 3.0
     doc.recompute()
 
