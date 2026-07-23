@@ -173,6 +173,41 @@ def _pct(a, q):
     return float(np.percentile(a, q)) if len(a) else 0.0
 
 
+def _render_png(V, colors, allowance, verdict, gpts, path):
+    """PNG: вид сверху (XY) + 3D, точки покрашены по зонам. Нужен matplotlib."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+    except Exception:
+        print("для --render нужен matplotlib (pip install matplotlib) — PNG пропущен")
+        return
+    c = colors[:, :3] / 255.0
+    fig = plt.figure(figsize=(13, 6))
+    ax1 = fig.add_subplot(1, 2, 1)
+    ax1.scatter(V[:, 0], V[:, 1], c=c, s=5, marker="s", linewidths=0)
+    ax1.set_aspect("equal", "box")
+    ax1.set_xlabel("X, мм"); ax1.set_ylabel("Y, мм"); ax1.set_title("вид сверху (XY)")
+    if gpts is not None and len(gpts):
+        ax1.scatter(gpts[:, 0], gpts[:, 1], facecolors="none",
+                    edgecolors="#1030c0", s=60, linewidths=1.2)   # обвести зарезы
+    ax2 = fig.add_subplot(1, 2, 2, projection="3d")
+    ax2.scatter(V[:, 0], V[:, 1], V[:, 2], c=c, s=3, linewidths=0)
+    ax2.view_init(elev=28, azim=-58); ax2.set_title("3D")
+    try:
+        ax2.set_box_aspect(np.ptp(V, axis=0))
+    except Exception:
+        pass
+    fig.suptitle(f"Верификация: {'PASS' if verdict else 'FAIL'}  |  припуск {allowance} мм  |  "
+                 f"зелёный=в припуске · красный=избыток · синий=зарез · "
+                 f"оранжевый=остаток · серый=2-й установ", fontsize=10)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+    print(f"снимок → {path}")
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Верификация детали после обработки по припуску (сравнение с эталоном)",
@@ -194,11 +229,11 @@ def main():
     ap.add_argument("--unreachable", metavar="FILE",
                     help="маска недостижимых граней «второго установа» (STL)")
     ap.add_argument("--out", metavar="FILE", help="карта отклонений (PLY); дефолт — рядом")
+    ap.add_argument("--render", action="store_true",
+                    help="сохранить PNG-снимок (вид сверху + 3D); нужен matplotlib")
     ap.add_argument("--json", metavar="FILE", help="машиночитаемый отчёт (JSON)")
     ap.add_argument("--samples", type=int, default=200000,
                     help="сэмплов поверхности для приближённого режима крупных мешей")
-    ap.add_argument("--gouge-samples", type=int, default=40000,
-                    help="сэмплов поверхности эталона для поиска зареза (плотность покрытия)")
     ap.add_argument("--deflection", type=float, default=0.03, metavar="MM",
                     help="точность тесселляции STEP → сетка, мм (мельче = точнее/дольше)")
     ap.add_argument("--config", metavar="FILE",
@@ -262,13 +297,14 @@ def main():
     # ОСТАТОК (периметр заготовки, база под деталью — это второй установ). В вердикт по
     # припуску идёт только финишная поверхность (достижимая и в пределах band от номинала).
     band = args.band if args.band is not None else max(2.0, 4 * args.allowance)
-    finished = reach & (excess <= band)
-    leftover = excess > band
+    far = (excess > band) | (below > band)          # грубое отклонение: периметр/низ IPW (2-й
+    finished = reach & ~far                          # установ). Вдали от номинала знак sdf по
+    leftover = far                                   # нормали ненадёжен — потому и режем по |dev|
 
-    # зарез: точки поверхности эталона, оказавшиеся СНАРУЖИ обработанной детали
-    gsrc = R if masks else P                        # считаем зарез на достижимых гранях
-    qg, _ = trimesh.sample.sample_surface(gsrc, args.gouge_samples)
-    gouge = np.clip(sdf_outside(M, qg, args.samples), 0, None)
+    # зарез: машинная поверхность НИЖЕ номинала (это `below`; знак — от надёжных нормалей
+    # ЭТАЛОНА, НЕ от нормалей фасеточного IPW). Только на финишной поверхности: реальный
+    # зарез мал, а вдали от номинала знак «внутри/снаружи» случаен.
+    gouge = np.where(finished, below, 0.0)
 
     ef = excess[finished]
     max_excess = float(ef.max()) if len(ef) else 0.0
@@ -304,7 +340,7 @@ def main():
         print(f"худший избыток финишной пов. @ ({V[fi,0]:.1f}, {V[fi,1]:.1f}, {V[fi,2]:.1f})")
     if max_gouge > 1e-6:
         gi = int(np.argmax(gouge))
-        print(f"худший зарез @ ({qg[gi,0]:.1f}, {qg[gi,1]:.1f}, {qg[gi,2]:.1f})")
+        print(f"худший зарез @ ({V[gi,0]:.1f}, {V[gi,1]:.1f}, {V[gi,2]:.1f})")
     print("───────────────────────────────────────────────────────")
     print(f"ВЕРДИКТ: {'✅ PASS — финишная поверхность в припуске' if verdict else '❌ FAIL'}")
     if not ok_gouge:
@@ -320,12 +356,45 @@ def main():
     col[finished & (excess > args.allowance)] = [210, 70, 60, 255]        # красный: недосъём на детали
     col[~reach & (excess <= band)] = [140, 140, 140, 255]                 # серый: второй установ у пов.
     col[leftover] = [235, 150, 40, 255]                                   # оранжевый: грубый остаток
-    col[below > args.gouge_tol] = [70, 110, 210, 255]                     # синий: зарез
+    col[gouge > args.gouge_tol] = [70, 110, 210, 255]                     # синий: зарез (на финишной)
     M.visual.vertex_colors = col
     out = args.out or (os.path.splitext(args.machined)[0] + "_deviation.ply")
     M.export(out)
     print(f"карта отклонений → {out}\n  (зелёный=в припуске, красный=избыток на детали, "
           f"синий=зарез, оранжевый=грубый остаток, серый=второй установ)")
+
+    # ── отдельные зоны + топ-худших мест (чтобы видеть, ГДЕ) ──
+    rbase = os.path.splitext(out)[0]
+    if rbase.endswith("_deviation"):
+        rbase = rbase[:-len("_deviation")]
+    gmask = gouge > args.gouge_tol                          # точки зареза (на эталоне)
+    xmask = finished & (excess > args.allowance)            # избыток на детали (на результате)
+    if gmask.any():
+        trimesh.PointCloud(V[gmask], colors=np.tile([70, 110, 210, 255],
+                           (int(gmask.sum()), 1))).export(rbase + "_gouge.ply")
+        print(f"зарез: {int(gmask.sum())} точек → {rbase}_gouge.ply")
+    if xmask.any():
+        trimesh.PointCloud(V[xmask], colors=np.tile([210, 70, 60, 255],
+                           (int(xmask.sum()), 1))).export(rbase + "_excess.ply")
+        print(f"избыток > припуска: {int(xmask.sum())} точек → {rbase}_excess.ply")
+
+    def _worst(pts, vals, m, n=5):
+        i = np.argsort(vals[m])[::-1][:n]
+        return pts[m][i], vals[m][i]
+    if gmask.any():
+        p, v = _worst(V, gouge, gmask)
+        print("топ зарезов (мм @ X, Y, Z):")
+        for k in range(len(v)):
+            print(f"   {v[k]:5.2f} @ ({p[k,0]:6.1f}, {p[k,1]:6.1f}, {p[k,2]:6.1f})")
+    if xmask.any():
+        p, v = _worst(V, excess, xmask)
+        print("топ избытка на детали (мм @ X, Y, Z):")
+        for k in range(len(v)):
+            print(f"   {v[k]:5.2f} @ ({p[k,0]:6.1f}, {p[k,1]:6.1f}, {p[k,2]:6.1f})")
+
+    if args.render:
+        _render_png(V, col, args.allowance, verdict,
+                    V[gmask] if gmask.any() else None, rbase + "_deviation.png")
 
     if args.json:
         import json

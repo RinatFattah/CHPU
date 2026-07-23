@@ -119,6 +119,15 @@ it lives in git history if ever needed.
   uses `closest_point_naive` (exact, chunked) or surface-sample + cKDTree. `freecad_cam.
   find_freecadcmd` now also globs Windows installs (`AppData\Local\Programs\FreeCAD*`,
   `Program Files\FreeCAD*`) — so run_cam/verify find FreeCAD on Windows without config.yaml.
+  `--render` (PNG snapshot: top view + 3D) additionally needs matplotlib.
+- verify GOUGE gotcha: measure gouge as machined-vertex `below` (sign from NOMINAL normals,
+  reliable), NEVER via sdf using the faceted IPW's own normals (not consistently outward →
+  ~33k spurious "gouge" points seen on a real IPW). The normal-based SDF sign is only
+  trustworthy NEAR the surface, so classify anything >band from nominal (EITHER sign) as
+  "gross leftover", not gouge — else a stock corner 25 mm away reads as a 25 mm gouge.
+  Sub-mm gouge at sharp edges is a sign artifact, not a real overcut. verify also emits
+  `<machined>_gouge.ply` / `_excess.ply` point clouds + top-5 worst spots (X,Y,Z) for
+  localization.
 - Generated outputs are gitignored: `*.gcode`, `*.stl`, `*.step` (nx-export + verify-export
   outputs), `*.mpf`, `*_deviation.ply`. Inputs use `.stp` (tracked); `.step` here is always
   generated. Never commit masks/machined/deviation/mpf.
