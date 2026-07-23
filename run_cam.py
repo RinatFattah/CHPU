@@ -126,6 +126,8 @@ def main():
         sys.exit(1)
 
     gcode = args.gcode or (os.path.splitext(args.model)[0] + ".gcode")
+    out_dir = os.path.dirname(os.path.abspath(gcode))
+    os.makedirs(out_dir, exist_ok=True)      # создаём папку вывода (напр. runs/stages/)
 
     print(f"FreeCAD:  {fc}")
     print(f"Модель:   {args.model}  "

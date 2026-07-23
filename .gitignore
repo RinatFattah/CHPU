@@ -25,6 +25,7 @@ config.local.yaml
 *.gcode
 *.mpf
 *_deviation.ply
+runs/          # прогоны по методам черновой: runs/<method>/ — все выходы генерируются
 
 # IDE
 .idea/
