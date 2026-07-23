@@ -248,9 +248,14 @@ def parse_zones(p):
     if work is not None and (work[0] >= work[3] or work[1] >= work[4]
                              or work[2] >= work[5]):
         raise RuntimeError("пересечение рабочих боксов пусто — работать негде")
-    return {"boxes": boxes, "work": work, "half": half,
-            "m": float(p.get("keepout_margin", 0.5)),
-            "r": float(p["tool_diameter"]) / 2.0}
+    m = float(p.get("keepout_margin", 0.5))
+    return {"boxes": boxes, "work": work, "half": half, "m": m,
+            "r": float(p["tool_diameter"]) / 2.0,
+            # раздув для ПОСТРОЕНИЯ зон операций: сверх зазора m закладываем
+            # допуск расчёта траектории (Adaptive кладёт путь с точностью
+            # rough_tolerance) и округление G-кода — иначе слоп траектории
+            # съедает зазор и строгий гейт ловит касания на сотки
+            "grow": m + float(p.get("rough_tolerance", 0.1)) + 0.01}
 
 
 def zone_z_floor(z):
@@ -370,7 +375,7 @@ def plug_stock_for_zones(doc, job, sb, z, p):
         if (b[0] > sb.XMax + reach or b[3] < sb.XMin - reach or
                 b[1] > sb.YMax + reach or b[4] < sb.YMin - reach):
             continue    # бокс далеко от заготовки — планировщику не мешает
-        g = z["m"]
+        g = z["grow"]
         prisms.append(Part.makeBox(b[3] - b[0] + 2 * g, b[4] - b[1] + 2 * g,
                                    sb.ZLength,
                                    FreeCAD.Vector(b[0] - g, b[1] - g, sb.ZMin)))
@@ -1049,7 +1054,7 @@ def make_roughing_ops(doc, job, tc, shape, p):
         # (Adaptive держит диск фрезы внутри зоны — хватает зазора m)
         if material is not None:
             material, _ = restrict_region(zones, material,
-                                          zones["m"] if zones else 0.0,
+                                          zones["grow"] if zones else 0.0,
                                           floor_z, "контур")
         if material is not None and material.Area > 1.0:
             tool_d = float(p["tool_diameter"])
@@ -1071,7 +1076,7 @@ def make_roughing_ops(doc, job, tc, shape, p):
                 except Exception:
                     ring = material
                 ring, _ = restrict_region(zones, ring,
-                                          zones["m"] if zones else 0.0,
+                                          zones["grow"] if zones else 0.0,
                                           floor_z, "контур (кольцо)")
                 ring_top = local_start(material) if ring is not None else None
                 if ring_top is None:
@@ -1138,7 +1143,7 @@ def make_roughing_ops(doc, job, tc, shape, p):
     # ── 2) сквозные вырезы любой формы, по очереди ──
     for i, region in enumerate(find_through_cuts(sil) if sil is not None else [], 1):
         rb = region.BoundBox
-        region, _ = restrict_region(zones, region, zones["m"] if zones else 0.0,
+        region, _ = restrict_region(zones, region, zones["grow"] if zones else 0.0,
                                     floor_z, f"RoughHole{i}")
         if region is None:
             continue
@@ -1168,7 +1173,7 @@ def make_roughing_ops(doc, job, tc, shape, p):
             if zfl > final:
                 final = zfl  # дно грани ниже пола зон — останавливаемся выше
         region = fc["region"]
-        region, _ = restrict_region(zones, region, zones["m"] if zones else 0.0,
+        region, _ = restrict_region(zones, region, zones["grow"] if zones else 0.0,
                                     final, f"RoughFace{j}")
         if region is None:
             continue
@@ -1416,7 +1421,7 @@ def make_layered_ops(doc, job, tc, shape, p):
     for bi, (top_z, bot_z, region) in enumerate(merged, 1):
         # мёртвые зоны: запретный футпринт по низу ИМЕННО этого диапазона —
         # боксы, чей верх ниже диапазона, рез выше себя не ограничивают
-        region, _ = restrict_region(zones, region, zones["m"] if zones else 0.0,
+        region, _ = restrict_region(zones, region, zones["grow"] if zones else 0.0,
                                     bot_z, f"диапазон {bi}")
         if region is None:
             continue
