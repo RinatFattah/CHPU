@@ -20,6 +20,16 @@ import argparse
 import config
 import freecad_cam
 
+# Windows: stdout по умолчанию cp1251 — печать Ø/кириллицы иначе падает с
+# UnicodeEncodeError. Переключаем на UTF-8 ТОЛЬКО когда консоль не UTF-8; где stdout
+# уже UTF-8 (Linux/macOS), ничего не трогаем — поведение старого кода сохраняется.
+for _stream in (sys.stdout, sys.stderr):
+    if (getattr(_stream, "encoding", "") or "").lower().replace("-", "") != "utf8":
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
 SOLID_EXTS = {".step", ".stp", ".iges", ".igs", ".brep", ".brp"}
 
 
@@ -44,12 +54,6 @@ def convert_prt(path: str, what: str) -> str:
 
 
 def main():
-    # Windows: при перенаправлении вывода консоль по умолчанию cp1251 —
-    # эмодзи-маркеры (✅/❌) роняют print; переводим потоки в UTF-8.
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            stream.reconfigure(encoding="utf-8", errors="replace")
-
     ap = argparse.ArgumentParser(
         description="CAD-модель (.step/.iges/.stl) → G-Code через FreeCAD CAM (3D по поверхности)",
         epilog="Параметры фрезы и режимов — в config.yaml, список в README_CAM.md",
@@ -73,9 +77,9 @@ def main():
                     help="черновая: stages = по типам фич (дефолт), "
                          "layers = послойно, как Cavity Mill (эксперимент)")
     ap.add_argument("--finish", action="store_true",
-                    help="включить чистовой проход (по умолчанию уже включён)")
+                    help="включить чистовой проход (по умолчанию выключен)")
     ap.add_argument("--no-finish", action="store_true",
-                    help="без чистового прохода (только черновая)")
+                    help="без чистового прохода (только черновая; дефолт)")
     ap.add_argument("--stock-margin", type=float, metavar="MM",
                     help="поля заготовки вокруг детали по X/Y, мм (дефолт из конфига)")
     ap.add_argument("--stock", metavar="FILE",
@@ -90,7 +94,11 @@ def main():
     ap.add_argument("--simulate", action="store_true",
                     help="после генерации прогнать G-Code на виртуальном станке "
                          "NX ISV (нужен установленный NX); результат — "
-                         "обработанная заготовка <gcode>_sim.stp")
+                         "обработанная заготовка <gcode>_sim.stp и _sim.prt")
+    ap.add_argument("--nx-export", action="store_true",
+                    help="доп. сохранить деталь и заготовку в STEP в системе координат "
+                         "G-кода (для ручной симуляции в NX): рядом лягут "
+                         "<out>_part.step / _stock.step")
     args = ap.parse_args()
 
     if args.config:
@@ -126,6 +134,8 @@ def main():
         config.AUTO_ORIENT = False
     if args.simulate:
         config.SIMULATE = True
+    if args.nx_export:
+        config.NX_EXPORT = True
 
     if not os.path.exists(args.model):
         print(f"❌ Файл не найден: {args.model}")

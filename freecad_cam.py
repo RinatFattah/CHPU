@@ -131,23 +131,29 @@ def generate_gcode_freecad(model_path: str, gcode_path: str) -> int:
         "stepover": config.SURFACE_STEPOVER,
         "sample_interval": config.SURFACE_SAMPLE_INTERVAL,
         "postprocessor": config.POSTPROCESSOR,
+        "nx_export": config.NX_EXPORT,   # экспорт STEP деталь/заготовка в СК G-кода (для NX)
     }
 
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tmp:
         json.dump(params, tmp)
         params_path = tmp.name
 
+    # freecadcmd не исполняет скрипт по пути с не-ASCII символами (Windows: узкие
+    # char* в OCCT/Qt) — _worker_path() отдаёт 8.3-имя, а если коротких имён нет,
+    # копирует worker во временную ASCII-папку. ASCII-пути (Linux) идут напрямую.
     t0 = time.perf_counter()
     try:
         proc = subprocess.Popen(
             [fc, _worker_path()],
-            # worker переводит свой stdout в UTF-8 (Windows-консоль по умолчанию
-            # cp1251); errors="replace" — чтобы битый байт не убил поток чтения
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-            encoding="utf-8", errors="replace",
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            # Windows: C++-слой FreeCAD (OCCT/Qt) пишет в консольной кодировке (не UTF-8);
+            # errors="replace", чтобы поток чтения не падал на чужих байтах и не терял
+            # маркер "OK gcode_lines=". На Linux вывод и так UTF-8 — поведение то же.
+            text=True, encoding="utf-8", errors="replace",
             env={**os.environ,
                  "FREECAD_WORKER_PARAMS": params_path,
-                 "QT_QPA_PLATFORM": "offscreen"},   # headless: без дисплея
+                 "QT_QPA_PLATFORM": "offscreen",   # headless: без дисплея
+                 "PYTHONUTF8": "1"},               # worker печатает Ø/кириллицу → форсируем UTF-8
         )
         captured = _stream_output(proc)
         try:

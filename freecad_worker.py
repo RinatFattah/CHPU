@@ -23,19 +23,20 @@ import math
 import os
 import sys
 
-# Windows: stdout внутри freecadcmd — cp1251, первый же print с символом вне неё
-# (Ø, ²) роняет worker с UnicodeEncodeError. Переводим вывод в UTF-8; хост
-# (freecad_cam.py) читает поток тоже как UTF-8.
-for _s in (sys.stdout, sys.stderr):
-    if hasattr(_s, "reconfigure"):
-        try:
-            _s.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:
-            pass
-
 import FreeCAD
 import Part
 import Mesh
+
+# FreeCAD форсирует stdout в кодировку консоли (на Windows-RU это cp1251), игнорируя
+# PYTHONUTF8. Символ Ø и прочие не-cp1251 знаки в log() иначе роняют worker с
+# UnicodeEncodeError. Переключаем на UTF-8 ТОЛЬКО когда stdout не UTF-8; где он уже
+# UTF-8 (Linux), ничего не трогаем — старое поведение сохраняется.
+for _stream in (sys.stdout, sys.stderr):
+    if (getattr(_stream, "encoding", "") or "").lower().replace("-", "") != "utf8":
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
 
 SOLID_EXTS = {".step", ".stp", ".iges", ".igs", ".brep", ".brp"}
 
@@ -1195,6 +1196,22 @@ def main():
     feat = doc.addObject("Part::Feature", "Model")
     feat.Shape = solid
     doc.recompute()
+
+    # Опционально: экспорт детали и заготовки в STEP в ТЕКУЩЕЙ (ориентированной,
+    # сдвинутой) системе координат — ровно в той, что у G-кода. Для симуляции в NX:
+    # импортируешь эти STEP, MCS в нуле — и всё встаёт под траекторию.
+    if p.get("nx_export"):
+        base = os.path.splitext(p["gcode_path"])[0]
+        Part.export([feat], base + "_part.step")
+        log(f"NX-export: деталь → {os.path.basename(base)}_part.step")
+        if stock_solid is not None:
+            sfeat = doc.addObject("Part::Feature", "Stock")
+            sfeat.Shape = stock_solid
+            doc.recompute()
+            Part.export([sfeat], base + "_stock.step")
+            log(f"NX-export: заготовка → {os.path.basename(base)}_stock.step")
+        else:
+            log("NX-export: заготовка = бокс, STEP не пишу — создай блок в NX по шапке (Stock box)")
 
     gcode = mill(doc, feat, p, stock_solid)
 
