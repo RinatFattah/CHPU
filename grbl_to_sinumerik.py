@@ -74,6 +74,7 @@ def main():
         sys.exit(1)
     src = sys.argv[1]
     dst = sys.argv[2] if len(sys.argv) > 2 else os.path.splitext(src)[0] + ".mpf"
+    os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
 
     with open(src, encoding="utf-8") as f:
         text = f.read()

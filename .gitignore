@@ -19,9 +19,13 @@ config.local.yaml
 .env
 .env.*
 
-# Выходные файлы pipeline
+# Выходные файлы pipeline (входы — .stp; .step/.stl/.mpf здесь всегда генерируются)
 *.stl
+*.step
 *.gcode
+*.mpf
+*_deviation.ply
+runs/          # прогоны по методам черновой: runs/<method>/ — все выходы генерируются
 
 # IDE
 .idea/
@@ -33,3 +37,9 @@ config.local.yaml
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# runs
+runs/
+
+# logs
+*.log

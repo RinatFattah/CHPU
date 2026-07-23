@@ -48,11 +48,13 @@ def main():
                     help="ноль программы: corner-top = угол детали + верх (дефолт), "
                          "center-top = центр + верх, model = как в CAD-файле")
     ap.add_argument("--rough", type=float, metavar="MM",
-                    help="припуск черновой обработки, мм (0 = без черновой; "
-                         "дефолт из конфига)")
+                    help="припуск черновой, мм (0 = черновая ДО НОМИНАЛА, без припуска; "
+                         "дефолт из конфига). Выключить черновую совсем — --no-rough")
     ap.add_argument("--rough-mode", choices=["stages", "layers"],
                     help="черновая: stages = по типам фич (дефолт), "
                          "layers = послойно, как Cavity Mill (эксперимент)")
+    ap.add_argument("--no-rough", action="store_true",
+                    help="без черновой обработки (только чистовая)")
     ap.add_argument("--finish", action="store_true",
                     help="включить чистовой проход (по умолчанию уже включён)")
     ap.add_argument("--no-finish", action="store_true",
@@ -68,6 +70,9 @@ def main():
     ap.add_argument("--nx-export", action="store_true",
                     help="доп. сохранить деталь и заготовку в STEP в системе координат "
                          "G-кода (для симуляции в NX): рядом лягут <out>_part.step / _stock.step")
+    ap.add_argument("--verify-export", action="store_true",
+                    help="доп. сохранить эталон и маски достижимости граней в STEP (в СК "
+                         "G-кода) для verify.py: <out>_part.step / _reachable.step / _unreachable.step")
     args = ap.parse_args()
 
     if args.config:
@@ -85,6 +90,8 @@ def main():
         config.ROUGH_ALLOWANCE = args.rough
     if args.rough_mode:
         config.ROUGH_MODE = args.rough_mode
+    if args.no_rough:
+        config.ROUGH_ENABLED = False
     if args.finish:
         config.FINISH = True
     if args.no_finish:
@@ -97,6 +104,13 @@ def main():
         config.AUTO_ORIENT = False
     if args.nx_export:
         config.NX_EXPORT = True
+    if args.verify_export:
+        config.VERIFY_EXPORT = True
+
+    if not config.ROUGH_ENABLED and not config.FINISH:
+        print("❌ Нечего делать: --no-rough и --no-finish вместе отключают все операции.")
+        print("   Оставьте хотя бы одну: черновую (убрать --no-rough) или чистовую (убрать --no-finish).")
+        sys.exit(1)
 
     ext = os.path.splitext(args.model)[1].lower()
     if ext == ".prt":
@@ -121,6 +135,8 @@ def main():
         sys.exit(1)
 
     gcode = args.gcode or (os.path.splitext(args.model)[0] + ".gcode")
+    out_dir = os.path.dirname(os.path.abspath(gcode))
+    os.makedirs(out_dir, exist_ok=True)      # создаём папку вывода (напр. runs/stages/)
 
     print(f"FreeCAD:  {fc}")
     print(f"Модель:   {args.model}  "
@@ -133,9 +149,12 @@ def main():
     print(f"Заготовка: {stock}")
     mode = ("послойно, как Cavity Mill (эксперимент)" if config.ROUGH_MODE == "layers"
             else "контур → отверстия → остальное")
-    rough = (f"припуск {config.ROUGH_ALLOWANCE}мм | слой {config.ROUGH_STEPDOWN}мм | "
-             f"шаг {config.ROUGH_STEPOVER}% Ø ({mode})"
-             if config.ROUGH_ALLOWANCE > 0 else "выключена")
+    if config.ROUGH_ENABLED:
+        prip = (f"припуск {config.ROUGH_ALLOWANCE}мм" if config.ROUGH_ALLOWANCE > 0
+                else "до номинала (припуск 0)")
+        rough = f"{prip} | слой {config.ROUGH_STEPDOWN}мм | шаг {config.ROUGH_STEPOVER}% Ø ({mode})"
+    else:
+        rough = "выключена (--no-rough)"
     print(f"Черновая: {rough}")
     finish = (f"шаг {config.SURFACE_STEPOVER}% Ø | сэмплинг {config.SURFACE_SAMPLE_INTERVAL}мм | "
               f"рисунок {config.SURFACE_CUT_PATTERN}"

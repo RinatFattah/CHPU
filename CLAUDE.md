@@ -27,7 +27,10 @@ material unreachable from above (overhangs) is skipped —
 that's a second setup, not something to cut through. Silhouette sections MUST be
 built with `Part.makeFace(wires, "Part::FaceMakerBullseye")` — making a Face per
 wire fills cutouts and the union loses the holes. A Path Surface finishing
-pass follows by default (`--no-finish` / `FINISH: false` disables). Stock = part
+pass follows by default (`--no-finish` / `FINISH: false` disables). Roughing on/off is
+`ROUGH_ENABLED` (`--no-rough`), DECOUPLED from allowance: `ROUGH_ALLOWANCE` = 0 means
+rough to NOMINAL (no stock left), NOT roughing-off — the worker guards roughing on
+`rough_enabled`, not `rough_allowance > 0`. Stock = part
 bbox + margins (`STOCK_MARGIN`, default 12 = 2 tool Ø) OR an arbitrary solid from a
 file (`STOCK_FILE` / `--stock`): the stock file must be in the SAME coordinate
 system as the model — the worker records the part's orient/origin transforms in a
@@ -38,6 +41,31 @@ An INVALID stock solid silently breaks Adaptive (empty paths) — the worker att
 a sew+makeSolid repair and warns. Stock/part/tool dimensions are
 embedded as `(Stock: ...)`/`(Part: ...)`/`(Tool: ...)` header comments in the
 G-Code.
+Verification (`verify.py`, math in numpy/scipy/trimesh; STEP inputs tessellated via
+FreeCAD): compares a post-simulation machined mesh (STEP/STL from NX ISV or CAMotics) to
+the nominal part against an allowance. Signed deviation split into GOUGE (below nominal,
+must be ~0) and EXCESS (above nominal, must be <= allowance), checked ONLY on the FINISHED
+surface = reachable part faces within `--band` of nominal (default max(2, 4×allowance)).
+The sim result is usually an IPW (the whole leftover stock) — perimeter/base beyond band
+is "gross leftover" (2nd setup), reported separately (orange on the map), NOT in the
+verdict. This band-gate is REQUIRED: without it the IPW's uncut perimeter (tens of mm of
+"excess", far from the part but nearest to a reachable wall) fails every real part. The
+coord-mismatch warning triggers on CENTER offset only, not bbox-size (IPW is stock-sized).
+`run_cam.py --verify-export` writes the nominal + reachable/unreachable face masks as
+STEP (exact BREP) in G-code coords (`<out>_part.step` / `_reachable.step` /
+`_unreachable.step`) — via `Shape.exportStep`, NOT `Part.export([rawShape])` which needs
+document objects and silently writes ~empty STEP for raw shapes. verify tessellates STEP
+inputs via FreeCAD (one batch freecadcmd call, `--deflection`, default 0.03 mm); STL
+loads directly. The IPW is faceted regardless, so the compare is mesh-based (STEP is just
+the container). verify masks out second-setup zones (grey on the `_deviation.ply` colour
+map). Both inputs MUST be in the same frame (the G-code frame). The reachability classifier uses a
+GEOMETRIC outward-normal test (probe both sides of the face — robust to STEP face
+orientation), NOT face.Orientation, and also corrects the worker's warn-accounting gap
+where down-facing horizontal faces slipped through `is_handled`. Signed distance is
+exact point-to-triangle (`closest_point_naive` + outward-normal sign, no rtree/embree
+needed — neither is installed here) when points*faces <= EXACT_BUDGET, else
+surface-sample + cKDTree. PASS ⇔ max gouge <= gouge-tol AND max excess on reachable <=
+allowance; exit 0 (PASS) / 2 (FAIL).
 The customer's source parts are Siemens NX `.prt`; the bridge is STEP export from NX
 (FreeCAD cannot read `.prt`, no open-source readers exist).
 
@@ -60,7 +88,12 @@ it lives in git history if ever needed.
 - `freecad_cam.py` - host side: locates `freecadcmd`, passes params via temp JSON
   (env var `FREECAD_WORKER_PARAMS`), parses `[worker]` output markers.
 - `freecad_worker.py` - runs **inside** FreeCAD's interpreter: model → solid →
-  origin normalization → Path Job → Surface op → postprocessor → G-Code.
+  origin normalization → Path Job → Surface op → postprocessor → G-Code. Under
+  `--verify-export` also writes nominal + reachability masks as STEP via
+  `export_verify` / `classify_reachable_faces` (`Shape.exportStep`).
+- `verify.py` - standalone math (numpy/scipy/trimesh); reads STEP via FreeCAD
+  tessellation (one batch call), STL directly. machined mesh ↔ nominal, allowance/gouge
+  check, colour deviation map. `--from-export` finds `.step`, else `.stl`.
 - `config.py` - parameter defaults + YAML loading (`--config`).
 - `README_CAM.md` - operator-facing parameter reference. **Keep in sync** when
   changing CAM params. `README.md` - main handoff doc.
@@ -83,6 +116,24 @@ it lives in git history if ever needed.
   on Ubuntu 24.04; the snap is broken headless (Qt symbol mismatch vs kf6-core24).
 - FreeCAD's CAM has **no lathe/turning operations** — turning was prototyped and
   removed; don't promise it.
+- Verification math deps (numpy/scipy/trimesh) are for `verify.py`; STEP inputs also need
+  FreeCAD (tessellation). Core pipeline still needs just pyyaml + FreeCAD. `rtree`/`embree`
+  NOT installed → verify never uses trimesh's rtree proximity path (silently slow); it
+  uses `closest_point_naive` (exact, chunked) or surface-sample + cKDTree. `freecad_cam.
+  find_freecadcmd` now also globs Windows installs (`AppData\Local\Programs\FreeCAD*`,
+  `Program Files\FreeCAD*`) — so run_cam/verify find FreeCAD on Windows without config.yaml.
+  `--render` (PNG snapshot: top view + 3D) additionally needs matplotlib.
+- verify GOUGE gotcha: measure gouge as machined-vertex `below` (sign from NOMINAL normals,
+  reliable), NEVER via sdf using the faceted IPW's own normals (not consistently outward →
+  ~33k spurious "gouge" points seen on a real IPW). The normal-based SDF sign is only
+  trustworthy NEAR the surface, so classify anything >band from nominal (EITHER sign) as
+  "gross leftover", not gouge — else a stock corner 25 mm away reads as a 25 mm gouge.
+  Sub-mm gouge at sharp edges is a sign artifact, not a real overcut. verify also emits
+  `<machined>_gouge.ply` / `_excess.ply` point clouds + top-5 worst spots (X,Y,Z) for
+  localization.
+- Generated outputs are gitignored: `*.gcode`, `*.stl`, `*.step` (nx-export + verify-export
+  outputs), `*.mpf`, `*_deviation.ply`. Inputs use `.stp` (tracked); `.step` here is always
+  generated. Never commit masks/machined/deviation/mpf.
 
 ## Verification
 

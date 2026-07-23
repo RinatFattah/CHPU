@@ -30,6 +30,17 @@ _CANDIDATES = [
     "freecadcmd",     # системный / PATH
     "FreeCADCmd",     # имя в некоторых сборках
     "freecad.cmd",    # snap-версия
+    # Windows: стандартные установщики (per-user и системный)
+    os.path.expanduser(r"~\AppData\Local\Programs\FreeCAD 1.1\bin\freecadcmd.exe"),
+    os.path.expanduser(r"~\AppData\Local\Programs\FreeCAD 1.0\bin\freecadcmd.exe"),
+    r"C:\Program Files\FreeCAD 1.1\bin\freecadcmd.exe",
+    r"C:\Program Files\FreeCAD 1.0\bin\freecadcmd.exe",
+]
+
+# Windows: другие версии FreeCAD — ищем по маске (берём самую свежую).
+_WIN_GLOBS = [
+    os.path.expanduser(r"~\AppData\Local\Programs\FreeCAD*\bin\freecadcmd.exe"),
+    r"C:\Program Files\FreeCAD*\bin\freecadcmd.exe",
 ]
 
 _WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "freecad_worker.py")
@@ -39,11 +50,16 @@ def find_freecadcmd() -> str | None:
     """Возвращает путь к рабочему freecadcmd или None, если FreeCAD не найден."""
     candidates = ([config.FREECAD_CMD] if getattr(config, "FREECAD_CMD", "") else []) + _CANDIDATES
     for c in candidates:
-        if os.path.isabs(c) or "/" in c:
+        if os.path.isabs(c) or "/" in c or "\\" in c:
             if os.path.exists(c) and os.access(c, os.X_OK):
                 return c
         elif shutil.which(c):
             return shutil.which(c)
+    import glob
+    for pat in _WIN_GLOBS:                       # запасной поиск по маске (Windows)
+        hits = sorted(glob.glob(pat), reverse=True)
+        if hits:
+            return hits[0]
     return None
 
 
@@ -74,6 +90,7 @@ def generate_gcode_freecad(model_path: str, gcode_path: str) -> int:
         "stock_file": (os.path.abspath(config.STOCK_FILE)
                        if config.STOCK_FILE else ""),  # заготовка из файла
 
+        "rough_enabled": config.ROUGH_ENABLED,   # черновая вкл/выкл (не зависит от припуска)
         "rough_mode": config.ROUGH_MODE,
         "rough_allowance": config.ROUGH_ALLOWANCE,
         "rough_stepdown": config.ROUGH_STEPDOWN,
@@ -85,6 +102,7 @@ def generate_gcode_freecad(model_path: str, gcode_path: str) -> int:
         "sample_interval": config.SURFACE_SAMPLE_INTERVAL,
         "postprocessor": config.POSTPROCESSOR,
         "nx_export": config.NX_EXPORT,   # экспорт STEP деталь/заготовка в СК G-кода (для NX)
+        "verify_export": config.VERIFY_EXPORT,  # эталон+маски (STEP) в СК G-кода (для verify.py)
     }
 
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tmp:
