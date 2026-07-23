@@ -38,10 +38,16 @@ An INVALID stock solid silently breaks Adaptive (empty paths) — the worker att
 a sew+makeSolid repair and warns. Stock/part/tool dimensions are
 embedded as `(Stock: ...)`/`(Part: ...)`/`(Tool: ...)` header comments in the
 G-Code.
-Verification (`verify.py`, standalone — numpy/scipy/trimesh, NO FreeCAD): compares a
-post-simulation machined mesh (STL/STEP from NX ISV or CAMotics) to the nominal part
-against an allowance. Signed deviation split into GOUGE (below nominal, must be ~0) and
-EXCESS (above nominal, must be <= allowance), checked ONLY on REACHABLE surfaces.
+Verification (`verify.py`, math in numpy/scipy/trimesh; STEP inputs tessellated via
+FreeCAD): compares a post-simulation machined mesh (STEP/STL from NX ISV or CAMotics) to
+the nominal part against an allowance. Signed deviation split into GOUGE (below nominal,
+must be ~0) and EXCESS (above nominal, must be <= allowance), checked ONLY on the FINISHED
+surface = reachable part faces within `--band` of nominal (default max(2, 4×allowance)).
+The sim result is usually an IPW (the whole leftover stock) — perimeter/base beyond band
+is "gross leftover" (2nd setup), reported separately (orange on the map), NOT in the
+verdict. This band-gate is REQUIRED: without it the IPW's uncut perimeter (tens of mm of
+"excess", far from the part but nearest to a reachable wall) fails every real part. The
+coord-mismatch warning triggers on CENTER offset only, not bbox-size (IPW is stock-sized).
 `run_cam.py --verify-export` writes the nominal + reachable/unreachable face masks as
 STEP (exact BREP) in G-code coords (`<out>_part.step` / `_reachable.step` /
 `_unreachable.step`) — via `Shape.exportStep`, NOT `Part.export([rawShape])` which needs
