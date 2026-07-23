@@ -1047,34 +1047,32 @@ def make_roughing_ops(doc, job, tc, shape, p):
             log(f"warn: зона контура не построилась: {e}")
         # мёртвые зоны: из материала периметра вычитается запретный футпринт
         # (Adaptive держит диск фрезы внутри зоны — хватает зазора m)
-        mat_cut = False
         if material is not None:
-            material, mat_cut = restrict_region(zones, material,
-                                                zones["m"] if zones else 0.0,
-                                                floor_z, "контур")
+            material, _ = restrict_region(zones, material,
+                                          zones["m"] if zones else 0.0,
+                                          floor_z, "контур")
         if material is not None and material.Area > 1.0:
             tool_d = float(p["tool_diameter"])
             margin_xy = min(sb.XLength - bb.XLength, sb.YLength - bb.YLength) / 2.0
-            ring = None
-            ring_cut = False
-            if margin_xy >= 2.0 * tool_d:
-                # широкие поля: адаптивная выборка кольца. Зона выпускается за
-                # край заготовки (снаружи воздух) — иначе StockToLeave оставит
-                # кожуру 0.5 мм у самого края
+            # При зонах контур ВСЕГДА адаптивным кольцом, даже при узких полях:
+            # Profile-петля обводит ВНЕШНИЙ КОНТУР своей грани, и если из грани
+            # выгрызена зона — контур идёт по стенкам выгрыза, а те проходят
+            # ВНУТРИ детали (ловлено на реальном уголке: траншеи поперёк тела
+            # детали при чистом гейте). Adaptive же в урезанный регион не
+            # заходит вовсе; его воздушные входы/линки закрыты запретными
+            # колоннами в заготовке, а винтовой заход в узком поле не нужен —
+            # кольцо выпущено за край, вход сбоку из воздуха (как в layers).
+            if zones is not None or margin_xy >= 2.0 * tool_d:
+                # адаптивная выборка кольца. Зона выпускается за край заготовки
+                # (снаружи воздух) — иначе StockToLeave оставит кожуру 0.5 мм
+                # у самого края
                 try:
                     ring = stock_filled.makeOffset2D(tool_d + allowance).cut(filled)
                 except Exception:
                     ring = material
-                ring, ring_cut = restrict_region(zones, ring,
-                                                 zones["m"] if zones else 0.0,
-                                                 floor_z, "контур (кольцо)")
-            # зоны задели периметр → Adaptive для контура НЕЛЬЗЯ: он считает
-            # всё вне силуэта заготовки расчищенным воздухом и свободно ходит
-            # там (вход/линки) НА ГЛУБИНЕ РЕЗА, игнорируя вырез из региона.
-            # Контурные петли (Profile) шорткатов по воздуху не строят.
-            force_loops = zones is not None and (mat_cut or ring_cut
-                                                 or ring is None)
-            if margin_xy >= 2.0 * tool_d and not force_loops:
+                ring, _ = restrict_region(zones, ring,
+                                          zones["m"] if zones else 0.0,
+                                          floor_z, "контур (кольцо)")
                 ring_top = local_start(material) if ring is not None else None
                 if ring_top is None:
                     log("контур: материала по периметру нет — пропущено")
@@ -1087,15 +1085,11 @@ def make_roughing_ops(doc, job, tc, shape, p):
                     else:
                         log("контур: пустая траектория — фреза не прошла по периметру")
             else:
-                # узкие/неравномерные поля: контурные петли СНАРУЖИ ВНУТРЬ,
-                # каждая петля — отдельная операция (Profile с несколькими
-                # гранями обводит только общий внешний контур). Одна петля
-                # снимает полосу шириной в фрезу; материал дальше (наплывы
-                # произвольной заготовки) добирают внешние петли.
-                if margin_xy >= 2.0 * tool_d:
-                    log("контур: мёртвые зоны задевают периметр — адаптивная "
-                        "выборка заменена контурными петлями (Adaptive свободно "
-                        "ходит по воздуху за краем заготовки на глубине реза)")
+                # узкие/неравномерные поля БЕЗ ЗОН: контурные петли СНАРУЖИ
+                # ВНУТРЬ, каждая петля — отдельная операция (Profile с
+                # несколькими гранями обводит только общий внешний контур).
+                # Одна петля снимает полосу шириной в фрезу; материал дальше
+                # (наплывы произвольной заготовки) добирают внешние петли.
                 step = tool_d * float(p["rough_stepover"]) / 100.0
                 mb = material.BoundBox
                 pts = [v.Point for v in material.Vertexes]
@@ -1118,16 +1112,6 @@ def make_roughing_ops(doc, job, tc, shape, p):
                         f"{dmax:.1f} мм от детали")
                 made = 0
                 for i, (k, lf) in enumerate(loop_faces, 1):
-                    name = f"RoughContour{i}" if len(loop_faces) > 1 else "RoughContour"
-                    # мёртвые зоны: Profile ведёт ЦЕНТР фрезы снаружи контура
-                    # петли на R+припуск, поэтому запрет раздувается на
-                    # 2R+припуск+m (иначе центр заедет в зону у её границы)
-                    lf, lf_cut = restrict_region(
-                        zones, lf,
-                        tool_d + allowance + (zones["m"] if zones else 0.0),
-                        floor_z, name)
-                    if lf is None:
-                        continue
                     # верх материала в полосе, которую метёт эта петля:
                     # петля выше него — чистый воздух, начинаем оттуда
                     loop_top = start_z
@@ -1140,17 +1124,12 @@ def make_roughing_ops(doc, job, tc, shape, p):
                     if loop_top is None:
                         log(f"контур: петля {i} — материала нет, пропущена")
                         continue
-                    # петля, разорванная зонами на куски: Profile с несколькими
-                    # гранями обводит только общий внешний контур (мост через
-                    # разрыв) — поэтому каждому куску своя операция
-                    parts = lf.Faces if (lf_cut and len(lf.Faces) > 1) else [lf]
-                    for j, pf in enumerate(parts, 1):
-                        pname = name if len(parts) == 1 else f"{name}p{j}"
-                        op = make_profile(doc, job, tc, pname, pf, p,
-                                          loop_top, floor_z, allowance)
-                        if op:
-                            ops.append(op)
-                            made += 1
+                    name = f"RoughContour{i}" if len(loop_faces) > 1 else "RoughContour"
+                    op = make_profile(doc, job, tc, name, lf, p,
+                                      loop_top, floor_z, allowance)
+                    if op:
+                        ops.append(op)
+                        made += 1
                 if made:
                     write_partial(job, ops, p, f"готов контур ({made} петель)")
                 else:
