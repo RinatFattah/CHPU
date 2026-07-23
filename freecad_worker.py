@@ -21,6 +21,17 @@ FREECAD_WORKER_PARAMS (не аргументом: freecadcmd пытается в
 import json
 import math
 import os
+import sys
+
+# Windows: stdout внутри freecadcmd — cp1251, первый же print с символом вне неё
+# (Ø, ²) роняет worker с UnicodeEncodeError. Переводим вывод в UTF-8; хост
+# (freecad_cam.py) читает поток тоже как UTF-8.
+for _s in (sys.stdout, sys.stderr):
+    if hasattr(_s, "reconfigure"):
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 import FreeCAD
 import Part
@@ -32,6 +43,16 @@ SOLID_EXTS = {".step", ".stp", ".iges", ".igs", ".brep", ".brp"}
 def log(msg):
     # stdout worker'а парсится хостом; префикс отделяет наши строки от шума FreeCAD
     print(f"[worker] {msg}", flush=True)
+
+
+def surf_name(f):
+    """Имя типа поверхности грани ('Plane'/'Cylinder'/...); '' если OCCT его не
+    определяет. На невалидном теле f.Surface может бросать 'undefined surface
+    type' — такие грани пропускаем, а не роняем весь расчёт."""
+    try:
+        return type(f.Surface).__name__
+    except Exception:
+        return ""
 
 
 def load_model(path, scale_to_mm):
@@ -90,7 +111,7 @@ def auto_orient(solid, journal=None):
     3-осевая обработка при этом невозможна: ось фрезы должна совпадать с Z детали."""
     best = None
     for f in solid.Faces:
-        if type(f.Surface).__name__ == "Plane" and (best is None or f.Area > best.Area):
+        if surf_name(f) == "Plane" and (best is None or f.Area > best.Area):
             best = f
     if best is None:
         log("auto-orient: плоских граней нет — ориентация не менялась")
@@ -114,6 +135,120 @@ def auto_orient(solid, journal=None):
     return solid
 
 
+def orient_hole_axis_up(solid, journal=None):
+    """Уголок может лечь auto_orient'ом на СТЕНКУ (её грань бывает больше полки) —
+    тогда отверстия полки смотрят вбок и деталь необрабатываема. Доворачивает
+    деталь так, чтобы доминирующая ось ОТВЕРСТИЙ стала вертикальной.
+    Отверстие = вогнутый цилиндр с охватом >= 180° (радиусы гиба — четверть
+    цилиндра — не в счёт, иначе ось гиба перепутается с осью отверстия)."""
+    groups = []   # [ось, суммарная площадь]
+    for f in solid.Faces:
+        if surf_name(f) != "Cylinder":
+            continue
+        try:
+            u0, u1, v0, v1 = f.ParameterRange
+            if (u1 - u0) < math.pi - 0.01:
+                continue        # дуга < 180° — скругление/гиб, не отверстие
+            pnt = f.valueAt((u0 + u1) / 2, (v0 + v1) / 2)
+            nrm = f.normalAt((u0 + u1) / 2, (v0 + v1) / 2)
+            s = f.Surface
+            a = FreeCAD.Vector(s.Axis.x, s.Axis.y, s.Axis.z)
+            a.normalize()
+            v = pnt - s.Center
+            radial = v - a * v.dot(a)
+        except Exception:
+            continue
+        if radial.Length < 1e-9 or nrm.dot(radial) > 0:
+            continue            # выпуклая стенка (бобышка), не отверстие
+        for g in groups:
+            if abs(g[0].dot(a)) > 0.99:
+                g[1] += f.Area
+                break
+        else:
+            groups.append([a, f.Area])
+    if not groups:
+        return solid
+    dom = max(groups, key=lambda g: g[1])[0]
+    if abs(dom.z) > 0.99:
+        return solid            # ось отверстий уже вертикальна
+    if dom.z < 0:
+        dom = dom * -1.0
+    target = FreeCAD.Vector(0, 0, 1)
+    axis = dom.cross(target)
+    if axis.Length < 1e-9:
+        axis = FreeCAD.Vector(1, 0, 0)
+    angle = math.degrees(dom.getAngle(target))
+    solid = solid.copy()
+    solid.rotate(FreeCAD.Vector(0, 0, 0), axis, angle)
+    if journal is not None:
+        journal.append(("rotate", ((axis.x, axis.y, axis.z), angle)))
+    log(f"orient: ось отверстий смотрела вбок — деталь довёрнута на {angle:.1f}° "
+        f"(отверстия вертикально)")
+    return solid
+
+
+def orient_flange_down(solid, journal=None):
+    """Полка (самая большая горизонтальная грань) должна быть ВНИЗУ, стенка —
+    торчать вверх. Если полка оказалась в верхней половине габарита — стенка
+    свисает вниз нависанием (сверху не достать) — переворот на 180°."""
+    bb = solid.BoundBox
+    best = None
+    for f in solid.Faces:
+        if surf_name(f) == "Plane" and abs(f.normalAt(0, 0).z) > 0.999:
+            if best is None or f.Area > best.Area:
+                best = f
+    if best is None or best.BoundBox.ZMax <= (bb.ZMin + bb.ZMax) / 2:
+        return solid
+    solid = solid.copy()
+    solid.rotate(FreeCAD.Vector(0, 0, 0), FreeCAD.Vector(1, 0, 0), 180)
+    if journal is not None:
+        journal.append(("rotate", ((1.0, 0.0, 0.0), 180.0)))
+    log("orient: полка была сверху (стенка нависала) — переворот на 180°")
+    return solid
+
+
+def _largest_vertical_face(solid):
+    best_f, best_n = None, None
+    for f in solid.Faces:
+        if surf_name(f) != "Plane":
+            continue
+        n = f.normalAt(0, 0)
+        if abs(n.z) > 0.001:
+            continue
+        if best_f is None or f.Area > best_f.Area:
+            best_f, best_n = f, n
+    return best_f, best_n
+
+
+def orient_wall_to_yz(solid, journal=None):
+    """Ставит вертикальную стенку уголка в плоскость YZ у края XMin — так
+    деталь-уголок вкладывается в заготовку-уголок, стенка которой стоит по
+    XMin (см. align_stock). Два шага: стенка смотрит вдоль Y (лежит в XZ) —
+    поворот 90° вокруг Z; стенка у дальнего края (XMax) — доворот 180°."""
+    f, n = _largest_vertical_face(solid)
+    if f is None:
+        return solid
+    if abs(n.x) < abs(n.y):
+        solid = solid.copy()
+        solid.rotate(FreeCAD.Vector(0, 0, 0), FreeCAD.Vector(0, 0, 1), 90)
+        if journal is not None:
+            journal.append(("rotate", ((0.0, 0.0, 1.0), 90.0)))
+        log("orient: стенка развёрнута в плоскость YZ (90° вокруг Z)")
+        f, n = _largest_vertical_face(solid)
+        if f is None:
+            return solid
+    bb = solid.BoundBox
+    fx = (f.BoundBox.XMin + f.BoundBox.XMax) / 2
+    if fx > (bb.XMin + bb.XMax) / 2:
+        solid = solid.copy()
+        solid.rotate(FreeCAD.Vector(0, 0, 0), FreeCAD.Vector(0, 0, 1), 180)
+        if journal is not None:
+            journal.append(("rotate", ((0.0, 0.0, 1.0), 180.0)))
+        log("orient: стенка была у края XMax — доворот 180° (стенка к XMin, "
+            "как у заготовки-уголка)")
+    return solid
+
+
 def orient_features_up(solid, journal=None):
     """После укладки на большую грань проверяет, куда ОТКРЫТЫ отверстия.
     Крупнейшие плоскости двух сторон детали часто почти равны, и укладка может
@@ -124,8 +259,10 @@ def orient_features_up(solid, journal=None):
     нельзя (сквозное окно в нижней полке перевернуло бы деталь зря)."""
     up = down = 0
     for f in solid.Faces:
+        if surf_name(f) != "Cylinder":
+            continue
         s = f.Surface
-        if type(s).__name__ != "Cylinder" or abs(s.Axis.z) < 0.999:
+        if abs(s.Axis.z) < 0.999:
             continue
         u0, u1, v0, v1 = f.ParameterRange
         pnt = f.valueAt((u0 + u1) / 2, (v0 + v1) / 2)
@@ -147,6 +284,39 @@ def orient_features_up(solid, journal=None):
             journal.append(("rotate", ((1.0, 0.0, 0.0), 180.0)))
         log(f"orient: отверстия ({down} шт.) открыты только вниз — деталь перевёрнута на 180°")
     return solid
+
+
+def align_stock(stock, part_bb):
+    """Выравнивает заготовку ПО ДЕТАЛИ, игнорируя координаты файла (файл может
+    быть привязан к другой детали сборки): кладёт заготовку плашмя, рёбра — по
+    осям, затем «уголок в уголке» — как у исходной пары деталь/заготовка серии:
+    X — край в край (XMin в XMin, запас уходит в +X), Y — центр в центр,
+    Z — ДНО В ДНО (запас материала оказывается сверху, где фреза его снимет;
+    снизу его не достать)."""
+    s = auto_orient(stock.copy())          # наибольшая грань вниз
+    # доворот вокруг Z: длинное прямое ребро нижней грани → вдоль оси
+    best = None
+    for f in s.Faces:
+        if surf_name(f) == "Plane" and abs(f.normalAt(0, 0).z) > 0.999:
+            if best is None or f.Area > best.Area:
+                best = f
+    if best is not None:
+        edge_dir, elen = None, 0.0
+        for e in best.Edges:
+            if type(e.Curve).__name__ == "Line" and e.Length > elen:
+                edge_dir, elen = e.Curve.Direction, e.Length
+        if edge_dir is not None:
+            ang = math.degrees(math.atan2(edge_dir.y, edge_dir.x)) % 90.0
+            if ang > 45.0:
+                ang -= 90.0
+            if abs(ang) > 0.05:
+                s.rotate(FreeCAD.Vector(0, 0, 0), FreeCAD.Vector(0, 0, 1), -ang)
+    sb = s.BoundBox
+    s.translate(FreeCAD.Vector(
+        part_bb.XMin - sb.XMin,                                   # X: край в край
+        (part_bb.YMin + part_bb.YMax) / 2 - (sb.YMin + sb.YMax) / 2,  # Y: центр
+        part_bb.ZMin - sb.ZMin))                                  # Z: дно в дно
+    return s
 
 
 def normalize_origin(solid, mode, journal=None):
@@ -177,6 +347,26 @@ def set_prop(obj, prop, value):
         setattr(obj, prop, value)
     except Exception as e:
         log(f"warn: {prop}={value!r} не применилось: {e}")
+
+
+def export_stock(job, p):
+    """Выгружает заготовку в координатах ПРОГРАММЫ (уже повёрнутую и сдвинутую
+    вместе с деталью) в STEP рядом с G-Code — для симулятора и наладки.
+    Работает и для бокса, и для произвольной заготовки из файла."""
+    out = p.get("stock_out")
+    if not out:
+        return
+    try:
+        import shutil
+        import tempfile
+        # OCCT на Windows не пишет по путям с не-ASCII символами (кириллица в
+        # C:\Users\<имя>) — экспорт во временную ASCII-папку, затем перенос
+        tmp = os.path.join(tempfile.gettempdir(), "cam_stock_export.stp")
+        job.Stock.Shape.exportStep(tmp)
+        shutil.move(tmp, out)
+        log(f"заготовка в координатах программы → {out}")
+    except Exception as e:
+        log(f"warn: экспорт заготовки не удался: {e}")
 
 
 def export_gcode(job, ops, postname):
@@ -301,7 +491,7 @@ def find_up_faces(shape, bb, include_top=False):
     на одном уровне — от ближней к дальней."""
     faces = []
     for idx, f in enumerate(shape.Faces, 1):
-        if type(f.Surface).__name__ != "Plane" or f.normalAt(0, 0).z < 0.999:
+        if surf_name(f) != "Plane" or f.normalAt(0, 0).z < 0.999:
             continue
         zf = f.BoundBox.ZMax  # грань горизонтальна: ZMin == ZMax
         if zf > bb.ZMax - 0.01 and not include_top:
@@ -361,7 +551,8 @@ def make_adaptive(doc, job, tc, name, region_shape, p, start_z, final_z, allowan
     return None  # 2 команды = пустой путь (один подъём Z)
 
 
-def make_profile(doc, job, tc, name, region_shape, p, start_z, final_z, allowance):
+def make_profile(doc, job, tc, name, region_shape, p, start_z, final_z, allowance,
+                 side="Outside"):
     """Контурный проход (Path Profile): фреза обходит внешний контур зоны
     с отступом радиус + припуск, слоями StepDown до дна. Применяется для
     периметра при УЗКИХ полях (меньше ~2 диаметров): адаптивной выборке там
@@ -375,7 +566,7 @@ def make_profile(doc, job, tc, name, region_shape, p, start_z, final_z, allowanc
     op = Profile.Create(name, parentJob=job)
     op.ToolController = tc
     op.Base = [(region, f"Face{i + 1}") for i in range(len(region.Shape.Faces))]
-    set_prop(op, "Side", "Outside")
+    set_prop(op, "Side", side)
     set_prop(op, "UseComp", True)  # смещение на радиус фрезы считается в софте
     set_prop(op, "OffsetExtra", FreeCAD.Units.Quantity(f"{allowance} mm"))
     op.setExpression("StepDown", None)
@@ -413,6 +604,14 @@ def make_surface_rough(doc, job, tc, name, model_obj, face_idx, p,
     # на радиус фрезы дают полное покрытие; по высоте фрезу всё равно ведёт
     # поверхность модели (+DepthOffset), зарезаться в соседей она не может.
     set_prop(op, "CutPattern", "ZigZag")
+    # строчки вдоль ДЛИННОЙ стороны грани (меньше проходов и врезаний):
+    # CutPatternAngle 0° = строчки вдоль X, 90° = вдоль Y
+    try:
+        fbb = model_obj.Shape.Faces[face_idx - 1].BoundBox
+        cut_angle = 0.0 if fbb.XLength >= fbb.YLength else 90.0
+    except Exception:
+        cut_angle = 0.0
+    set_prop(op, "CutPatternAngle", cut_angle)
     set_prop(op, "BoundaryAdjustment",
              FreeCAD.Units.Quantity(f"{float(p['tool_diameter']) / 2.0} mm"))
     set_prop(op, "BoundaryEnforcement", False)
@@ -436,20 +635,30 @@ def make_surface_rough(doc, job, tc, name, model_obj, face_idx, p,
 
 
 def make_roughing_ops(doc, job, tc, shape, p):
-    """Черновая «по-человечески» — раздельными операциями в порядке техпроцесса:
-      1. RoughContour — контур: материал между силуэтом детали и краем заготовки
-         (существует только при STOCK_MARGIN > 0);
-      2. RoughHole<N> — сквозные вырезы ПРОИЗВОЛЬНОЙ формы, по очереди;
-      3. RoughFace<N> — каждая плоская грань («контур» в терминах NX) отдельной
-         операцией: полки, донья карманов, уступы — сверху вниз.
-    Зоны не пересекаются. Недоступное сверху (нависания — 2-й установ) и наклонные
-    поверхности черновая НЕ трогает: наклонные — задача чистовой (FINISH).
-    Припуск: по стенкам StockToLeave, по дну — глубиной FinalDepth."""
-    allowance = round(p["rough_allowance"], 1)  # шаг 0.1 мм
+    """Черновая «по граням» (ROUGH_MODE=stages), порядок техпроцесса:
+      1. RoughHole<N>   — сквозные вырезы ЛЮБОЙ формы, по очереди (Adaptive) —
+         ПЕРВЫМИ, пока деталь жёстко держится в заготовке;
+      2. грани сверху вниз (только достижимые сверху: над гранью есть заготовка,
+         грань смотрит вверх — есть проекция на XY, над ней нет тела детали):
+         плоские — Adaptive (RoughFace<N>), наклонные/криволинейные — террасы
+         по поверхности (RoughSlope<N>), ВПЕРЕМЕШКУ по высоте;
+      3. RoughPerimeter — внешний контур детали по силуэту, ПОСЛЕДНИМ: один обвод
+         Profile снаружи (материал в углах заготовки, не касающийся детали,
+         остаётся).
+    Зоны не пересекаются. Недоступное сверху (грани вниз/вбок, нависания, накрытые
+    материалом) не режется — второй установ. Припуск: по стенкам StockToLeave /
+    OffsetExtra, по дну — глубиной FinalDepth."""
+    # припуск разведён на стенки (XY) и полы/поверхности (Z). Режим:
+    # none = начисто без припуска (дефолт), xy = только стенки, all = стенки+полы.
+    # Величина — ROUGH_ALLOWANCE. Сквозные вырезы и внешний контур режутся до дна
+    # ВСЕГДА (ниже), припуск по дну на них не влияет.
+    mag = round(p.get("rough_allowance", 0.5), 1)     # шаг 0.1 мм
+    mode = p.get("rough_allowance_mode", "none")
+    alw_xy = mag if mode in ("xy", "all") else 0.0    # StockToLeave / OffsetExtra
+    alw_z = mag if mode == "all" else 0.0             # полы карманов, поверхности
     bb = shape.BoundBox
     sb = job.Stock.Shape.BoundBox
     start_z = sb.ZMax                      # верх заготовки
-    floor_z = bb.ZMin + allowance          # дно + припуск
 
     sil = build_silhouette(shape, bb, p["rough_stepdown"])
     ops = []
@@ -473,112 +682,27 @@ def make_roughing_ops(doc, job, tc, shape, p):
             log(f"warn: локальный верх зоны не посчитался ({e}) — беру верх заготовки")
             return sb.ZMax
 
-    # ── 1) контур: материал между силуэтом детали и краем заготовки.
-    #      Существует и при полях 0: заготовка — всегда БОКС, а деталь в плане
-    #      обычно не прямоугольник (скругления углов, выступы дают материал
-    #      по периметру). Широкие поля (≥ 2 диаметров) — адаптивная выборка
-    #      кольца; узкие — контурный проход (Profile): адаптивной негде сделать
-    #      винтовой заход, а проходу по контуру заход не нужен. ──
+    # ── 1) сквозные вырезы любой формы, ПЕРВЫМИ (деталь ещё жёстко в заготовке) ──
     if sil is None:
-        log("warn: силуэт не построился — контур и вырезы пропущены")
-    else:
-        try:
-            # вычитается ЗАЛИТЫЙ силуэт (только внешние контуры): если вычесть
-            # силуэт с отверстиями, сквозные вырезы «провалятся» в зону контура
-            # и будут фрезероваться дважды (они — этап 2, RoughHole)
-            filled = Part.makeFace([f.OuterWire for f in sil.Faces],
-                                   "Part::FaceMakerBullseye")
-            # силуэт ЗАГОТОВКИ: для бокса это прямоугольник, для произвольной
-            # заготовки из файла — её реальный контур в плане
-            stock_sil = build_silhouette(job.Stock.Shape, sb, p["rough_stepdown"])
-            stock_filled = Part.makeFace([f.OuterWire for f in stock_sil.Faces],
-                                         "Part::FaceMakerBullseye")
-            material = stock_filled.cut(filled)  # реальный материал по периметру
-        except Exception as e:
-            material = filled = None
-            log(f"warn: зона контура не построилась: {e}")
-        if material is not None and material.Area > 1.0:
-            tool_d = float(p["tool_diameter"])
-            margin_xy = min(sb.XLength - bb.XLength, sb.YLength - bb.YLength) / 2.0
-            if margin_xy >= 2.0 * tool_d:
-                # широкие поля: адаптивная выборка кольца. Зона выпускается за
-                # край заготовки (снаружи воздух) — иначе StockToLeave оставит
-                # кожуру 0.5 мм у самого края
-                try:
-                    ring = stock_filled.makeOffset2D(tool_d + allowance).cut(filled)
-                except Exception:
-                    ring = material
-                ring_top = local_start(material)
-                if ring_top is None:
-                    log("контур: материала по периметру нет — пропущено")
-                else:
-                    op = make_adaptive(doc, job, tc, "RoughContour", ring, p,
-                                       ring_top, floor_z, allowance)
-                    if op:
-                        ops.append(op)
-                        write_partial(job, ops, p, "готов контур")
-                    else:
-                        log("контур: пустая траектория — фреза не прошла по периметру")
-            else:
-                # узкие/неравномерные поля: контурные петли СНАРУЖИ ВНУТРЬ,
-                # каждая петля — отдельная операция (Profile с несколькими
-                # гранями обводит только общий внешний контур). Одна петля
-                # снимает полосу шириной в фрезу; материал дальше (наплывы
-                # произвольной заготовки) добирают внешние петли.
-                step = tool_d * float(p["rough_stepover"]) / 100.0
-                mb = material.BoundBox
-                pts = [v.Point for v in material.Vertexes]
-                pts += [FreeCAD.Vector(x, y, 0)
-                        for x in (mb.XMin, mb.XMax) for y in (mb.YMin, mb.YMax)]
-                dmax = max(filled.distToShape(Part.Vertex(pt))[0] for pt in pts)
-                n_loops = max(1, min(50, int(math.ceil(
-                    (dmax - tool_d - allowance) / step)) + 1))
-                loop_faces = []
-                for k in range(n_loops - 1, 0, -1):
-                    try:
-                        loop_faces.append((k, Part.makeCompound(
-                            filled.makeOffset2D(k * step).Faces)))
-                    except Exception as e:
-                        log(f"warn: петля контура на отступе {k * step:.1f} мм "
-                            f"не построилась: {e}")
-                loop_faces.append((0, Part.makeCompound(filled.Faces)))  # вдоль детали
-                if n_loops > 1:
-                    log(f"контур: {n_loops} петель — материал заготовки до "
-                        f"{dmax:.1f} мм от детали")
-                made = 0
-                for i, (k, lf) in enumerate(loop_faces, 1):
-                    # верх материала в полосе, которую метёт эта петля:
-                    # петля выше него — чистый воздух, начинаем оттуда
-                    loop_top = start_z
-                    try:
-                        band = filled.makeOffset2D(
-                            k * step + tool_d + allowance).cut(lf)
-                        loop_top = local_start(band)
-                    except Exception:
-                        pass
-                    if loop_top is None:
-                        log(f"контур: петля {i} — материала нет, пропущена")
-                        continue
-                    name = f"RoughContour{i}" if len(loop_faces) > 1 else "RoughContour"
-                    op = make_profile(doc, job, tc, name, lf, p,
-                                      loop_top, floor_z, allowance)
-                    if op:
-                        ops.append(op)
-                        made += 1
-                if made:
-                    write_partial(job, ops, p, f"готов контур ({made} петель)")
-                else:
-                    log("контур: пустая траектория — фреза не прошла по периметру")
-
-    # ── 2) сквозные вырезы любой формы, по очереди ──
+        log("warn: силуэт не построился — вырезы и внешний контур пропущены")
     for i, region in enumerate(find_through_cuts(sil) if sil is not None else [], 1):
         rb = region.BoundBox
         hole_top = local_start(region)
         if hole_top is None:
             log(f"RoughHole{i}: над вырезом нет материала заготовки — пропущено")
             continue
+        # сквозной вырез режем до дна ДЕТАЛИ (bb.ZMin), а НЕ до floor_z
+        # (дно + припуск): у сквозного отверстия нет дна, чтобы оставлять там
+        # припуск под чистовую — иначе на дне стоит кожура (видно без FINISH).
+        # Припуск по стенкам (StockToLeave) при этом сохраняется.
         op = make_adaptive(doc, job, tc, f"RoughHole{i}", region, p,
-                           hole_top, floor_z, allowance)
+                           hole_top, bb.ZMin, alw_xy)
+        if not op and min(rb.XLength, rb.YLength) > float(p["tool_diameter"]) + 0.2:
+            # узкий паз: адаптивной негде сделать винтовой заход, но фреза в паз
+            # проходит — контурный обход ИЗНУТРИ (вход вертикальным врезанием)
+            log(f"RoughHole{i}: узкий вырез — перехожу на контурный проход изнутри")
+            op = make_profile(doc, job, tc, f"RoughHole{i}", region, p,
+                              hole_top, bb.ZMin, alw_xy, side="Inside")
         if op:
             ops.append(op)
             write_partial(job, ops, p, f"готов вырез {i} "
@@ -587,50 +711,37 @@ def make_roughing_ops(doc, job, tc, shape, p):
             log(f"RoughHole{i}: фреза Ø{p['tool_diameter']} с припуском не влезает "
                 f"в вырез ~{rb.XLength:.0f}x{rb.YLength:.0f} мм — пропущено")
 
-    # ── 3) плоские грани («контуры» из NX), каждая отдельной операцией.
-    #      Верхние грани детали включаются, если заготовка выше детали
-    #      (уголок, верхнее поле) — над ними тогда есть материал. ──
-    jm = job.Model.Group[0]  # клон модели внутри Job — его грани идут в Base операций
-    include_top = sb.ZMax > bb.ZMax + 0.01
-    for j, fc in enumerate(find_up_faces(shape, bb, include_top), 1):
-        final = fc["z"] + allowance
-        face_top = local_start(fc["region"])
-        if face_top is None or final >= face_top - 1e-6:
-            if face_top is None:
-                log(f"RoughFace{j}: (Z={fc['z']:.1f}) материала над гранью нет — "
-                    f"пропущено")
-            continue  # грань вровень с верхом материала — снимать нечего
-        op = make_adaptive(doc, job, tc, f"RoughFace{j}", fc["region"], p,
-                           face_top, final, allowance)
-        if not op:
-            # грань уже фрезы (узкая полка) — адаптивной выборке негде
-            # развернуться; снимаем материал над ней террасами по поверхности,
-            # тем же приёмом, что и криволинейные грани
-            log(f"RoughFace{j}: узкая грань — перехожу на террасы по поверхности")
-            op = make_surface_rough(doc, job, tc, f"RoughFace{j}", jm, fc["idx"], p,
-                                    face_top, final, allowance)
-        if op:
-            ops.append(op)
-            write_partial(job, ops, p, f"готова грань {j} "
-                                       f"(Z={fc['z']:.1f}, {fc['area']:.0f} мм²)")
-        else:
-            log(f"RoughFace{j}: (Z={fc['z']:.1f}) пустая траектория — материал "
-                f"недоступен, пропущено")
-
-    # ── 4) наклонные/криволинейные грани — террасами, каждая отдельной операцией.
-    #      Берём грани, у которых есть площадь в проекции на основание (нормаль
-    #      хоть немного смотрит вверх) и над которыми нет материала. Смотрящие
-    #      вниз/вбок или накрытые — недоступны сверху, это второй установ. ──
+    # ── 2) грани сверху вниз: плоские (Adaptive) и наклонные/криволинейные
+    #      (террасы по поверхности) ВПЕРЕМЕШКУ по высоте — сначала самые высокие.
+    #      Берём только достижимые сверху: над гранью есть материал заготовки,
+    #      грань смотрит вверх (есть проекция на XY), над ней НЕТ тела детали.
+    #      Смотрящие вниз/вбок, накрытые, нависания — второй установ. ──
     def is_handled(f):
-        s = type(f.Surface).__name__
+        s = surf_name(f)
         nz = f.normalAt(0, 0).z if s == "Plane" else None
         if s == "Plane" and (abs(nz) > 0.999 or abs(nz) < 0.001):
-            return True    # горизонтальные (этап 3) и вертикальные плоскости (стенки)
+            return True    # горизонтальные (идут ниже) и вертикальные плоскости (стенки)
         if s == "Cylinder" and abs(f.Surface.Axis.z) > 0.999:
             return True    # вертикальные цилиндрические стенки/скругления
         return False
 
-    slopes, skipped = [], 0.0
+    jm = job.Model.Group[0]  # клон модели внутри Job — его грани идут в Base операций
+    include_top = sb.ZMax > bb.ZMax + 0.01
+    faces, skipped = [], 0.0
+    # плоские грани, смотрящие вверх (полки, донья карманов, уступы)
+    up_faces = find_up_faces(shape, bb, include_top)
+    log(f"кандидаты: {len(up_faces)} плоских граней вверх (include_top={include_top})")
+    for fc in up_faces:
+        probe = FreeCAD.Vector(fc["cx"], fc["cy"], fc["z"] + 0.3)
+        if shape.isInside(probe, 1e-6, True):
+            log(f"грань Z={fc['z']:.1f} ({fc['area']:.0f} мм²): накрыта материалом — "
+                f"пропущена")
+            skipped += fc["area"]          # накрыта материалом сверху — не достать
+            continue
+        faces.append({"kind": "planar", "z": fc["z"], "final": fc["z"] + alw_z,
+                      "region": fc["region"], "idx": fc["idx"], "area": fc["area"],
+                      "cx": fc["cx"], "cy": fc["cy"]})
+    # наклонные/криволинейные грани с восходящей нормалью
     for idx, f in enumerate(jm.Shape.Faces, 1):
         if is_handled(f) or f.Area < 1.0:
             continue
@@ -641,7 +752,7 @@ def make_roughing_ops(doc, job, tc, shape, p):
         except Exception:
             skipped += f.Area
             continue
-        if nz < 0.01:      # смотрит вниз или строго вбок — проекции на основание нет
+        if nz < 0.01:      # смотрит вниз или строго вбок — проекции на XY нет
             skipped += f.Area
             continue
         probe = FreeCAD.Vector(mid.x, mid.y, f.BoundBox.ZMax + 0.3)
@@ -653,33 +764,85 @@ def make_roughing_ops(doc, job, tc, shape, p):
             FreeCAD.Vector(fbb.XMin, fbb.YMin, 0), FreeCAD.Vector(fbb.XMax, fbb.YMin, 0),
             FreeCAD.Vector(fbb.XMax, fbb.YMax, 0), FreeCAD.Vector(fbb.XMin, fbb.YMax, 0),
             FreeCAD.Vector(fbb.XMin, fbb.YMin, 0)]))
-        slopes.append({"idx": idx, "z": fbb.ZMax, "zmin": fbb.ZMin,
-                       "area": f.Area, "cx": mid.x, "cy": mid.y, "rect": rect})
-    levels = sorted({round(s["z"], 3) for s in slopes}, reverse=True)
+        faces.append({"kind": "slope", "z": fbb.ZMax, "final": fbb.ZMin + alw_z,
+                      "rect": rect, "idx": idx, "area": f.Area,
+                      "cx": mid.x, "cy": mid.y})
+
+    # сортировка сверху вниз; на одном уровне — от ближней к дальней
+    levels = sorted({round(f["z"], 3) for f in faces}, reverse=True)
     ordered = []
     for lv in levels:
-        ordered += _nearest_order([s for s in slopes if round(s["z"], 3) == lv],
-                                  lambda s: (s["cx"], s["cy"]))
-    for k, s in enumerate(ordered, 1):
-        slope_top = local_start(s["rect"])  # верх материала над зоной грани
-        if slope_top is None:
-            log(f"RoughSlope{k}: материала над гранью нет — пропущено")
-            continue
-        op = make_surface_rough(doc, job, tc, f"RoughSlope{k}", jm, s["idx"], p,
-                                slope_top, s["zmin"] + allowance, allowance)
+        ordered += _nearest_order([f for f in faces if round(f["z"], 3) == lv],
+                                  lambda f: (f["cx"], f["cy"]))
+
+    face_n = slope_n = 0
+    for fc in ordered:
+        if fc["kind"] == "planar":
+            top = local_start(fc["region"])
+            if top is None or fc["final"] >= top - 1e-6:
+                if top is None:
+                    log(f"RoughFace (Z={fc['z']:.1f}): материала над гранью нет — "
+                        f"пропущено")
+                continue  # грань вровень с верхом материала — снимать нечего
+            face_n += 1
+            name = f"RoughFace{face_n}"
+            op = make_adaptive(doc, job, tc, name, fc["region"], p,
+                               top, fc["final"], alw_xy)
+            if not op:
+                # узкая полка — адаптивной выборке негде развернуться; снимаем
+                # террасами по поверхности, как криволинейные грани
+                log(f"{name}: узкая грань — перехожу на террасы по поверхности")
+                op = make_surface_rough(doc, job, tc, name, jm, fc["idx"], p,
+                                        top, fc["final"], alw_z)
+            note = f"готова грань {face_n} (Z={fc['z']:.1f}, {fc['area']:.0f} мм²)"
+        else:
+            top = local_start(fc["rect"])
+            if top is None:
+                log(f"RoughSlope (Z={fc['z']:.1f}): материала над гранью нет — "
+                    f"пропущено")
+                continue
+            slope_n += 1
+            name = f"RoughSlope{slope_n}"
+            op = make_surface_rough(doc, job, tc, name, jm, fc["idx"], p,
+                                    top, fc["final"], alw_z)
+            note = f"готова криволинейная грань {slope_n} ({fc['area']:.0f} мм²)"
         if op:
             ops.append(op)
-            write_partial(job, ops, p, f"готова криволинейная грань {k} "
-                                       f"({s['area']:.0f} мм²)")
+            write_partial(job, ops, p, note)
         else:
-            log(f"RoughSlope{k}: пустая траектория — пропущено")
+            log(f"{name}: (Z={fc['z']:.1f}) пустая траектория — пропущено")
     if skipped > 1.0:
         log(f"warn: {skipped:.0f} мм² поверхностей смотрят вниз/вбок или накрыты "
             f"материалом — сверху не достать, это второй установ")
 
+    # ── 3) внешний контур детали по силуэту — ПОСЛЕДНИМ: пока деталь жёстко
+    #      держится в заготовке, снят весь объём выше; периметр обходим в конце.
+    #      Один обвод Profile снаружи вдоль силуэта детали; лишний материал в
+    #      углах заготовки, не касающийся детали, остаётся (так просил техпроцесс).
+    #      Прорезаем именно внешний периметр детали, не выбирая всё поле. ──
+    if sil is not None:
+        try:
+            filled = Part.makeFace([f.OuterWire for f in sil.Faces],
+                                   "Part::FaceMakerBullseye")
+        except Exception as e:
+            filled = None
+            log(f"warn: внешний контур не построился: {e}")
+        if filled is not None:
+            # внешний контур режем до дна ДЕТАЛИ (bb.ZMin) ВСЕГДА, без припуска
+            # по дну: периметр отделяет деталь от рамки заготовки — кожура на дне
+            # не нужна. Припуск по стенке (OffsetExtra) при этом сохраняется.
+            op = make_profile(doc, job, tc, "RoughPerimeter", filled, p,
+                              start_z, bb.ZMin, alw_xy)
+            if op:
+                ops.append(op)
+                write_partial(job, ops, p, "готов внешний контур детали")
+            else:
+                log("внешний контур: пустая траектория — периметр не прорезан")
+
     if ops:
-        log(f"черновая: припуск {allowance} мм, слой {p['rough_stepdown']} мм, "
-            f"этапов: {len(ops)} ({', '.join(o.Label for o in ops)})")
+        log(f"черновая (по граням): припуск XY {alw_xy} / полы {alw_z} мм "
+            f"(режим {mode}), слой {p['rough_stepdown']} мм, этапов: {len(ops)} "
+            f"({', '.join(o.Label for o in ops)})")
     else:
         log("warn: черновая не дала ни одной операции")
     return ops
@@ -695,7 +858,10 @@ def make_layered_ops(doc, job, tc, shape, p):
     у края заготовки, Pocket — замкнутая внутри); Adaptive знает заготовку и
     пропускает воздух. Припуск: по стенкам StockToLeave, по полкам — границы
     диапазонов сдвинуты на припуск выше граней."""
-    allowance = round(p["rough_allowance"], 1)
+    mag = round(p.get("rough_allowance", 0.5), 1)
+    mode = p.get("rough_allowance_mode", "none")
+    alw_xy = mag if mode in ("xy", "all") else 0.0   # StockToLeave (стенки)
+    alw_z = mag if mode == "all" else 0.0            # полы (границы диапазонов)
     step = float(p["rough_stepdown"])
     bb = shape.BoundBox
     sb = job.Stock.Shape.BoundBox
@@ -709,16 +875,16 @@ def make_layered_ops(doc, job, tc, shape, p):
                                  "Part::FaceMakerBullseye")
 
     # ── 1) характерные уровни детали ──
-    bottom = bb.ZMin + allowance
+    bottom = bb.ZMin + alw_z
     levels = {sb.ZMax, bottom}
     slant_spans = []
     for f in shape.Faces:
-        s = type(f.Surface).__name__
+        s = surf_name(f)
         fz1, fz2 = f.BoundBox.ZMin, f.BoundBox.ZMax
         if s == "Plane":
             nz = f.normalAt(0, 0).z
             if nz > 0.999:
-                levels.add(fz2 + allowance)  # полка: дно диапазона = грань + припуск
+                levels.add(fz2 + alw_z)  # полка: дно диапазона = грань + припуск
                 continue
             if nz < -0.999:
                 levels.add(fz1)
@@ -781,7 +947,7 @@ def make_layered_ops(doc, job, tc, shape, p):
               # тонкие рёбра заготовки (полка уголка уже фрезы) становятся
               # обрабатываемыми — Side=Inside в узкую зону не помещается.
               # makeOffset2D зовётся по-фасетно: на сшитом сечении он падает.
-            grow = float(p["tool_diameter"]) + allowance
+            grow = float(p["tool_diameter"]) + alw_xy
             parts = [f.makeOffset2D(grow) for f in stock_sec.Faces]
             stock_sec = parts[0] if len(parts) == 1 else parts[0].fuse(parts[1:])
         except Exception as e:
@@ -825,7 +991,7 @@ def make_layered_ops(doc, job, tc, shape, p):
             except Exception:
                 kind = "Region"
             op = make_adaptive(doc, job, tc, f"B{bi}{kind}{ri}", rf, p,
-                               top_z, bot_z, allowance)
+                               top_z, bot_z, alw_xy)
             if op:
                 ops.append(op)
                 write_partial(job, ops, p,
@@ -884,6 +1050,8 @@ def mill(doc, feat, p, stock_solid=None):
         stock_note = f"деталь + поля {margin}/{p.get('stock_margin_top', 0.0)} мм"
         log(f"заготовка: {sb.XLength:.1f} x {sb.YLength:.1f} x {sb.ZLength:.1f} мм "
             f"({stock_note})")
+    export_stock(job, p)
+
     tc = job.Tools.Group[0]
     tool_d = float(p["tool_diameter"])
     set_prop(tc.Tool, "Diameter", FreeCAD.Units.Quantity(f"{tool_d} mm"))
@@ -967,11 +1135,27 @@ def main():
     doc = FreeCAD.newDocument("CAM")
     solid = load_model(p["model_path"], p.get("scale_to_mm", 1.0))
     if not solid.isValid():
-        log("warn: solid is not valid (mesh may be non-watertight)")
+        log("warn: тело детали невалидно — пробую починить (sew + makeSolid)")
+        try:
+            sh = solid.copy()
+            sh.sewShape()
+            fixed = Part.makeSolid(sh)
+            if fixed.isValid() and fixed.Volume > 0:
+                solid = fixed
+                log("деталь починена")
+            else:
+                log("warn: починить не удалось — продолжаю на исходном "
+                    "(грани с неопределённой поверхностью пропускаются)")
+        except Exception as e:
+            log(f"warn: починка не удалась ({e}) — продолжаю, "
+                f"битые грани пропускаются")
     journal = []   # трансформации детали — повторяются на заготовке из файла
     if p.get("auto_orient", True):
         solid = auto_orient(solid, journal)
+        solid = orient_hole_axis_up(solid, journal)   # полка с отверстием — в XY
+        solid = orient_flange_down(solid, journal)    # полка вниз, стенка вверх
         solid = orient_features_up(solid, journal)
+        solid = orient_wall_to_yz(solid, journal)     # стенка — в плоскость YZ
     solid = normalize_origin(solid, p.get("origin", "corner-top"), journal)
     bb = solid.BoundBox
     log(f"solid mm: {bb.XLength:.2f} x {bb.YLength:.2f} x {bb.ZLength:.2f}")
@@ -996,8 +1180,17 @@ def main():
             except Exception as e:
                 log(f"warn: починка заготовки не удалась ({e}) — "
                     f"операции могут выйти пустыми")
-        stock_solid = apply_transforms(stock_solid, journal)
-        log("заготовка из файла повёрнута/сдвинута вместе с деталью")
+        if p.get("stock_align"):
+            # координатам файла заготовки не доверяем (он мог быть привязан к
+            # другой детали сборки) — выравниваем по детали
+            stock_solid = align_stock(stock_solid, solid.BoundBox)
+            sab = stock_solid.BoundBox
+            log(f"заготовка выровнена по детали (X край в край, Y центр, дно в дно): "
+                f"X {sab.XMin:.1f}..{sab.XMax:.1f}, Y {sab.YMin:.1f}..{sab.YMax:.1f}, "
+                f"Z {sab.ZMin:.1f}..{sab.ZMax:.1f}")
+        else:
+            stock_solid = apply_transforms(stock_solid, journal)
+            log("заготовка из файла повёрнута/сдвинута вместе с деталью")
 
     feat = doc.addObject("Part::Feature", "Model")
     feat.Shape = solid
@@ -1012,4 +1205,12 @@ def main():
 
 # freecadcmd исполняет этот файл как скрипт (не как __main__), поэтому вызываем напрямую
 if os.environ.get("FREECAD_WORKER_PARAMS"):
-    main()
+    try:
+        main()
+    except Exception:
+        import traceback
+        # префикс [worker] на КАЖДОЙ строке traceback — иначе хост (он показывает
+        # только строки с [worker]) проглотит настоящую причину падения
+        for _line in traceback.format_exc().splitlines():
+            log(_line)
+        raise

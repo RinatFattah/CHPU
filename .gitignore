@@ -22,6 +22,12 @@ config.local.yaml
 # Выходные файлы pipeline
 *.stl
 *.gcode
+*_stock.stp
+*_sim.stp
+# Артефакты симуляции NX (рабочие файлы)
+*_ipw.prt
+*_sim.prt
+*.mpf
 
 # IDE
 .idea/

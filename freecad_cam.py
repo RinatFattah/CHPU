@@ -17,6 +17,7 @@ freecad_cam.py — генерация G-Code из CAD-модели через Fr
 
 import os
 import json
+import time
 import shutil
 import tempfile
 import subprocess
@@ -25,14 +26,54 @@ import config
 
 # Кандидаты на бинарник freecadcmd (headless FreeCAD), в порядке приоритета.
 # config.FREECAD_CMD (если задан) проверяется первым.
-_CANDIDATES = [
-    os.path.expanduser("~/freecad-appimage/squashfs-root/usr/bin/freecadcmd"),
-    "freecadcmd",     # системный / PATH
-    "FreeCADCmd",     # имя в некоторых сборках
-    "freecad.cmd",    # snap-версия
-]
+def _windows_candidates():
+    """Типовые пути установки FreeCAD на Windows (инсталлятор/winget/portable)."""
+    import glob
+    roots = [os.environ.get("ProgramFiles", r"C:\Program Files"),
+             os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+             os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs")]
+    found = []
+    for root in roots:
+        if root:
+            found += glob.glob(os.path.join(root, "FreeCAD*", "bin", "freecadcmd.exe"))
+    return sorted(found, reverse=True)  # свежая версия первой
+
+_CANDIDATES = (
+    (_windows_candidates() if os.name == "nt" else
+     [os.path.expanduser("~/freecad-appimage/squashfs-root/usr/bin/freecadcmd")])
+    + [
+        "freecadcmd",     # системный / PATH
+        "FreeCADCmd",     # имя в некоторых сборках
+        "freecad.cmd",    # snap-версия (Linux)
+    ]
+)
 
 _WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "freecad_worker.py")
+
+
+def _ascii_safe(path: str) -> str:
+    """FreeCAD/OCCT на Windows не открывают файлы по путям с не-ASCII символами
+    (кириллица в C:\\Users\\<имя> → «Unknown exception while processing file»).
+    Для существующего пути возвращает его короткое 8.3-имя (чистый ASCII)."""
+    if not path or os.name != "nt" or path.isascii():
+        return path
+    import ctypes
+    buf = ctypes.create_unicode_buffer(1024)
+    if ctypes.windll.kernel32.GetShortPathNameW(path, buf, 1024) and buf.value.isascii():
+        return buf.value
+    return path
+
+
+def _worker_path() -> str:
+    """Путь к worker-скрипту, который freecadcmd сможет открыть: не-ASCII путь
+    конвертируется в 8.3, а если коротких имён нет — worker копируется во
+    временную папку (она ASCII: %TEMP% отдаётся коротким путём)."""
+    p = _ascii_safe(_WORKER)
+    if p.isascii():
+        return p
+    dst = os.path.join(tempfile.gettempdir(), "freecad_worker.py")
+    shutil.copyfile(_WORKER, dst)
+    return dst
 
 
 def find_freecadcmd() -> str | None:
@@ -60,7 +101,8 @@ def generate_gcode_freecad(model_path: str, gcode_path: str) -> int:
         raise RuntimeError("freecadcmd не найден (укажите FREECAD_CMD в конфиге)")
 
     params = {
-        "model_path": os.path.abspath(model_path),
+        # модель/заготовку читает OCCT — на Windows пути должны быть ASCII (8.3)
+        "model_path": _ascii_safe(os.path.abspath(model_path)),
         "gcode_path": os.path.abspath(gcode_path),
         "scale_to_mm": config.STL_SCALE_TO_MM,      # только для мешей
         "origin": config.ORIGIN,                    # нормализация нуля программы
@@ -71,11 +113,16 @@ def generate_gcode_freecad(model_path: str, gcode_path: str) -> int:
         "safe_height": config.SAFE_HEIGHT,
         "stock_margin": config.STOCK_MARGIN,
         "stock_margin_top": config.STOCK_MARGIN_TOP,
-        "stock_file": (os.path.abspath(config.STOCK_FILE)
+        "stock_file": (_ascii_safe(os.path.abspath(config.STOCK_FILE))
                        if config.STOCK_FILE else ""),  # заготовка из файла
+        "stock_align": bool(getattr(config, "STOCK_ALIGN", False)),
+        # заготовка в координатах программы (повёрнутая/сдвинутая вместе с
+        # деталью) выгружается рядом с G-Code — для симуляции и наладки
+        "stock_out": os.path.splitext(os.path.abspath(gcode_path))[0] + "_stock.stp",
 
         "rough_mode": config.ROUGH_MODE,
         "rough_allowance": config.ROUGH_ALLOWANCE,
+        "rough_allowance_mode": config.ROUGH_ALLOWANCE_MODE,
         "rough_stepdown": config.ROUGH_STEPDOWN,
         "rough_stepover": config.ROUGH_STEPOVER,
         "rough_tolerance": config.ROUGH_TOLERANCE,
@@ -90,10 +137,14 @@ def generate_gcode_freecad(model_path: str, gcode_path: str) -> int:
         json.dump(params, tmp)
         params_path = tmp.name
 
+    t0 = time.perf_counter()
     try:
         proc = subprocess.Popen(
-            [fc, _WORKER],
+            [fc, _worker_path()],
+            # worker переводит свой stdout в UTF-8 (Windows-консоль по умолчанию
+            # cp1251); errors="replace" — чтобы битый байт не убил поток чтения
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            encoding="utf-8", errors="replace",
             env={**os.environ,
                  "FREECAD_WORKER_PARAMS": params_path,
                  "QT_QPA_PLATFORM": "offscreen"},   # headless: без дисплея
@@ -117,6 +168,8 @@ def generate_gcode_freecad(model_path: str, gcode_path: str) -> int:
     lines_out = "".join(captured).splitlines()
     ok = next((l for l in lines_out if "[worker] OK gcode_lines=" in l), None)
     if ok and os.path.exists(gcode_path) and os.path.getsize(gcode_path) > 0:
+        print(f"[cam] генерация G-Code: {time.perf_counter() - t0:.0f} с "
+              f"реального времени", flush=True)
         return int(ok.split("gcode_lines=")[1].split()[0])
 
     worker_msgs = [l for l in lines_out if "[worker]" in l]
