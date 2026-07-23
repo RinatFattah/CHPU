@@ -38,6 +38,21 @@ An INVALID stock solid silently breaks Adaptive (empty paths) — the worker att
 a sew+makeSolid repair and warns. Stock/part/tool dimensions are
 embedded as `(Stock: ...)`/`(Part: ...)`/`(Tool: ...)` header comments in the
 G-Code.
+Verification (`verify.py`, standalone — numpy/scipy/trimesh, NO FreeCAD): compares a
+post-simulation machined mesh (STL/STEP from NX ISV or CAMotics) to the nominal part
+against an allowance. Signed deviation split into GOUGE (below nominal, must be ~0) and
+EXCESS (above nominal, must be <= allowance), checked ONLY on REACHABLE surfaces.
+`run_cam.py --verify-export` writes the nominal + reachable/unreachable face masks as
+STL in G-code coords (`<out>_part.stl` / `_reachable.stl` / `_unreachable.stl`); verify
+masks out second-setup zones (grey on the `_deviation.ply` colour map). Both inputs
+MUST be in the same frame (the G-code frame). The reachability classifier uses a
+GEOMETRIC outward-normal test (probe both sides of the face — robust to STEP face
+orientation), NOT face.Orientation, and also corrects the worker's warn-accounting gap
+where down-facing horizontal faces slipped through `is_handled`. Signed distance is
+exact point-to-triangle (`closest_point_naive` + outward-normal sign, no rtree/embree
+needed — neither is installed here) when points*faces <= EXACT_BUDGET, else
+surface-sample + cKDTree. PASS ⇔ max gouge <= gouge-tol AND max excess on reachable <=
+allowance; exit 0 (PASS) / 2 (FAIL).
 The customer's source parts are Siemens NX `.prt`; the bridge is STEP export from NX
 (FreeCAD cannot read `.prt`, no open-source readers exist).
 
@@ -60,7 +75,11 @@ it lives in git history if ever needed.
 - `freecad_cam.py` - host side: locates `freecadcmd`, passes params via temp JSON
   (env var `FREECAD_WORKER_PARAMS`), parses `[worker]` output markers.
 - `freecad_worker.py` - runs **inside** FreeCAD's interpreter: model → solid →
-  origin normalization → Path Job → Surface op → postprocessor → G-Code.
+  origin normalization → Path Job → Surface op → postprocessor → G-Code. Under
+  `--verify-export` also writes nominal + reachability masks (STL) via
+  `export_verify_stl` / `classify_reachable_faces`.
+- `verify.py` - standalone (numpy/scipy/trimesh, no FreeCAD): machined mesh ↔ nominal,
+  allowance/gouge check, colour deviation map. See `--from-export`.
 - `config.py` - parameter defaults + YAML loading (`--config`).
 - `README_CAM.md` - operator-facing parameter reference. **Keep in sync** when
   changing CAM params. `README.md` - main handoff doc.
@@ -83,6 +102,12 @@ it lives in git history if ever needed.
   on Ubuntu 24.04; the snap is broken headless (Qt symbol mismatch vs kf6-core24).
 - FreeCAD's CAM has **no lathe/turning operations** — turning was prototyped and
   removed; don't promise it.
+- Verification deps (numpy/scipy/trimesh) are for `verify.py` only — the core pipeline
+  still needs just pyyaml + FreeCAD. `rtree`/`embree` are NOT installed, so verify never
+  uses trimesh's rtree proximity path (would be silently slow); it uses
+  `closest_point_naive` (exact, chunked) or surface-sample + cKDTree.
+- Generated verification outputs are gitignored: `*.stl` (masks + machined) already,
+  `*_deviation.ply` added. Masks/machined/deviation are artifacts — never commit them.
 
 ## Verification
 

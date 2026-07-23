@@ -47,5 +47,8 @@ AUTO_ORIENT: true
 POSTPROCESSOR: "grbl"    # диалект вашей стойки: grbl / linuxcnc / fanuc / mach3_mach4 …
 FREECAD_CMD: ""          # путь к freecadcmd; пусто → автопоиск (AppImage/PATH/snap)
 FREECAD_TIMEOUT: 3600    # сек — лимит на расчёт (черновая Adaptive считается долго)
+# Доп. экспорт для симуляции/верификации — обычно через флаги CLI, а не здесь:
+#   --nx-export     → <out>_part.step / _stock.step        (сцена для NX ISV)
+#   --verify-export → <out>_part.stl / _reachable.stl / _unreachable.stl  (вход для verify.py)
 # Только для мешей (.stl/.obj): множитель единиц → мм. Для STEP/IGES игнорируется.
 STL_SCALE_TO_MM: 1000.0
