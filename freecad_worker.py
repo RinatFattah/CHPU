@@ -973,26 +973,12 @@ def mill(doc, feat, p, stock_solid=None):
 
 
 # ── Экспорт эталона и масок достижимости для verify.py (флаг --verify-export) ─────
-def _mesh_shape(shape, lin=0.1):
-    """Тесселляция BREP → Mesh. Через MeshPart, с откатом на Shape.tessellate."""
-    try:
-        import MeshPart
-        return MeshPart.meshFromShape(Shape=shape, LinearDeflection=lin,
-                                      AngularDeflection=0.5)
-    except Exception:
-        verts, facets = shape.tessellate(lin)
-        m = Mesh.Mesh()
-        for a, b, c in facets:
-            m.addFacet(verts[a], verts[b], verts[c])
-        return m
-
-
-def _write_faces_stl(solid, idxs, path, lin=0.1):
-    """Пишет подмножество граней тела в STL. Возвращает False, если граней нет."""
+def _write_faces_step(solid, idxs, path):
+    """Пишет подмножество граней тела в STEP (точное BREP). False, если граней нет.
+    Через Shape.exportStep — Part.export ждёт документные объекты, не сырой Shape."""
     if not idxs:
         return False
-    comp = Part.makeCompound([solid.Faces[i] for i in idxs])
-    _mesh_shape(comp, lin).write(path)
+    Part.makeCompound([solid.Faces[i] for i in idxs]).exportStep(path)
     return True
 
 
@@ -1034,19 +1020,19 @@ def classify_reachable_faces(solid):
     return reachable, unreachable
 
 
-def export_verify_stl(solid, base):
-    """Пишет эталон (watertight) и маски достижимых/недостижимых граней в STL
+def export_verify(solid, base):
+    """Пишет эталон и маски достижимых/недостижимых граней в STEP (точное BREP)
     рядом с G-кодом — вход для verify.py. Всё в текущей (ориентированной, сдвинутой)
     СК, ровно как у G-кода и у результата симуляции."""
-    _mesh_shape(solid).write(base + "_part.stl")
-    log(f"verify-export: эталон → {os.path.basename(base)}_part.stl")
+    solid.exportStep(base + "_part.step")
+    log(f"verify-export: эталон → {os.path.basename(base)}_part.step")
     reach, unreach = classify_reachable_faces(solid)
-    if _write_faces_stl(solid, reach, base + "_reachable.stl"):
+    if _write_faces_step(solid, reach, base + "_reachable.step"):
         log(f"verify-export: достижимые грани ({len(reach)}) → "
-            f"{os.path.basename(base)}_reachable.stl")
-    if _write_faces_stl(solid, unreach, base + "_unreachable.stl"):
+            f"{os.path.basename(base)}_reachable.step")
+    if _write_faces_step(solid, unreach, base + "_unreachable.step"):
         log(f"verify-export: недостижимые грани, второй установ ({len(unreach)}) → "
-            f"{os.path.basename(base)}_unreachable.stl")
+            f"{os.path.basename(base)}_unreachable.step")
 
 
 def main():
@@ -1110,7 +1096,7 @@ def main():
 
     if p.get("verify_export"):
         try:
-            export_verify_stl(solid, os.path.splitext(p["gcode_path"])[0])
+            export_verify(solid, os.path.splitext(p["gcode_path"])[0])
         except Exception as e:
             log(f"verify-export: не удалось ({e})")
 

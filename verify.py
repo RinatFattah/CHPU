@@ -57,42 +57,73 @@ STEP_EXTS = {".step", ".stp", ".iges", ".igs", ".brep", ".brp"}
 EXACT_BUDGET = 40_000_000
 
 
-# ── загрузка геометрии ───────────────────────────────────────────────────────────
-def load_mesh(path):
-    """STL/OBJ/PLY → trimesh напрямую; STEP/IGES → тесселляция через FreeCAD."""
-    ext = os.path.splitext(path)[1].lower()
-    if ext in STEP_EXTS:
-        path = _step_to_stl(path)
+# ── загрузка геометрии (STL напрямую; STEP → сетка через FreeCAD) ─────────────────
+def _find_freecad(config_path=None):
+    """freecadcmd для тесселляции STEP: FREECAD_CMD из config.yaml → автопоиск."""
+    try:
+        import config as _cfg
+        import freecad_cam
+    except Exception:
+        return None
+    for c in (config_path, "config.yaml"):
+        if c and os.path.exists(c):
+            try:
+                _cfg.load(c)
+            except Exception:
+                pass
+            break
+    return freecad_cam.find_freecadcmd()
+
+
+def _tessellate_steps(pairs, deflection, fc):
+    """STEP → STL одним запуском FreeCAD. pairs: [(src_step, dst_stl), ...]."""
+    import json
+    import subprocess
+    import tempfile
+    spec = os.path.join(tempfile.gettempdir(), "verify_tess_spec.json")
+    script = os.path.join(tempfile.gettempdir(), "verify_tess.py")
+    with open(spec, "w", encoding="utf-8") as f:
+        json.dump({"deflection": deflection, "pairs": pairs}, f)
+    with open(script, "w", encoding="utf-8") as f:
+        f.write("import json, Part, MeshPart\n"
+                f"d = json.load(open(r\"{spec}\", encoding='utf-8'))\n"
+                "for src, dst in d['pairs']:\n"
+                "    s = Part.Shape(); s.read(src)\n"
+                "    MeshPart.meshFromShape(Shape=s, LinearDeflection=d['deflection'],\n"
+                "                           AngularDeflection=0.5).write(dst)\n")
+    env = dict(os.environ)
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    subprocess.run([fc, script], check=True, env=env,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+
+
+def _as_mesh(path):
     m = trimesh.load_mesh(path)
     if isinstance(m, trimesh.Scene):          # несколько тел — склеиваем в один меш
         m = trimesh.util.concatenate(tuple(m.geometry.values()))
     return m
 
 
-def _step_to_stl(path):
-    import subprocess
+def load_meshes(paths, deflection, config_path=None):
+    """Грузит список файлов как trimesh-меши (None → None). STL/OBJ/PLY — напрямую;
+    STEP/IGES — тесселляция одним запуском FreeCAD (LinearDeflection=deflection)."""
     import tempfile
-    try:
-        import freecad_cam
-        fc = freecad_cam.find_freecadcmd()
-    except Exception:
-        fc = None
-    if not fc:
-        raise SystemExit(f"❌ STEP-вход ({os.path.basename(path)}) требует FreeCAD, а "
-                         f"freecadcmd не найден. Выгрузите вход как STL.")
-    out = os.path.join(tempfile.gettempdir(), "verify_" + str(abs(hash(path))) + ".stl")
-    script = os.path.join(tempfile.gettempdir(), "verify_tess.py")
-    with open(script, "w", encoding="utf-8") as f:
-        f.write("import Part, MeshPart\n"
-                f"s = Part.Shape(); s.read(r\"{path}\")\n"
-                "m = MeshPart.meshFromShape(Shape=s, LinearDeflection=0.1, "
-                "AngularDeflection=0.5)\n"
-                f"m.write(r\"{out}\")\n")
-    env = dict(os.environ)
-    env["QT_QPA_PLATFORM"] = "offscreen"
-    subprocess.run([fc, script], check=True, env=env,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-    return out
+    steps = {i: p for i, p in enumerate(paths)
+             if p and os.path.splitext(p)[1].lower() in STEP_EXTS}
+    tmp = {}
+    if steps:
+        fc = _find_freecad(config_path)
+        if not fc:
+            raise SystemExit("❌ STEP-вход требует FreeCAD, а freecadcmd не найден. "
+                             "Пропишите путь в config.yaml (FREECAD_CMD), передайте "
+                             "--config FILE или подайте STL.")
+        pairs = []
+        for i, p in steps.items():
+            dst = os.path.join(tempfile.gettempdir(), f"verify_{i}_{abs(hash(p))}.stl")
+            tmp[i] = dst
+            pairs.append([os.path.abspath(p), dst])
+        _tessellate_steps(pairs, deflection, fc)
+    return [(_as_mesh(tmp.get(i, p)) if p else None) for i, p in enumerate(paths)]
 
 
 # ── знаковое расстояние: «+ снаружи ref, − внутри» ───────────────────────────────
@@ -162,21 +193,29 @@ def main():
                     help="сэмплов поверхности для приближённого режима крупных мешей")
     ap.add_argument("--gouge-samples", type=int, default=40000,
                     help="сэмплов поверхности эталона для поиска зареза (плотность покрытия)")
+    ap.add_argument("--deflection", type=float, default=0.03, metavar="MM",
+                    help="точность тесселляции STEP → сетка, мм (мельче = точнее/дольше)")
+    ap.add_argument("--config", metavar="FILE",
+                    help="config.yaml (для FREECAD_CMD при STEP-входах)")
     args = ap.parse_args()
 
     nominal = args.nominal
     reach_f, unreach_f = args.reachable, args.unreachable
     if args.from_export:
         base = args.from_export
-        nominal = nominal or base + "_part.stl"
-        reach_f = reach_f or (base + "_reachable.stl")
-        unreach_f = unreach_f or (base + "_unreachable.stl")
-        for f in (reach_f, unreach_f):
-            if not os.path.exists(f):
-                reach_f = unreach_f = None      # масок нет — проверяем всю поверхность
-                break
+
+        def _pick(suffix):                       # берём .step, иначе .stl, иначе None
+            for ext in (".step", ".stl"):
+                if os.path.exists(base + suffix + ext):
+                    return base + suffix + ext
+            return None
+        nominal = nominal or _pick("_part")
+        reach_f = reach_f or _pick("_reachable")
+        unreach_f = unreach_f or _pick("_unreachable")
+        if not (reach_f and unreach_f):
+            reach_f = unreach_f = None           # масок нет — проверяем всю поверхность
     if not nominal:
-        ap.error("нужен --nominal FILE или --from-export BASE")
+        ap.error("нужен --nominal FILE или --from-export BASE (файлы _part.* не найдены)")
     for f in [args.machined, nominal] + ([reach_f, unreach_f] if reach_f else []):
         if not os.path.exists(f):
             print(f"❌ Файл не найден: {f}")
@@ -185,11 +224,14 @@ def main():
     print(f"Результат:  {args.machined}")
     print(f"Эталон:     {nominal}")
     print(f"Припуск:    {args.allowance} мм | допуск зареза: {args.gouge_tol} мм")
-    M = load_mesh(args.machined)
-    P = load_mesh(nominal)
     masks = bool(reach_f and unreach_f)
-    R = load_mesh(reach_f) if masks else None
-    U = load_mesh(unreach_f) if masks else None
+    if any(p and os.path.splitext(p)[1].lower() in STEP_EXTS
+           for p in (args.machined, nominal, reach_f, unreach_f)):
+        print(f"STEP→сетка: deflection {args.deflection} мм (FreeCAD)")
+    M, P, R, U = load_meshes([args.machined, nominal,
+                              reach_f if masks else None,
+                              unreach_f if masks else None],
+                             args.deflection, args.config)
     print(f"Маска:      {'достижимые/недостижимые грани заданы' if masks else 'нет (проверяю всю поверхность)'}")
 
     if not P.is_watertight:

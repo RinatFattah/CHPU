@@ -69,8 +69,8 @@ def main():
                     help="доп. сохранить деталь и заготовку в STEP в системе координат "
                          "G-кода (для симуляции в NX): рядом лягут <out>_part.step / _stock.step")
     ap.add_argument("--verify-export", action="store_true",
-                    help="доп. сохранить эталон и маски достижимости граней в STL (в СК "
-                         "G-кода) для verify.py: <out>_part.stl / _reachable.stl / _unreachable.stl")
+                    help="доп. сохранить эталон и маски достижимости граней в STEP (в СК "
+                         "G-кода) для verify.py: <out>_part.step / _reachable.step / _unreachable.step")
     args = ap.parse_args()
 
     if args.config:
