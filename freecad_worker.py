@@ -930,13 +930,13 @@ def mill(doc, feat, p, stock_solid=None):
     )
 
     ops = []
-    if p.get("rough_allowance", 0) > 0:
+    if p.get("rough_enabled", True):        # припуск (в т.ч. 0 = до номинала) — отдельно
         if p.get("rough_mode", "stages") == "layers":
             ops.extend(make_layered_ops(doc, job, tc, feat.Shape, p))
         else:
             ops.extend(make_roughing_ops(doc, job, tc, feat.Shape, p))
     else:
-        log("черновая отключена (ROUGH_ALLOWANCE=0)")
+        log("черновая отключена (--no-rough)")
 
     if p.get("finish", False):
         import Path.Op.Surface as Surface

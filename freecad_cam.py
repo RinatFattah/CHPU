@@ -90,6 +90,7 @@ def generate_gcode_freecad(model_path: str, gcode_path: str) -> int:
         "stock_file": (os.path.abspath(config.STOCK_FILE)
                        if config.STOCK_FILE else ""),  # заготовка из файла
 
+        "rough_enabled": config.ROUGH_ENABLED,   # черновая вкл/выкл (не зависит от припуска)
         "rough_mode": config.ROUGH_MODE,
         "rough_allowance": config.ROUGH_ALLOWANCE,
         "rough_stepdown": config.ROUGH_STEPDOWN,

@@ -27,7 +27,10 @@ material unreachable from above (overhangs) is skipped —
 that's a second setup, not something to cut through. Silhouette sections MUST be
 built with `Part.makeFace(wires, "Part::FaceMakerBullseye")` — making a Face per
 wire fills cutouts and the union loses the holes. A Path Surface finishing
-pass follows by default (`--no-finish` / `FINISH: false` disables). Stock = part
+pass follows by default (`--no-finish` / `FINISH: false` disables). Roughing on/off is
+`ROUGH_ENABLED` (`--no-rough`), DECOUPLED from allowance: `ROUGH_ALLOWANCE` = 0 means
+rough to NOMINAL (no stock left), NOT roughing-off — the worker guards roughing on
+`rough_enabled`, not `rough_allowance > 0`. Stock = part
 bbox + margins (`STOCK_MARGIN`, default 12 = 2 tool Ø) OR an arbitrary solid from a
 file (`STOCK_FILE` / `--stock`): the stock file must be in the SAME coordinate
 system as the model — the worker records the part's orient/origin transforms in a

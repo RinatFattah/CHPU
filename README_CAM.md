@@ -28,13 +28,15 @@
 python run_cam.py detal.step                          # черновая + чистовая (дефолт)
 python run_cam.py detal.step out.gcode --config config.yaml
 python run_cam.py detal.step --no-finish              # только черновая
+python run_cam.py detal.step --rough 0                # черновая ДО НОМИНАЛА (без припуска)
+python run_cam.py detal.step --no-rough               # без черновой (только чистовая)
 python run_cam.py detal.step --stock-margin 0         # заготовка точно по детали
 python run_cam.py detal.step --stock otlivka.step     # заготовка из файла (отливка)
 python run_cam.py detal.step --verify-export          # + эталон и маски для verify.py
 python run_cam.py scan.stl --mm                       # меш в миллиметрах
 ```
 
-Флаги CLI: `--config FILE`, `--rough MM` (припуск черновой), `--no-finish`,
+Флаги CLI: `--config FILE`, `--rough MM` (припуск; `0` = до номинала), `--no-rough`, `--no-finish`,
 `--stock-margin MM`, `--stock FILE`, `--origin ...`, `--no-orient`,
 `--nx-export` (STEP деталь/заготовка для NX), `--verify-export` (эталон+маски для
 [`verify.py`](#верификация-детали-после-симуляции-verifypy)); для мешей — `--mm` / `--meters` /
@@ -75,7 +77,9 @@ python run_cam.py scan.stl --mm                       # меш в миллиме
 Этапы 1–3 — адаптивная выборка (FreeCAD Path Adaptive) слоями `ROUGH_STEPDOWN`
 с припуском `ROUGH_ALLOWANCE` по стенкам и по дну; этап 4 — проход по поверхности
 (Path Surface, Multi-pass). После черновой по умолчанию идёт **чистовой проход**
-по поверхности — отключается `--no-finish` / `FINISH: false`.
+по поверхности — отключается `--no-finish` / `FINISH: false`. Черновую целиком
+отключает `--no-rough` / `ROUGH_ENABLED: false`; `--rough 0` — это черновая **до
+номинала** (без припуска), а не её выключение.
 
 **Экспериментальный режим `--rough-mode layers`** (`ROUGH_MODE: "layers"`) —
 послойная черновая, как Cavity Mill в NX: материал на высоте Z = сечение
@@ -133,8 +137,9 @@ python run_cam.py scan.stl --mm                       # меш в миллиме
 
 | Параметр | Дефолт | Ед. | Что означает |
 |---|---|---|---|
+| `ROUGH_ENABLED` | `true` | — | черновая вкл/выкл (выключить: `false` / `--no-rough`). Не зависит от припуска |
 | `ROUGH_MODE` | `"stages"` | — | `stages` = по типам фич; `layers` = послойно, как Cavity Mill (эксперимент, `--rough-mode layers`) |
-| `ROUGH_ALLOWANCE` | `0.5` | мм | **припуск**: сколько материала оставить под чистовую, шаг 0.1. `0` = черновая выключена |
+| `ROUGH_ALLOWANCE` | `0.5` | мм | **припуск**: сколько материала оставить под чистовую, шаг 0.1. `0` = черновая **до номинала** (без припуска), а не выключение — выключает `ROUGH_ENABLED: false` |
 | `ROUGH_STEPDOWN` | `1.0` | мм | слой съёма за проход (главный рычаг времени обработки) |
 | `ROUGH_STEPOVER` | `40` | % Ø | шаг адаптивной строчки |
 | `ROUGH_TOLERANCE` | `0.1` | мм | точность расчёта траектории; для черновой 0.2 — быстрее почти без потерь |

@@ -53,7 +53,8 @@ python run_cam.py деталь.step --config config.yaml
 ```
 
 Флаги CLI: `--config FILE`, `--origin corner-top|center-top|model` (ноль программы),
-для мешей — `--mm` / `--meters` / `--scale N`.
+`--rough MM` (припуск; `0` = черновая до номинала), `--no-rough` (без черновой),
+`--no-finish`; для мешей — `--mm` / `--meters` / `--scale N`.
 
 ## Параметры
 
