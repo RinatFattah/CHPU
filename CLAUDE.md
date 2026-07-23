@@ -69,6 +69,45 @@ allowance; exit 0 (PASS) / 2 (FAIL).
 The customer's source parts are Siemens NX `.prt`; the bridge is STEP export from NX
 (FreeCAD cannot read `.prt`, no open-source readers exist).
 
+Keep-out зоны (v1 — ТОЛЬКО черновая; зоны+FINISH = ранний отказ в run_cam И
+freecad_cam): примитивы `--keepout-box`/`--work-box`/`--keepout-halfspace X lt 5` +
+`KEEPOUT_*` в YAML (CLI ДОБАВЛЯЕТСЯ к YAML), канон/валидация в
+`config.normalize_zones()`. Координаты — в СК ПРОГРАММЫ. Модель инструмента —
+полубесконечный вертикальный цилиндр от кончика: под боксом запрещено, проезд над
+боксом можно, потолки (Z gt / верх work-бокса) — по кончику; раздув на
+R+KEEPOUT_MARGIN (0.5). Ограничение АПРИОРНОЕ (worker):
+(1) `restrict_region` вычитает футпринт из 2D-зон Adaptive (grow=m — Adaptive держит
+диск внутри региона; бокс участвует только если final_z ниже его верха+m; в layers —
+по каждому диапазону), Profile-петли — grow=2R+allowance+m (центр снаружи контура),
+разорванная петля → отдельная op на кусок (Profile с multi-face обводит общий
+контур = мост через зону);
+(2) контур при затронутом периметре ПРИНУДИТЕЛЬНО петлями Profile: Adaptive сводит
+заготовку к внешнему 2D-контуру (findShapeOutline) и всё вне его считает
+расчищенным воздухом — винтовой вход и линки идут там НА ГЛУБИНЕ РЕЗА, игнорируя
+вырез из региона (ловлено гейтом на реальном прогоне);
+(3) по той же причине `plug_stock_for_zones` вплавляет в заготовку запретные
+КОЛОННЫ (бокс⊕m на высоту стока — габарит/ZMax не меняются, заготовка
+материализуется в статичный Part::Feature); для layers это ЕДИНСТВЕННАЯ защита
+краевых диапазонов — боксы внутри силуэта колонн не требуют (там и так материал);
+(4) Surface-черновая (RoughSlope/узкий RoughFace): рабочее пятно bbox грани+~3R
+конфликтует с зоной → скип операции целиком (`surface_zone_block`);
+(5) ClearanceHeight ≥ верх боксов+m (`op_clearance`). ГЛАВНЫЙ грабель:
+ClearanceHeight/SafeHeight привязаны экспрешеном к SetupSheet (сток-топ+5/+3) —
+присвоение .Value БЕЗ setExpression(None) молча откатывается на recompute (это
+касалось и старого кода: клиренс всегда был сток+5, а не start+SAFE_HEIGHT).
+Гейт-страховка `check_gcode_zones`: разбор ГОТОВОГО G-кода (модальные координаты,
+дуги IJ/R и хеликсы сэмплингом 0.2 мм); бокс = прямоугольник ⊕ ДИСК R+m (растёт
+скруглёнными углами — раздув квадратом ложно срабатывал на честном обходе угла
+колонны), work-бокс = точная эрозия диском (прямоугольник), полупространства — по
+концам отрезков (выпуклость); нарушение → G-код НЕ пишется, целевой файл
+(промежуточный) удаляется, рядом остаётся `*.REJECTED.gcode`, exit по отсутствию
+маркера OK. Зоны печатаются в шапку G-кода латиницей `(Keepout box: ...)`.
+Самотест гейта — 19 кейсов под freecadcmd (скрипты для freecadcmd НЕЛЬЗЯ класть на
+кириллический путь — копировать в ASCII-темп). verify.py в зоне покажет ожидаемый
+ИЗБЫТОК (материал не снят намеренно). Наблюдение: freecadcmd на исключении скрипта
+исполняет его ПОВТОРНО и выходит с кодом 0 — провал ловится по отсутствию
+"OK gcode_lines=", не по коду возврата.
+
 CRITICAL Adaptive gotcha: regions must be explicit planar faces. Passing model faces
 as `Base` yields open projected contours on real parts (`Path.Area: ccurve not closed`)
 and Adaptive silently returns an empty path. Adaptive also needs ~2 tool diameters of
