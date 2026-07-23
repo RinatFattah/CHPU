@@ -37,3 +37,9 @@ runs/          # прогоны по методам черновой: runs/<meth
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# runs
+runs/
+
+# logs
+*.log
