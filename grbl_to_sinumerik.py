@@ -32,7 +32,20 @@ for _stream in (sys.stdout, sys.stderr):
 _TNUM = re.compile(r"\bT(\d+)\b")      # номер инструмента: T1, T2, …
 _M6 = re.compile(r"\bM0?6\b")          # смена инструмента: M6 или M06
 _G21 = re.compile(r"\bG21\b")          # «единицы = мм» (GRBL)
-_PARENS = re.compile(r"\([^)]*\)")     # (комментарий) в круглых скобках
+
+def _strip_parens(line: str) -> str:
+    """Убирает (…)-комментарии с учётом ВЛОЖЕННЫХ скобок: наивный regex \\([^)]*\\)
+    на «(Tool: endmill (flat), …)» обрезался бы по первой ')' и оставил хвост-мусор,
+    на котором стойка падает. Считаем глубину скобок."""
+    out, depth = [], 0
+    for ch in line:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        elif depth == 0:
+            out.append(ch)
+    return "".join(out)
 
 
 def convert(text: str) -> tuple[str, int]:
@@ -56,7 +69,7 @@ def convert(text: str) -> tuple[str, int]:
             if _M6.search(s) and _TNUM.search(s):       # закомментированная смена «( M6 T1 )»
                 emit_toolchange(s)
             continue                                    # прочие комментарии — убрать
-        s = _PARENS.sub("", s).strip()                  # на всякий случай — хвостовой inline (...)
+        s = _strip_parens(s).strip()                    # хвостовой inline (...), м.б. вложенный
         if _M6.search(s) and _TNUM.search(s):           # активная смена «M6 T1» / «T1 M6»
             emit_toolchange(s)
             continue
