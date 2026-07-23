@@ -367,16 +367,19 @@ def main():
     rbase = os.path.splitext(out)[0]
     if rbase.endswith("_deviation"):
         rbase = rbase[:-len("_deviation")]
-    gmask = gouge > args.gouge_tol                          # точки зареза (на эталоне)
-    xmask = finished & (excess > args.allowance)            # избыток на детали (на результате)
-    if gmask.any():
-        trimesh.PointCloud(V[gmask], colors=np.tile([70, 110, 210, 255],
-                           (int(gmask.sum()), 1))).export(rbase + "_gouge.ply")
-        print(f"зарез: {int(gmask.sum())} точек → {rbase}_gouge.ply")
-    if xmask.any():
-        trimesh.PointCloud(V[xmask], colors=np.tile([210, 70, 60, 255],
-                           (int(xmask.sum()), 1))).export(rbase + "_excess.ply")
-        print(f"избыток > припуска: {int(xmask.sum())} точек → {rbase}_excess.ply")
+    gmask = gouge > args.gouge_tol                          # вершины зареза
+    xmask = finished & (excess > args.allowance)            # вершины избытка на детали
+    # зоны выгружаем как ПОДМЕШ (STL) — грани результата, попавшие в зону. Открывается
+    # как обычная модель (NX/FreeCAD/MeshLab), в отличие от облака точек; наложите на деталь.
+    gface = np.where((gouge[M.faces] > args.gouge_tol).any(axis=1))[0]
+    xface = np.where(finished[M.faces].all(axis=1)
+                     & (excess[M.faces] > args.allowance).any(axis=1))[0]
+    if len(gface):
+        M.submesh([gface], append=True).export(rbase + "_gouge.stl")
+        print(f"зарез: {int(gmask.sum())} вершин / {len(gface)} граней → {rbase}_gouge.stl")
+    if len(xface):
+        M.submesh([xface], append=True).export(rbase + "_excess.stl")
+        print(f"избыток > припуска: {int(xmask.sum())} вершин / {len(xface)} граней → {rbase}_excess.stl")
 
     def _worst(pts, vals, m, n=5):
         i = np.argsort(vals[m])[::-1][:n]
