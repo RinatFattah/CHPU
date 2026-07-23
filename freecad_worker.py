@@ -354,6 +354,47 @@ def warn_zone_sanity(z, sb):
                                f"накрывает всю заготовку — работать негде")
 
 
+def plug_stock_for_zones(doc, job, sb, z, p):
+    """Запретные КОЛОННЫ в заготовке — для планировщика Adaptive. Он сводит
+    заготовку к внешнему 2D-контуру (TechDraw.findShapeOutline) и считает всё
+    вне контура расчищенным воздухом: там он свободно ставит винтовой вход и
+    тянет линки НА ГЛУБИНЕ РЕЗА, игнорируя вырез из региона операции. Колонна
+    (бокс ⊕ m, на высоту заготовки — габарит не меняется) расширяет контур,
+    воздух в футпринте бокса становится «материалом», и Adaptive его объезжает.
+    Нужна только боксам, задевающим кромку/окрестность заготовки: внутри
+    силуэта и так материал. Заготовка при этом материализуется в статичную
+    Part::Feature (у параметрической присвоение Shape откатилось бы)."""
+    reach = float(p["tool_diameter"]) + float(p["rough_allowance"]) + z["m"] + 1.0
+    prisms = []
+    for b in z["boxes"]:
+        if (b[0] > sb.XMax + reach or b[3] < sb.XMin - reach or
+                b[1] > sb.YMax + reach or b[4] < sb.YMin - reach):
+            continue    # бокс далеко от заготовки — планировщику не мешает
+        g = z["m"]
+        prisms.append(Part.makeBox(b[3] - b[0] + 2 * g, b[4] - b[1] + 2 * g,
+                                   sb.ZLength,
+                                   FreeCAD.Vector(b[0] - g, b[1] - g, sb.ZMin)))
+    if not prisms:
+        return
+    try:
+        fused = job.Stock.Shape.fuse(prisms)
+    except Exception as e:
+        log(f"warn: запретные колонны не вплавились в заготовку ({e}) — "
+            f"вход/линки Adaptive у края прикроет только гейт")
+        return
+    stock_feat = doc.addObject("Part::Feature", "StockZoned")
+    stock_feat.Shape = fused
+    old = job.Stock
+    job.Stock = stock_feat
+    try:
+        doc.removeObject(old.Name)
+    except Exception:
+        pass
+    doc.recompute()
+    log(f"зоны: в заготовку вплавлено запретных колонн: {len(prisms)} — "
+        f"планировщик Adaptive не поведёт туда вход и линки (габарит прежний)")
+
+
 def _rect_face(x0, y0, x1, y1):
     """Прямоугольная грань на плоскости Z=0 (там живут все 2D-зоны операций)."""
     return Part.Face(Part.makePolygon([
@@ -512,12 +553,48 @@ def _arc_segments(p0, p1, arc, cw):
     return list(zip(pts[:-1], pts[1:]))
 
 
+def _pt_seg_dist2d(p, a, b):
+    """Расстояние точка-отрезок в XY."""
+    ax, ay, bx, by = a[0], a[1], b[0], b[1]
+    dx, dy = bx - ax, by - ay
+    ll = dx * dx + dy * dy
+    if ll < 1e-18:
+        return math.hypot(p[0] - ax, p[1] - ay)
+    t = max(0.0, min(1.0, ((p[0] - ax) * dx + (p[1] - ay) * dy) / ll))
+    return math.hypot(p[0] - (ax + t * dx), p[1] - (ay + t * dy))
+
+
+def _seg_seg_dist2d(a0, a1, b0, b1):
+    """Расстояние отрезок-отрезок в XY (0 — пересекаются)."""
+    def orient(p, q, r):
+        return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+    d1, d2 = orient(b0, b1, a0), orient(b0, b1, a1)
+    d3, d4 = orient(a0, a1, b0), orient(a0, a1, b1)
+    if ((d1 > 0) != (d2 > 0)) and ((d3 > 0) != (d4 > 0)):
+        return 0.0
+    return min(_pt_seg_dist2d(a0, b0, b1), _pt_seg_dist2d(a1, b0, b1),
+               _pt_seg_dist2d(b0, a0, a1), _pt_seg_dist2d(b1, a0, a1))
+
+
+def _seg_rect_dist2d(p0, p1, x0, y0, x1, y1):
+    """Расстояние в XY от отрезка до прямоугольника (0 — задевает)."""
+    for px, py in (p0, p1):
+        if x0 <= px <= x1 and y0 <= py <= y1:
+            return 0.0
+    corners = ((x0, y0), (x1, y0), (x1, y1), (x0, y1))
+    return min(_seg_seg_dist2d(p0, p1, corners[i], corners[(i + 1) % 4])
+               for i in range(4))
+
+
 def check_gcode_zones(z, gcode):
     """ГЕЙТ-страховка: проход по ГОТОВОМУ G-коду против зон в пространстве
-    кончика инструмента. Отрезки против боксов — точный slab-тест; дуги —
-    сэмплинг; выпуклые ограничения (рабочий бокс, полупространства) — по
-    концам отрезков (прямая между разрешёнными точками выпуклой области не
-    выходит из неё). Возвращает [(строка, (x,y,z), глубина_захода, описание)].
+    кончика инструмента. Запретный бокс = прямоугольник, раздутый ДИСКОМ
+    R+m (углы скруглены — раздув квадратом ложно срабатывал бы на честном
+    обходе угла): точный тест «расстояние XY-отрезка до прямоугольника» на
+    части отрезка ниже потолка бокса. Дуги — сэмплинг; выпуклые ограничения
+    (рабочий бокс — эрозия диском даёт точный прямоугольник, полупространства)
+    — по концам отрезков (прямая между точками выпуклой области не выходит из
+    неё). Возвращает [(строка, (x,y,z), глубина_захода, описание)].
     Априорное ограничение обязано давать пустой список — непустой означает
     дыру в нём, а не «нормальную» ситуацию."""
     import re
@@ -525,11 +602,10 @@ def check_gcode_zones(z, gcode):
     tol = 1e-3
     g = z["r"] + z["m"]
 
-    # запретные боксы для кончика: снизу открыты (под боксом нельзя), сверху z1+m
+    # запретные боксы: (описание, x0, y0, x1, y1, потолок для кончика)
     boxes = [(f"запретный бокс X {b[0]:g}..{b[3]:g} Y {b[1]:g}..{b[4]:g} "
               f"(кончику нельзя ниже Z {b[5] + z['m']:g})",
-              b[0] - g + tol, b[1] - g + tol, -1e9,
-              b[3] + g - tol, b[4] + g - tol, b[5] + z["m"] - tol)
+              b[0], b[1], b[3], b[4], b[5] + z["m"])
              for b in z["boxes"]]
     half = []
     for a, c, v in z["half"]:
@@ -558,30 +634,27 @@ def check_gcode_zones(z, gcode):
 
     def check_seg(p0, p1, ln):
         check_point(p1, ln)
-        for bx in boxes:
+        for desc, bx0, by0, bx1, by1, zc in boxes:
+            # часть отрезка ниже потолка бокса (снизу бокс открыт)
+            zc_eff = zc - tol
+            z0, z1v = p0[2], p1[2]
+            if z0 >= zc_eff and z1v >= zc_eff:
+                continue
             t0, t1 = 0.0, 1.0
-            hit = True
-            for i in range(3):
-                a0, d = p0[i], p1[i] - p0[i]
-                lo, hi = bx[1 + i], bx[4 + i]
-                if abs(d) < 1e-12:
-                    if a0 <= lo or a0 >= hi:
-                        hit = False
-                        break
-                else:
-                    ta, tb = (lo - a0) / d, (hi - a0) / d
-                    if ta > tb:
-                        ta, tb = tb, ta
-                    t0, t1 = max(t0, ta), min(t1, tb)
-                    if t0 >= t1:
-                        hit = False
-                        break
-            if hit:
+            dzt = z1v - z0
+            if abs(dzt) > 1e-12:
+                tc = (zc_eff - z0) / dzt
+                if z0 >= zc_eff:      # входит под потолок в точке tc
+                    t0 = max(t0, tc)
+                elif z1v >= zc_eff:   # выходит из-под потолка в точке tc
+                    t1 = min(t1, tc)
+            q0 = (p0[0] + (p1[0] - p0[0]) * t0, p0[1] + (p1[1] - p0[1]) * t0)
+            q1 = (p0[0] + (p1[0] - p0[0]) * t1, p0[1] + (p1[1] - p0[1]) * t1)
+            d = _seg_rect_dist2d(q0, q1, bx0, by0, bx1, by1)
+            if d < g - tol:
                 tm = (t0 + t1) / 2.0
                 pt = tuple(p0[i] + (p1[i] - p0[i]) * tm for i in range(3))
-                depth = min(pt[0] - bx[1], bx[4] - pt[0],
-                            pt[1] - bx[2], bx[5] - pt[1], bx[6] - pt[2])
-                viol.append((ln, pt, depth, bx[0]))
+                viol.append((ln, pt, g - d, desc))
 
     pos = {"X": None, "Y": None, "Z": None}
     mode = None
@@ -1444,6 +1517,8 @@ def mill(doc, feat, p, stock_solid=None):
                                "(v1) — отключите чистовую (--no-finish)")
         check_zone_heights(zones, sb)   # потолок/пол зон против высот заготовки
         warn_zone_sanity(zones, sb)     # зоны мимо заготовки = вероятно, не та СК
+        plug_stock_for_zones(doc, job, sb, zones, p)  # колонны от воздушных
+        # шорткатов Adaptive за краем заготовки (вход/линки на глубине реза)
 
     tc = job.Tools.Group[0]
     tool_d = float(p["tool_diameter"])
