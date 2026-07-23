@@ -974,13 +974,16 @@ def make_roughing_ops(doc, job, tc, shape, p):
             log(f"warn: зона контура не построилась: {e}")
         # мёртвые зоны: из материала периметра вычитается запретный футпринт
         # (Adaptive держит диск фрезы внутри зоны — хватает зазора m)
+        mat_cut = False
         if material is not None:
-            material, _ = restrict_region(zones, material,
-                                          zones["m"] if zones else 0.0,
-                                          floor_z, "контур")
+            material, mat_cut = restrict_region(zones, material,
+                                                zones["m"] if zones else 0.0,
+                                                floor_z, "контур")
         if material is not None and material.Area > 1.0:
             tool_d = float(p["tool_diameter"])
             margin_xy = min(sb.XLength - bb.XLength, sb.YLength - bb.YLength) / 2.0
+            ring = None
+            ring_cut = False
             if margin_xy >= 2.0 * tool_d:
                 # широкие поля: адаптивная выборка кольца. Зона выпускается за
                 # край заготовки (снаружи воздух) — иначе StockToLeave оставит
@@ -989,9 +992,16 @@ def make_roughing_ops(doc, job, tc, shape, p):
                     ring = stock_filled.makeOffset2D(tool_d + allowance).cut(filled)
                 except Exception:
                     ring = material
-                ring, _ = restrict_region(zones, ring,
-                                          zones["m"] if zones else 0.0,
-                                          floor_z, "контур (кольцо)")
+                ring, ring_cut = restrict_region(zones, ring,
+                                                 zones["m"] if zones else 0.0,
+                                                 floor_z, "контур (кольцо)")
+            # зоны задели периметр → Adaptive для контура НЕЛЬЗЯ: он считает
+            # всё вне силуэта заготовки расчищенным воздухом и свободно ходит
+            # там (вход/линки) НА ГЛУБИНЕ РЕЗА, игнорируя вырез из региона.
+            # Контурные петли (Profile) шорткатов по воздуху не строят.
+            force_loops = zones is not None and (mat_cut or ring_cut
+                                                 or ring is None)
+            if margin_xy >= 2.0 * tool_d and not force_loops:
                 ring_top = local_start(material) if ring is not None else None
                 if ring_top is None:
                     log("контур: материала по периметру нет — пропущено")
@@ -1009,6 +1019,10 @@ def make_roughing_ops(doc, job, tc, shape, p):
                 # гранями обводит только общий внешний контур). Одна петля
                 # снимает полосу шириной в фрезу; материал дальше (наплывы
                 # произвольной заготовки) добирают внешние петли.
+                if margin_xy >= 2.0 * tool_d:
+                    log("контур: мёртвые зоны задевают периметр — адаптивная "
+                        "выборка заменена контурными петлями (Adaptive свободно "
+                        "ходит по воздуху за краем заготовки на глубине реза)")
                 step = tool_d * float(p["rough_stepover"]) / 100.0
                 mb = material.BoundBox
                 pts = [v.Point for v in material.Vertexes]
