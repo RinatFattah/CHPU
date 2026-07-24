@@ -39,3 +39,6 @@ config.local.yaml
 .DS_Store
 Thumbs.db
 desktop.ini
+*_stock.step
+*_part.step
+*_autofix.json
