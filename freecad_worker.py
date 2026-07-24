@@ -513,9 +513,11 @@ def find_up_faces(shape, bb, include_top=False):
 def make_adaptive(doc, job, tc, name, region_shape, p, start_z, final_z, allowance):
     """Одна черновая операция Adaptive по явной 2D-зоне (Side=Inside).
     Возвращает операцию или None, если траектория пуста.
+    final_z снизу ограничен зазором от стола (_floor_limit).
     Зона задаётся явной плоской областью: проекции граней модели на сложной
     детали дают незамкнутый контур (Path.Area: «ccurve not closed»), и операция
     молча выдаёт пустую траекторию."""
+    final_z = max(final_z, p.get("_floor_limit", final_z))  # не ниже стола
     region = doc.addObject("Part::Feature", f"Region{name}")
     region.Shape = region_shape
     doc.recompute()
@@ -559,6 +561,7 @@ def make_profile(doc, job, tc, name, region_shape, p, start_z, final_z, allowanc
     периметра при УЗКИХ полях (меньше ~2 диаметров): адаптивной выборке там
     негде сделать винтовой заход, а контурному проходу заход не нужен —
     он идёт по воздуху вокруг заготовки и срезает выступающий материал."""
+    final_z = max(final_z, p.get("_floor_limit", final_z))  # не ниже стола
     region = doc.addObject("Part::Feature", f"Region{name}")
     region.Shape = region_shape
     doc.recompute()
@@ -592,6 +595,7 @@ def make_surface_rough(doc, job, tc, name, model_obj, face_idx, p,
     слоями StepDown, с вертикальным смещением DepthOffset = припуск, зона —
     только эта грань модели (BoundBox=BaseBoundBox). Плоская фреза оставляет
     на наклоне ступеньки высотой до StepDown — их снимает чистовой проход."""
+    final_z = max(final_z, p.get("_floor_limit", final_z))  # не ниже стола
     import Path.Op.Surface as Surface
     op = Surface.Create(name, parentJob=job)
     op.ToolController = tc
@@ -665,6 +669,53 @@ def make_roughing_ops(doc, job, tc, shape, p):
     ops = []
     stock_shape = job.Stock.Shape
 
+    # ── мёртвые зоны: XY-боксы (координаты программы), где фреза работать НЕ должна
+    #    (прижимы, указания auto_fix/ЛЛМ). Вычитаются из 2D-зон операций;
+    #    наклонная грань, чей центр в зоне, пропускается целиком. ──
+    dz_faces = []
+    for z in (p.get("dead_zones") or []):
+        try:
+            x0, x1 = float(z["x"][0]), float(z["x"][1])
+            y0, y1 = float(z["y"][0]), float(z["y"][1])
+            dz_faces.append(Part.Face(Part.makePolygon([
+                FreeCAD.Vector(x0, y0, 0), FreeCAD.Vector(x1, y0, 0),
+                FreeCAD.Vector(x1, y1, 0), FreeCAD.Vector(x0, y1, 0),
+                FreeCAD.Vector(x0, y0, 0)])))
+        except Exception as e:
+            log(f"warn: мёртвая зона {z} не разобрана: {e}")
+    dead = Part.makeCompound(dz_faces) if dz_faces else None
+    if dead is not None:
+        log(f"мёртвые зоны: {len(dz_faces)} шт. — исключены из обработки")
+
+    def cut_dead(region):
+        """Вычитает мёртвые зоны из плоской зоны; None = зона исчезла целиком."""
+        if dead is None or region is None:
+            return region
+        try:
+            r = region.cut(dead)
+            return r if r.Area > 0.5 else None
+        except Exception as e:
+            log(f"warn: вычитание мёртвой зоны не удалось ({e}) — зона без выреза")
+            return region
+
+    def in_dead(cx, cy):
+        for z in (p.get("dead_zones") or []):
+            try:
+                if z["x"][0] <= cx <= z["x"][1] and z["y"][0] <= cy <= z["y"][1]:
+                    return True
+            except Exception:
+                pass
+        return False
+
+    skip_ops = set(p.get("skip_ops") or [])
+
+    def skip(name):
+        """Операция в чёрном списке (указание оператора/ЛЛМ) — не создавать."""
+        if name in skip_ops:
+            log(f"{name}: в списке skip_ops — пропущено по указанию")
+            return True
+        return False
+
     def local_start(region_shape):
         """Локальный верх материала над зоной: колонна над зоной ∩ заготовка.
         None = материала над зоной нет вообще (зону пропускаем). Заготовка —
@@ -687,6 +738,12 @@ def make_roughing_ops(doc, job, tc, shape, p):
     if sil is None:
         log("warn: силуэт не построился — вырезы и внешний контур пропущены")
     for i, region in enumerate(find_through_cuts(sil) if sil is not None else [], 1):
+        if skip(f"RoughHole{i}"):
+            continue
+        region = cut_dead(region)
+        if region is None:
+            log(f"RoughHole{i}: целиком в мёртвой зоне — пропущено")
+            continue
         rb = region.BoundBox
         hole_top = local_start(region)
         if hole_top is None:
@@ -739,8 +796,13 @@ def make_roughing_ops(doc, job, tc, shape, p):
                 f"пропущена")
             skipped += fc["area"]          # накрыта материалом сверху — не достать
             continue
+        region = cut_dead(fc["region"])
+        if region is None:
+            log(f"грань Z={fc['z']:.1f} ({fc['area']:.0f} мм²): целиком в мёртвой "
+                f"зоне — пропущена")
+            continue
         faces.append({"kind": "planar", "z": fc["z"], "final": fc["z"] + alw_z,
-                      "region": fc["region"], "idx": fc["idx"], "area": fc["area"],
+                      "region": region, "idx": fc["idx"], "area": fc["area"],
                       "cx": fc["cx"], "cy": fc["cy"]})
     # наклонные/криволинейные грани с восходящей нормалью
     for idx, f in enumerate(jm.Shape.Faces, 1):
@@ -755,6 +817,9 @@ def make_roughing_ops(doc, job, tc, shape, p):
             continue
         if nz < 0.01:      # смотрит вниз или строго вбок — проекции на XY нет
             skipped += f.Area
+            continue
+        if in_dead(mid.x, mid.y):
+            log(f"наклонная грань ({f.Area:.0f} мм²): в мёртвой зоне — пропущена")
             continue
         probe = FreeCAD.Vector(mid.x, mid.y, f.BoundBox.ZMax + 0.3)
         if shape.isInside(probe, 1e-6, True):
@@ -787,6 +852,8 @@ def make_roughing_ops(doc, job, tc, shape, p):
                 continue  # грань вровень с верхом материала — снимать нечего
             face_n += 1
             name = f"RoughFace{face_n}"
+            if skip(name):
+                continue
             op = make_adaptive(doc, job, tc, name, fc["region"], p,
                                top, fc["final"], alw_xy)
             if not op:
@@ -804,6 +871,8 @@ def make_roughing_ops(doc, job, tc, shape, p):
                 continue
             slope_n += 1
             name = f"RoughSlope{slope_n}"
+            if skip(name):
+                continue
             op = make_surface_rough(doc, job, tc, name, jm, fc["idx"], p,
                                     top, fc["final"], alw_z)
             note = f"готова криволинейная грань {slope_n} ({fc['area']:.0f} мм²)"
@@ -815,6 +884,44 @@ def make_roughing_ops(doc, job, tc, shape, p):
     if skipped > 1.0:
         log(f"warn: {skipped:.0f} мм² поверхностей смотрят вниз/вбок или накрыты "
             f"материалом — сверху не достать, это второй установ")
+
+    # ── 2b) дополнительные зоны съёма (указания оператора/ЛЛМ из auto_fix):
+    #      принудительная дообработка там, где штатные операции не добрали. ──
+    for k, z in enumerate(p.get("extra_zones") or [], 1):
+        name = f"ExtraZone{k}"
+        if skip(name):
+            continue
+        try:
+            x0, x1 = sorted((float(z["x"][0]), float(z["x"][1])))
+            y0, y1 = sorted((float(z["y"][0]), float(z["y"][1])))
+            rect = Part.Face(Part.makePolygon([
+                FreeCAD.Vector(x0, y0, 0), FreeCAD.Vector(x1, y0, 0),
+                FreeCAD.Vector(x1, y1, 0), FreeCAD.Vector(x0, y1, 0),
+                FreeCAD.Vector(x0, y0, 0)]))
+        except Exception as e:
+            log(f"{name}: зона {z} не разобрана: {e}")
+            continue
+        rect = cut_dead(rect)
+        if rect is None:
+            log(f"{name}: целиком в мёртвой зоне — пропущено")
+            continue
+        ztop = local_start(rect)
+        if ztop is None:
+            log(f"{name}: над зоной нет материала заготовки — пропущено")
+            continue
+        if "z_top" in z:
+            ztop = min(ztop, float(z["z_top"]))
+        zbot = float(z.get("z_bottom", bb.ZMin))   # снизу клампится полом
+        op = make_adaptive(doc, job, tc, name, rect, p, ztop, zbot, alw_xy)
+        if not op and min(x1 - x0, y1 - y0) > float(p["tool_diameter"]) + 0.2:
+            log(f"{name}: узкая зона — перехожу на контурный проход изнутри")
+            op = make_profile(doc, job, tc, name, rect, p, ztop, zbot, alw_xy,
+                              side="Inside")
+        if op:
+            ops.append(op)
+            write_partial(job, ops, p, f"готова доп. зона {k}")
+        else:
+            log(f"{name}: пустая траектория — пропущено")
 
     # ── 3) внешний контур детали по силуэту — ПОСЛЕДНИМ: пока деталь жёстко
     #      держится в заготовке, снят весь объём выше; периметр обходим в конце.
@@ -828,10 +935,10 @@ def make_roughing_ops(doc, job, tc, shape, p):
         except Exception as e:
             filled = None
             log(f"warn: внешний контур не построился: {e}")
-        if filled is not None:
-            # внешний контур режем до дна ДЕТАЛИ (bb.ZMin) ВСЕГДА, без припуска
-            # по дну: периметр отделяет деталь от рамки заготовки — кожура на дне
-            # не нужна. Припуск по стенке (OffsetExtra) при этом сохраняется.
+        if filled is not None and not skip("RoughPerimeter"):
+            # внешний контур режем до дна ДЕТАЛИ (bb.ZMin, снизу клампится полом):
+            # периметр отделяет деталь от рамки заготовки. Припуск по стенке
+            # (OffsetExtra) при этом сохраняется.
             op = make_profile(doc, job, tc, "RoughPerimeter", filled, p,
                               start_z, bb.ZMin, alw_xy)
             if op:
@@ -1011,6 +1118,12 @@ def mill(doc, feat, p, stock_solid=None):
     stock_solid — произвольная заготовка из файла (уже в координатах детали);
     None — заготовка = габаритный бокс детали + поля."""
     bb = feat.Shape.BoundBox
+    # зазор от стола: ни одна операция не опускается ниже дна детали + зазор
+    # (деталь лежит на столе; сквозные вырезы оставляют плёнку этой толщины)
+    p["_floor_limit"] = bb.ZMin + float(p.get("floor_clearance", 0.5))
+    if p.get("floor_clearance", 0.5) > 0:
+        log(f"зазор от стола: {p['floor_clearance']:g} мм — фреза не ниже "
+            f"Z={p['_floor_limit']:.2f}")
 
     import Path.Main.Job as Job
     job = Job.Create("Job", [feat])
@@ -1111,7 +1224,7 @@ def mill(doc, feat, p, stock_solid=None):
         surf.setExpression("StartDepth", None)
         surf.StartDepth = bb.ZMax
         surf.setExpression("FinalDepth", None)
-        surf.FinalDepth = bb.ZMin
+        surf.FinalDepth = p["_floor_limit"]   # чистовая тоже не ниже стола
         surf.ClearanceHeight.Value = bb.ZMax + p["safe_height"]
         surf.SafeHeight.Value = bb.ZMax + 3.0
         doc.recompute()

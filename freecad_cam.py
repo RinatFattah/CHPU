@@ -120,6 +120,10 @@ def generate_gcode_freecad(model_path: str, gcode_path: str) -> int:
         # деталью) выгружается рядом с G-Code — для симуляции и наладки
         "stock_out": os.path.splitext(os.path.abspath(gcode_path))[0] + "_stock.stp",
 
+        "floor_clearance": float(getattr(config, "FLOOR_CLEARANCE", 0.5)),
+        "dead_zones": list(getattr(config, "DEAD_ZONES", []) or []),
+        "extra_zones": list(getattr(config, "EXTRA_ZONES", []) or []),
+        "skip_ops": list(getattr(config, "SKIP_OPS", []) or []),
         "rough_mode": config.ROUGH_MODE,
         "rough_allowance": config.ROUGH_ALLOWANCE,
         "rough_allowance_mode": config.ROUGH_ALLOWANCE_MODE,

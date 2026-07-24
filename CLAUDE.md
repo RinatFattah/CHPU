@@ -82,6 +82,26 @@ it lives in git history if ever needed.
 ## Files
 
 - `run_cam.py` - CLI entry point: `python run_cam.py model.step|model.prt [out.gcode] [--config config.yaml]`
+- `auto_fix.py` - autonomous LLM loop: generate → NX-simulate → boolean diff
+  (`step_diff.py` + `freecad_diff_worker.py`) → ask `claude -p` (headless CLI; found
+  via PATH / CLAUDE_CLI env / VSCode extension native-binary) → parse STRICT-JSON
+  actions (set_param whitelist with bounds; extra_zone = forced clearing rect for
+  undercuts, Adaptive with Profile-inside fallback, floor-clamped; skip_op = drop a
+  named op, validated against op-name pattern; dead_zone XY boxes) → regenerate.
+  Op names for the prompt are parsed from `(Begin|Finish operation: X)` G-code
+  comments. Boolean diff gotcha: OCCT booleans with the FACETED sim body are only
+  reliable with it as the RIGHT operand (result.cut(part) silently no-ops) — hence
+  undercut = (bbox−part) − ((bbox−part) − result), the sim body is mesh-laundered
+  (tessellate→makeShapeFromMesh→makeSolid, reverse if inverted), the intentional
+  floor skin is split off by a slab cut, and diffuse tessellation films
+  (fill<2% of own bbox) are filtered as noise.
+  Journal at `<gcode>_autofix.json`. Key safety: `FLOOR_CLEARANCE` (default 0.5 mm)
+  clamps FinalDepth of EVERY op (incl. through-holes/perimeter/finish) to part
+  bottom + clearance — the part lies on the machine table; `DEAD_ZONES` (XY boxes,
+  program coords) are subtracted from hole/face regions, slopes with center inside
+  are skipped (perimeter Profile is NOT affected). Diff counts undercut only inside
+  the part-silhouette prism (stock frame is intentional), bottom skin ≤ floor limit
+  reported separately as floor_skin, faceting noise filtered by min_volume.
 - `nx_export.py` - Siemens NX bridge: `.prt` → STEP via NX's CLI translator (headless).
 - `freecad_cam.py` - host side: locates `freecadcmd`, passes params via temp JSON
   (env var `FREECAD_WORKER_PARAMS`), parses `[worker]` output markers.
