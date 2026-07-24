@@ -20,8 +20,15 @@ import subprocess
 import sys
 import tempfile
 
+import sys
+
+# при прямом запуске файла корень репозитория добавляется в sys.path
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
 import config
-import freecad_cam
+from cam import freecad_cam
 
 _WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "freecad_describe_worker.py")
@@ -37,7 +44,7 @@ def describe(model_path: str, json_path: str | None = None,
 
     src_name = os.path.basename(model_path)
     if os.path.splitext(model_path)[1].lower() == ".prt":
-        import nx_export
+        from nx import nx_export
         model_path = nx_export.prt_to_step(model_path)
 
     out_json = json_path or os.path.join(tempfile.gettempdir(), "step_describe.json")

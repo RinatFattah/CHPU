@@ -205,9 +205,9 @@ SURFACE_SAMPLE_INTERVAL: 0.3
 ## Как это устроено внутри
 
 - `run_cam.py` — CLI-обёртка.
-- `freecad_cam.py` — хост: находит `freecadcmd`, передаёт параметры (JSON через
+- `cam/freecad_cam.py` — хост: находит `freecadcmd`, передаёт параметры (JSON через
   env `FREECAD_WORKER_PARAMS`), парсит результат. FreeCAD — отдельный процесс.
-- `freecad_worker.py` — исполняется внутри FreeCAD: модель → тело → Path Job
-  (заготовка + фреза) → операция Surface → постпроцессор → G-Code.
+- `cam/freecad_worker.py` — исполняется внутри FreeCAD: модель → тело → Path Job
+  (заготовка + фреза) → операции → постпроцессор → G-Code.
 
 Установка FreeCAD (AppImage, без root) и быстрый старт — в основном [README.md](README.md).

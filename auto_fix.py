@@ -32,9 +32,9 @@ import tempfile
 import time
 
 import config
-import freecad_cam
-import step_describe
-import step_diff
+from cam import freecad_cam
+from cam import step_describe
+from cam import step_diff
 
 for _s in (sys.stdout, sys.stderr):
     if (getattr(_s, "encoding", "") or "").lower().replace("-", "") != "utf8":
@@ -45,6 +45,10 @@ for _s in (sys.stdout, sys.stderr):
 
 # Параметры, которые ЛЛМ разрешено менять: (тип, мин, макс) либо (тип, варианты)
 PARAM_WHITELIST = {
+    # инструмент ЛЛМ может ДИКТОВАТЬ: в симуляции новая фреза подхватывается
+    # автоматически (таблица стойки перезаписывается); на реальном станке её
+    # ставит оператор — рекомендация попадает в report/журнал
+    "TOOL_DIAMETER":         (float, 1.0, 20.0),
     "ROUGH_STEPDOWN":        (float, 0.2, 3.0),
     "ROUGH_STEPOVER":        (float, 10, 60),
     "ROUGH_TOLERANCE":       (float, 0.05, 0.3),
@@ -83,11 +87,15 @@ def find_claude() -> str:
                        "— ЛЛМ-петля недоступна")
 
 
-def ask_llm(prompt: str, timeout: int = 900) -> str:
-    """Запрос к ЛЛМ через headless Claude Code (`claude -p`), промпт — через stdin."""
+def ask_llm(prompt: str, timeout: int = 900, model: str = "") -> str:
+    """Запрос к ЛЛМ через headless Claude Code (`claude -p`), промпт — через stdin.
+    model: "opus" / "sonnet" / "claude-fable-5" / "" = дефолт сессии CLI."""
     exe = find_claude()
+    cmd = [exe, "-p"]
+    if model:
+        cmd += ["--model", model]
     proc = subprocess.run(
-        [exe, "-p"], input=prompt,
+        cmd, input=prompt,
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         timeout=timeout,
     )
@@ -157,7 +165,10 @@ def build_prompt(part_desc: dict, diff_data: dict, history: list,
 - рамка заготовки вне силуэта детали остаётся по техпроцессу;
 - припуск задаётся ROUGH_ALLOWANCE_MODE (сейчас {config.ROUGH_ALLOWANCE_MODE!r});
 - материал, недоступный сверху (поднутрения, накрытые грани), 3-осевая обработка
-  снять НЕ может — это второй установ, параметрами не лечится (verdict unfixable).
+  снять НЕ может — это второй установ, параметрами не лечится (verdict unfixable);
+- фрезу МОЖНО менять (set_param TOOL_DIAMETER, считай что на складе есть любая):
+  меньшая фреза лечит недорезы в узких местах и углах (внутренний угол получает
+  радиус = радиус фрезы; в паз уже фрезы она не влезает), но режет медленнее.
 
 ЗАДАЧА: объясни причину каждого значимого недореза/зареза и предложи исправление.
 Доступные действия:
@@ -249,6 +260,9 @@ def main():
                     help="выровнять заготовку по детали (уголок в уголке)")
     ap.add_argument("--iters", type=int, default=3, metavar="N",
                     help="максимум итераций петли (дефолт 3)")
+    ap.add_argument("--llm-model", default="opus", metavar="MODEL",
+                    help="модель для claude -p: opus (дефолт) / sonnet / "
+                         "claude-fable-5 / '' = дефолт сессии CLI")
     ap.add_argument("--config", metavar="FILE", help="YAML-конфиг")
     args = ap.parse_args()
 
@@ -261,11 +275,11 @@ def main():
     config.NX_EXPORT = True          # нужен _part.step в СК программы для diff
 
     find_claude()                    # проверить ЛЛМ до долгих расчётов
-    import nx_sim
+    from nx import nx_sim
 
     model = args.model
     if os.path.splitext(model)[1].lower() == ".prt":
-        import nx_export
+        from nx import nx_export
         log(f"NX: {os.path.basename(model)} → STEP...")
         model = nx_export.prt_to_step(model)
     gcode = args.gcode or (os.path.splitext(args.model)[0] + ".gcode")
@@ -306,8 +320,9 @@ def main():
 
         if part_desc is None:
             part_desc = step_describe.describe(part_step)
-        log("спрашиваю ЛЛМ (claude -p)...")
-        raw = ask_llm(build_prompt(part_desc, d, history, gcode_ops(gcode)))
+        log(f"спрашиваю ЛЛМ (claude -p, модель {args.llm_model or 'дефолт'})...")
+        raw = ask_llm(build_prompt(part_desc, d, history, gcode_ops(gcode)),
+                      model=args.llm_model)
         try:
             ans = extract_json(raw)
         except ValueError as e:

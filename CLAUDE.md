@@ -81,9 +81,16 @@ it lives in git history if ever needed.
 
 ## Files
 
+Layout: CLI entry points (`run_cam.py`, `auto_fix.py`) + `config.py` at repo root;
+FreeCAD host modules and workers in `cam/`; everything Siemens NX in `nx/`
+(recorded research journals in `nx/research/`); docs in `docs/` (incl.
+`docs/LLM_ПЕТЛЯ.md` — full LLM-loop tech writeup); sample parts in `samples/`.
+In-package modules bootstrap repo root onto sys.path, so both `python run_cam.py`
+and direct runs like `python cam/step_diff.py a.step b.stp` work.
+
 - `run_cam.py` - CLI entry point: `python run_cam.py model.step|model.prt [out.gcode] [--config config.yaml]`
 - `auto_fix.py` - autonomous LLM loop: generate → NX-simulate → boolean diff
-  (`step_diff.py` + `freecad_diff_worker.py`) → ask `claude -p` (headless CLI; found
+  (`cam/step_diff.py` + `cam/freecad_diff_worker.py`) → ask `claude -p` (headless CLI; found
   via PATH / CLAUDE_CLI env / VSCode extension native-binary) → parse STRICT-JSON
   actions (set_param whitelist with bounds; extra_zone = forced clearing rect for
   undercuts, Adaptive with Profile-inside fallback, floor-clamped; skip_op = drop a
@@ -102,15 +109,17 @@ it lives in git history if ever needed.
   are skipped (perimeter Profile is NOT affected). Diff counts undercut only inside
   the part-silhouette prism (stock frame is intentional), bottom skin ≤ floor limit
   reported separately as floor_skin, faceting noise filtered by min_volume.
-- `nx_export.py` - Siemens NX bridge: `.prt` → STEP via NX's CLI translator (headless).
-- `freecad_cam.py` - host side: locates `freecadcmd`, passes params via temp JSON
+- `nx/nx_export.py` - Siemens NX bridge: `.prt` → STEP via NX's CLI translator (headless).
+- `cam/freecad_cam.py` - host side: locates `freecadcmd`, passes params via temp JSON
   (env var `FREECAD_WORKER_PARAMS`), parses `[worker]` output markers.
-- `freecad_worker.py` - runs **inside** FreeCAD's interpreter: model → solid →
+- `cam/freecad_worker.py` - runs **inside** FreeCAD's interpreter: model → solid →
   origin normalization → Path Job → Surface op → postprocessor → G-Code.
-- `nx_sim.py` + `nx_sim_journal.py` + `nx_sim_export_journal.py` - NX ISV
+- `nx/nx_sim.py` + `nx/nx_sim_journal.py` + `nx/nx_sim_export_journal.py` - NX ISV
   material-removal simulation of the G-code (`--simulate`); see the ISV Key Fact.
-- `step_describe.py` + `freecad_describe_worker.py` - CAD file → compact JSON
+- `cam/step_describe.py` + `cam/freecad_describe_worker.py` - CAD file → compact JSON
   geometry description for LLM/automation (bbox, faces by type, holes, summary).
+- `nx/grbl_to_sinumerik.py` - standalone GRBL→.mpf converter (manual NX sim path,
+  see `docs/NX_ПОШАГОВО.md`).
 - `config.py` - parameter defaults + YAML loading (`--config`).
 - `README_CAM.md` - operator-facing parameter reference. **Keep in sync** when
   changing CAM params. `README.md` - main handoff doc.
@@ -180,9 +189,11 @@ python run_cam.py --help
 python run_cam.py part.step out.gcode
 ```
 
-A real customer part for testing sits in the repo root:
-`75.6121.0.0411.003-A-CAM-DMC-635_1.stp` (exported in assembly coords — good test
-for ORIGIN normalization).
+A real customer part for testing sits in `samples/`:
+`samples/75.6121.0.0411.003-A-CAM-DMC-635_1.stp` (exported in assembly coords —
+good test for ORIGIN normalization); its L-shaped stock:
+`samples/75.6121.0.0411.003-A-CAM-DMC-635_1_zag_oriented.stp` (use with
+`--stock ... --stock-align`).
 
 ## Editing Guidance
 

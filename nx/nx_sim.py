@@ -37,8 +37,15 @@ import subprocess
 import tempfile
 import time
 
+import sys
+
+# при прямом запуске файла корень репозитория добавляется в sys.path
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
 import config
-import nx_export
+from nx import nx_export
 
 
 def _log(msg):
@@ -191,7 +198,7 @@ def simulate(gcode_path: str, stock_step_path: str, out_stem: str | None = None)
     n = gcode_to_mpf(gcode_path, mpf_path, tool_number=1)
     _log(f"программа для стойки: {n} строк → {os.path.basename(mpf_path)}")
 
-    from freecad_cam import _ascii_safe
+    from cam.freecad_cam import _ascii_safe
     log_path = os.path.join(tdir, f"{stem}_sim_journal.log")
     if os.path.exists(log_path):
         os.unlink(log_path)

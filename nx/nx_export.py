@@ -22,6 +22,13 @@ import os
 import subprocess
 import tempfile
 
+import sys
+
+# при прямом запуске файла корень репозитория добавляется в sys.path
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
 import config
 
 # (подпапка транслятора, exe, def-файл с направлением "UG to STEP")
@@ -85,7 +92,7 @@ def prt_to_step(prt_path: str, step_path: str | None = None,
         raise RuntimeError(f"транслятор STEP AP{ap} не найден: {translator}")
 
     # NX/OCCT-цепочке дальше нужен ASCII-путь; вход конвертируем в 8.3 на месте
-    from freecad_cam import _ascii_safe
+    from cam.freecad_cam import _ascii_safe
     prt_path = _ascii_safe(os.path.abspath(prt_path))
     if step_path is None:
         stem = os.path.splitext(os.path.basename(prt_path))[0]

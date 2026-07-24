@@ -97,19 +97,21 @@ POSTPROCESSOR: "grbl"     # диалект стойки: grbl / linuxcnc / fanuc
 | Файл | Роль |
 |---|---|
 | `run_cam.py` | CLI: модель → G-Code |
-| `nx_export.py` | мост NX: `.prt` → STEP штатным транслятором NX (headless) |
-| `freecad_cam.py` | хост: находит `freecadcmd`, передаёт параметры, разбирает результат |
-| `freecad_worker.py` | исполняется внутри FreeCAD: модель → тело → Path Job → Surface → постпроцессор |
-| `nx_sim.py` + `nx_sim_journal.py` + `nx_sim_export_journal.py` | симуляция G-Code на виртуальном станке NX ISV со съёмом материала (`--simulate`) |
-| `step_describe.py` + `freecad_describe_worker.py` | CAD-файл → JSON-описание геометрии (для LLM/автоматизации) |
-| `step_diff.py` + `freecad_diff_worker.py` | булев diff «деталь vs результат симуляции» → JSON недорезов/зарезов |
-| `auto_fix.py` | автономная ЛЛМ-петля: генерация → симуляция → diff → правка параметров через `claude -p` → регенерация |
+| `auto_fix.py` | автономная ЛЛМ-петля: генерация → симуляция → diff → правка параметров через `claude -p` → регенерация (разбор: [docs/LLM_ПЕТЛЯ.md](docs/LLM_ПЕТЛЯ.md)) |
 | `config.py` | дефолты параметров + загрузка YAML |
+| `cam/freecad_cam.py` | хост: находит `freecadcmd`, передаёт параметры, разбирает результат |
+| `cam/freecad_worker.py` | исполняется внутри FreeCAD: модель → тело → Path Job → операции → постпроцессор |
+| `cam/step_describe.py` + `cam/freecad_describe_worker.py` | CAD-файл → JSON-описание геометрии (для LLM/автоматизации) |
+| `cam/step_diff.py` + `cam/freecad_diff_worker.py` | булев diff «деталь vs результат симуляции» → JSON недорезов/зарезов |
+| `nx/nx_export.py` | мост NX: `.prt` → STEP штатным транслятором NX (headless) |
+| `nx/nx_sim.py` + журналы | симуляция G-Code на виртуальном станке NX ISV со съёмом материала (`--simulate`) |
+| `nx/grbl_to_sinumerik.py` | GRBL → Sinumerik `.mpf` для ручной симуляции ([docs/NX_ПОШАГОВО.md](docs/NX_ПОШАГОВО.md)) |
+| `samples/` | пробные детали и заготовка-уголок серии 75.6121 |
 
 ### CAD-файл → JSON (для LLM)
 
 ```bash
-python step_describe.py заготовка.stp [выход.json]
+python cam/step_describe.py заготовка.stp [выход.json]
 ```
 
 Сырой STEP — граф сущностей с тысячами координат, LLM его читает плохо.
@@ -142,7 +144,8 @@ python run_cam.py деталь.step --simulate
 `SaveAsPartfile` (нужна лицензия `ug_isv_full`); на время прогона открывается
 окно NX, но взаимодействия оно не требует. Станок задаётся `NX_SIM_MACHINE`
 (по умолчанию учебный `sim01_mill_3ax_sinumerik`); для «как на моём станке»
-нужен machine kit конкретного станка. Подробности и грабли — в [guide.md](guide.md).
+нужен machine kit конкретного станка. Подробности и грабли — в
+[docs/guide.md](docs/guide.md), ручной маршрут — [docs/NX_ПОШАГОВО.md](docs/NX_ПОШАГОВО.md).
 
 ## Автономное исправление программой ЛЛМ (auto_fix)
 

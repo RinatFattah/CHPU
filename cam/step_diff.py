@@ -17,8 +17,15 @@ import subprocess
 import sys
 import tempfile
 
+import sys
+
+# при прямом запуске файла корень репозитория добавляется в sys.path
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
 import config
-import freecad_cam
+from cam import freecad_cam
 
 _WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "freecad_diff_worker.py")

@@ -18,7 +18,7 @@ import sys
 import argparse
 
 import config
-import freecad_cam
+from cam import freecad_cam
 
 # Windows: stdout по умолчанию cp1251 — печать Ø/кириллицы иначе падает с
 # UnicodeEncodeError. Переключаем на UTF-8 ТОЛЬКО когда консоль не UTF-8; где stdout
@@ -35,7 +35,7 @@ SOLID_EXTS = {".step", ".stp", ".iges", ".igs", ".brep", ".brp"}
 
 def convert_prt(path: str, what: str) -> str:
     """.prt → STEP через установленный NX; без NX — понятная ошибка."""
-    import nx_export
+    from nx import nx_export
     if not nx_export.available():
         print(f"❌ {path}: .prt (Siemens NX) — закрытый формат, FreeCAD его не читает,")
         print("   а Siemens NX на этой машине не найден.")
@@ -198,7 +198,7 @@ def main():
     if config.SIMULATE:
         print("Симуляция на виртуальном станке NX (ISV) — на время прогона "
               "откроется окно NX, трогать его не нужно...")
-        import nx_sim
+        from nx import nx_sim
         stock_step = os.path.splitext(os.path.abspath(gcode))[0] + "_stock.stp"
         try:
             res = nx_sim.simulate(gcode, stock_step)
