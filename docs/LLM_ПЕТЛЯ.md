@@ -158,6 +158,7 @@ claude -p [--model <model>]     # промпт подаётся через stdin
 |---|---|---|---|
 | `set_param` | `{"type":"set_param","name":N,"value":V}` | системные проблемы | имя строго из белого списка; float клампится в границы; str — из перечня |
 | `extra_zone` | `{"type":"extra_zone","x":[x0,x1],"y":[y0,y1],"z_bottom":z,"reason":R}` | недорез по месту | float-каст; зона режется Adaptive (fallback Profile-Inside), клампится полом и мёртвыми зонами |
+| `set_op_tool` | `{"type":"set_op_tool","name":"RoughSlope2","diameter":6.0}` | недорез в узком месте/углу (мелкая фреза лезет туда, куда крупная нет) | имя по regex операций; диаметр клампится 1–20 мм, добавляется в TOOL_SET |
 | `skip_op` | `{"type":"skip_op","name":"RoughSlope2","reason":R}` | зарез от конкретной операции | имя по regex `(RoughHole\|RoughFace\|RoughSlope\|ExtraZone)\d+\|RoughPerimeter\|Finish` |
 | `dead_zone` | `{"type":"dead_zone","x":[..],"y":[..],"reason":R}` | зарез по месту (крайняя мера) | float-каст; вычитается из всех 2D-зон, наклонные с центром в зоне пропускаются |
 

@@ -46,7 +46,17 @@ the tool can reach it). Part orientation beyond auto_orient: orient_hole_axis_up
 excluded on purpose), orient_flange_down (largest horizontal face to the bottom half,
 else the wall hangs as an overhang), orient_wall_to_yz (largest vertical planar face's
 normal → X). Narrow through-slots where Adaptive can't helix (slot > tool Ø but
-< 2 Ø) fall back to Path Profile Side=Inside (plunge entry at VertFeed). FreeCAD 1.1 has no `Stock.CreateFromExisting`,
+< 2 Ø) fall back to Path Profile Side=Inside (plunge entry at VertFeed).
+Multi-tool milling: `TOOL_SET` (list of mill Ø, desc) — worker picks per op the
+largest that fits the feature width (SET_OP_TOOLS / LLM set_op_tool overrides per
+op). FreeCAD BUG: `Op.Create` throws `cannot access local variable 'tc'` when
+`job.Tools.Group` has >1 controller — so extra TCs are created OUTSIDE the group
+(op.ToolController still assignable/computable), and added to job.Tools only AFTER
+all ops exist, then renumbered T2.. Unused pool TCs are removed. grbl post writes
+each change as a comment `( M6 Tn )`; `nx_sim.parse_tools` maps T#→Ø from the
+`(TC: Endmill D#mm)`+`( M6 T# )` pairs, `gcode_to_mpf` emits a real T#/M6 at each,
+`write_to_ini` fills the Sinumerik tool table for all, and the sim journal makes a
+tool per POCKET_0N. FreeCAD 1.1 has no `Stock.CreateFromExisting`,
 but assigning a plain `Part::Feature` to `job.Stock` works (ops only read
 `job.Stock.Shape`); the contour zone is then built from the stock's real silhouette.
 An INVALID stock solid silently breaks Adaptive (empty paths) — the worker attempts

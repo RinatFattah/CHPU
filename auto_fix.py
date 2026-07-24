@@ -178,6 +178,9 @@ def build_prompt(part_desc: dict, diff_data: dict, history: list,
   {{"type":"extra_zone","x":[x0,x1],"y":[y0,y1],"z_bottom":z,"reason":"..."}}
   (z_bottom = нижняя граница съёма, обычно ZMin зоны недореза; зазор от стола
   применится автоматически);
+- set_op_tool: назначить операции фрезу другого Ø (лечит недорез в узком месте/
+  углу: мелкая фреза лезет туда, куда крупная нет) —
+  {{"type":"set_op_tool","name":"RoughSlope2","diameter":6.0}};
 - skip_op: отключить конкретную операцию (лечит ЗАРЕЗ от неё; имя — из списка
   операций выше) — {{"type":"skip_op","name":"RoughSlope2","reason":"..."}};
 - dead_zone: запретить ЛЮБУЮ обработку в XY-боксе (крайняя мера против зареза;
@@ -233,6 +236,21 @@ def apply_actions(actions: list) -> list:
                 config.EXTRA_ZONES = list(getattr(config, "EXTRA_ZONES", [])) + [zone]
                 applied.append({"extra_zone": zone, "reason": a.get("reason", "")})
                 log(f"доп. зона съёма: {zone} ({a.get('reason', '')})")
+            elif a.get("type") == "set_op_tool":
+                name = str(a.get("name", "")).strip()
+                if not re.fullmatch(r"(RoughHole|RoughFace|RoughSlope|ExtraZone)\d+"
+                                    r"|RoughPerimeter|Finish", name):
+                    log(f"отклонено set_op_tool {name!r}: не похоже на имя операции")
+                    continue
+                d = min(max(float(a["diameter"]), 1.0), 20.0)   # границы фрезы
+                config.SET_OP_TOOLS = dict(getattr(config, "SET_OP_TOOLS", {}))
+                config.SET_OP_TOOLS[name] = d
+                if d not in (getattr(config, "TOOL_SET", None) or []):
+                    config.TOOL_SET = sorted(
+                        set((getattr(config, "TOOL_SET", None) or
+                             [config.TOOL_DIAMETER]) + [d]), reverse=True)
+                applied.append({"set_op_tool": name, "diameter": d})
+                log(f"фреза операции {name} = Ø{d:g}")
             elif a.get("type") == "skip_op":
                 name = str(a.get("name", "")).strip()
                 if not re.fullmatch(r"(RoughHole|RoughFace|RoughSlope|ExtraZone)\d+"

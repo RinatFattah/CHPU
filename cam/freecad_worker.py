@@ -617,8 +617,11 @@ def make_surface_rough(doc, job, tc, name, model_obj, face_idx, p,
     except Exception:
         cut_angle = 0.0
     set_prop(op, "CutPatternAngle", cut_angle)
-    set_prop(op, "BoundaryAdjustment",
-             FreeCAD.Units.Quantity(f"{float(p['tool_diameter']) / 2.0} mm"))
+    try:   # радиус границы — от фактической фрезы ЭТОЙ операции, не глобальной
+        tool_r = float(tc.Tool.Diameter.Value) / 2.0
+    except Exception:
+        tool_r = float(p["tool_diameter"]) / 2.0
+    set_prop(op, "BoundaryAdjustment", FreeCAD.Units.Quantity(f"{tool_r} mm"))
     set_prop(op, "BoundaryEnforcement", False)
     set_prop(op, "StepOver", int(p["rough_stepover"]))
     set_prop(op, "SampleInterval",
@@ -716,6 +719,25 @@ def make_roughing_ops(doc, job, tc, shape, p):
             return True
         return False
 
+    # пул фрез: {диаметр: TC}, диаметры по убыванию. Неглавные TC пока ВНЕ
+    # job.Tools (иначе FreeCAD роняет создание операций) — добавятся в конце.
+    pool = p.get("_tool_pool") or {round(float(p["tool_diameter"]), 3): tc}
+    diams = p.get("_tool_diams") or sorted(pool, reverse=True)
+    overrides = p.get("set_op_tools") or {}
+
+    def choose_tc(name, width):
+        """(TC, диаметр) для операции: пофрезное переопределение (SET_OP_TOOLS) →
+        иначе крупнейшая фреза набора, влезающая в фичу шириной width
+        (width=None — выборка/контур, берём крупнейшую)."""
+        if name in overrides:
+            d = min(diams, key=lambda t: abs(t - float(overrides[name])))
+        elif width is None:
+            d = diams[0]
+        else:
+            fit = [t for t in diams if t <= width + 1e-6]  # diams убыв. → [0] крупнейшая
+            d = fit[0] if fit else diams[-1]
+        return pool.get(d, tc), d
+
     def local_start(region_shape):
         """Локальный верх материала над зоной: колонна над зоной ∩ заготовка.
         None = материала над зоной нет вообще (зону пропускаем). Заготовка —
@@ -753,20 +775,21 @@ def make_roughing_ops(doc, job, tc, shape, p):
         # (дно + припуск): у сквозного отверстия нет дна, чтобы оставлять там
         # припуск под чистовую — иначе на дне стоит кожура (видно без FINISH).
         # Припуск по стенкам (StockToLeave) при этом сохраняется.
-        op = make_adaptive(doc, job, tc, f"RoughHole{i}", region, p,
+        tcx, dx = choose_tc(f"RoughHole{i}", min(rb.XLength, rb.YLength))
+        op = make_adaptive(doc, job, tcx, f"RoughHole{i}", region, p,
                            hole_top, bb.ZMin, alw_xy)
-        if not op and min(rb.XLength, rb.YLength) > float(p["tool_diameter"]) + 0.2:
+        if not op and min(rb.XLength, rb.YLength) > dx + 0.2:
             # узкий паз: адаптивной негде сделать винтовой заход, но фреза в паз
             # проходит — контурный обход ИЗНУТРИ (вход вертикальным врезанием)
             log(f"RoughHole{i}: узкий вырез — перехожу на контурный проход изнутри")
-            op = make_profile(doc, job, tc, f"RoughHole{i}", region, p,
+            op = make_profile(doc, job, tcx, f"RoughHole{i}", region, p,
                               hole_top, bb.ZMin, alw_xy, side="Inside")
         if op:
             ops.append(op)
-            write_partial(job, ops, p, f"готов вырез {i} "
-                                       f"(~{rb.XLength:.0f}x{rb.YLength:.0f} мм)")
+            write_partial(job, ops, p, f"готов вырез {i} (Ø{dx:g}, "
+                                       f"~{rb.XLength:.0f}x{rb.YLength:.0f} мм)")
         else:
-            log(f"RoughHole{i}: фреза Ø{p['tool_diameter']} с припуском не влезает "
+            log(f"RoughHole{i}: фреза Ø{dx:g} с припуском не влезает "
                 f"в вырез ~{rb.XLength:.0f}x{rb.YLength:.0f} мм — пропущено")
 
     # ── 2) грани сверху вниз: плоские (Adaptive) и наклонные/криволинейные
@@ -854,15 +877,17 @@ def make_roughing_ops(doc, job, tc, shape, p):
             name = f"RoughFace{face_n}"
             if skip(name):
                 continue
-            op = make_adaptive(doc, job, tc, name, fc["region"], p,
+            rfb = fc["region"].BoundBox
+            tcx, dx = choose_tc(name, min(rfb.XLength, rfb.YLength))
+            op = make_adaptive(doc, job, tcx, name, fc["region"], p,
                                top, fc["final"], alw_xy)
             if not op:
                 # узкая полка — адаптивной выборке негде развернуться; снимаем
                 # террасами по поверхности, как криволинейные грани
                 log(f"{name}: узкая грань — перехожу на террасы по поверхности")
-                op = make_surface_rough(doc, job, tc, name, jm, fc["idx"], p,
+                op = make_surface_rough(doc, job, tcx, name, jm, fc["idx"], p,
                                         top, fc["final"], alw_z)
-            note = f"готова грань {face_n} (Z={fc['z']:.1f}, {fc['area']:.0f} мм²)"
+            note = f"готова грань {face_n} (Ø{dx:g}, Z={fc['z']:.1f}, {fc['area']:.0f} мм²)"
         else:
             top = local_start(fc["rect"])
             if top is None:
@@ -873,9 +898,11 @@ def make_roughing_ops(doc, job, tc, shape, p):
             name = f"RoughSlope{slope_n}"
             if skip(name):
                 continue
-            op = make_surface_rough(doc, job, tc, name, jm, fc["idx"], p,
+            rb2 = fc["rect"].BoundBox
+            tcx, dx = choose_tc(name, min(rb2.XLength, rb2.YLength))
+            op = make_surface_rough(doc, job, tcx, name, jm, fc["idx"], p,
                                     top, fc["final"], alw_z)
-            note = f"готова криволинейная грань {slope_n} ({fc['area']:.0f} мм²)"
+            note = f"готова криволинейная грань {slope_n} (Ø{dx:g}, {fc['area']:.0f} мм²)"
         if op:
             ops.append(op)
             write_partial(job, ops, p, note)
@@ -912,10 +939,11 @@ def make_roughing_ops(doc, job, tc, shape, p):
         if "z_top" in z:
             ztop = min(ztop, float(z["z_top"]))
         zbot = float(z.get("z_bottom", bb.ZMin))   # снизу клампится полом
-        op = make_adaptive(doc, job, tc, name, rect, p, ztop, zbot, alw_xy)
-        if not op and min(x1 - x0, y1 - y0) > float(p["tool_diameter"]) + 0.2:
+        tcx, dx = choose_tc(name, min(x1 - x0, y1 - y0))
+        op = make_adaptive(doc, job, tcx, name, rect, p, ztop, zbot, alw_xy)
+        if not op and min(x1 - x0, y1 - y0) > dx + 0.2:
             log(f"{name}: узкая зона — перехожу на контурный проход изнутри")
-            op = make_profile(doc, job, tc, name, rect, p, ztop, zbot, alw_xy,
+            op = make_profile(doc, job, tcx, name, rect, p, ztop, zbot, alw_xy,
                               side="Inside")
         if op:
             ops.append(op)
@@ -939,7 +967,8 @@ def make_roughing_ops(doc, job, tc, shape, p):
             # внешний контур режем до дна ДЕТАЛИ (bb.ZMin, снизу клампится полом):
             # периметр отделяет деталь от рамки заготовки. Припуск по стенке
             # (OffsetExtra) при этом сохраняется.
-            op = make_profile(doc, job, tc, "RoughPerimeter", filled, p,
+            tcx, _ = choose_tc("RoughPerimeter", None)
+            op = make_profile(doc, job, tcx, "RoughPerimeter", filled, p,
                               start_z, bb.ZMin, alw_xy)
             if op:
                 ops.append(op)
@@ -1167,23 +1196,49 @@ def mill(doc, feat, p, stock_solid=None):
     export_stock(job, p)
 
     tc = job.Tools.Group[0]
-    tool_d = float(p["tool_diameter"])
-    set_prop(tc.Tool, "Diameter", FreeCAD.Units.Quantity(f"{tool_d} mm"))
-    tc.HorizFeed = FreeCAD.Units.Quantity(f"{p['feed_rate']} mm/min")
-    tc.VertFeed = FreeCAD.Units.Quantity(f"{p['feed_rate'] / 4.0} mm/min")
-    tc.SpindleSpeed = float(p["spindle_speed"])
-    # дефолтный инструмент Job зовётся «5mm Endmill» независимо от диаметра —
-    # переименовываем, чтобы комментарий (TC: ...) в G-Code не врал
-    tc.Label = f"TC: Endmill D{tool_d:g}mm"
-    tc.Tool.Label = f"Endmill D{tool_d:g}mm"
+    feed = float(p["feed_rate"])
+    rpm = float(p["spindle_speed"])
+    # набор фрез (мм), по убыванию; главная (черновая) — крупнейшая
+    tset = sorted({round(float(x), 3) for x in
+                   (p.get("tool_set") or [p["tool_diameter"]])}, reverse=True)
+    tool_d = tset[0]
+    p["tool_diameter"] = tool_d          # шапка/пороги — от главной фрезы
+
+    def _setup_tc(tcobj, d, num):
+        set_prop(tcobj.Tool, "Diameter", FreeCAD.Units.Quantity(f"{d} mm"))
+        tcobj.HorizFeed = FreeCAD.Units.Quantity(f"{feed} mm/min")
+        tcobj.VertFeed = FreeCAD.Units.Quantity(f"{feed / 4.0} mm/min")
+        tcobj.SpindleSpeed = rpm
+        set_prop(tcobj, "ToolNumber", num)
+        # дефолтный инструмент Job зовётся «5mm Endmill» независимо от диаметра —
+        # переименовываем, чтобы комментарий (TC: ...) в G-Code не врал
+        tcobj.Label = f"TC: Endmill D{d:g}mm"
+        tcobj.Tool.Label = f"Endmill D{d:g}mm"
+
+    _setup_tc(tc, tool_d, 1)
+    pool = {tool_d: tc}
+    if len(tset) > 1:
+        import Path.Tool.Controller as Controller
+        for i, d in enumerate([x for x in tset if x != tool_d], start=2):
+            bit = doc.copyObject(tc.Tool)
+            tcn = Controller.Create(f"TC_D{d:g}", tool=bit, toolNumber=i)
+            _setup_tc(tcn, d, i)
+            pool[d] = tcn        # НЕ в job.Tools пока — иначе Op.Create падает
+        log(f"набор фрез: {', '.join('Ø%g' % d for d in tset)} "
+            f"(главная Ø{tool_d:g}); неглавные добавятся в программу по факту")
+    p["_tool_pool"] = pool
+    p["_tool_diams"] = tset
     doc.recompute()
 
     # в описание идёт только диаметр — единственный размер, который мы задаём;
     # остальные размеры (длина, хвостовик) у дефолтного инструмента FreeCAD —
     # библиотечные заглушки, печатать их в программу опасно
-    tool_desc = f"endmill (flat), D{tool_d:g} mm"
-    log(f"фреза: концевая плоская (endmill) Ø{tool_d:g} мм | "
-        f"подача {p['feed_rate']:g} мм/мин | шпиндель {p['spindle_speed']:g} об/мин")
+    tool_desc = (f"endmill (flat), D{tool_d:g} mm" if len(tset) == 1
+                 else "endmills " + "/".join(f"D{d:g}" for d in tset)
+                      + f" mm (main D{tool_d:g})")
+    log(f"фреза: концевая плоская (endmill) Ø{tool_d:g} мм"
+        + (f" +{len(tset) - 1}" if len(tset) > 1 else "")
+        + f" | подача {p['feed_rate']:g} мм/мин | шпиндель {p['spindle_speed']:g} об/мин")
 
     # шапка G-Code: заготовка/деталь/инструмент комментарием (латиницей — кириллицу
     # в комментариях понимает не каждая стойка). Координаты — в нуле программы.
@@ -1238,6 +1293,33 @@ def mill(doc, feat, p, stock_solid=None):
 
     if not ops:
         raise RuntimeError("ни одной операции с траекторией — проверьте параметры")
+
+    # многоинструментальность: неглавные фрезы во время создания операций держались
+    # ВНЕ job.Tools (иначе FreeCAD роняет Op.Create при >1 инструменте). Теперь
+    # добавляем в группу те, что реально задействованы, и перенумеровываем —
+    # постпроцессор впишет смены инструмента; неиспользованные фрезы удаляем.
+    used = {}
+    for op in ops:
+        tco = getattr(op, "ToolController", None)
+        if tco is not None and tco is not tc:
+            used[tco.Name] = tco
+    for n, tco in enumerate(used.values(), start=2):
+        if tco not in job.Tools.Group:
+            job.Tools.addObject(tco)
+        set_prop(tco, "ToolNumber", n)
+    for d, tco in list(pool.items()):
+        if tco is not tc and tco.Name not in used:
+            try:
+                doc.removeObject(tco.Name)
+            except Exception:
+                pass
+    if used:
+        doc.recompute()
+        allt = [tc] + list(used.values())
+        log(f"инструментов в программе: {len(allt)} (" + ", ".join(
+            f"T{getattr(t, 'ToolNumber', '?')} Ø{t.Tool.Diameter.Value:g}"
+            for t in allt) + ")")
+
     # порядок операций = порядок выполнения
     return p["_gcode_header"] + export_gcode(job, ops, p["postprocessor"])
 

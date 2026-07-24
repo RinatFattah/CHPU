@@ -171,22 +171,31 @@ def main():
     machine_builder.Destroy()
     log(f"станок подключён: {p['machine']}")
 
-    # ── 5. Инструмент в кармане POCKET_01 (смена берёт тело из кармана по T) ──
-    pocket = setup.CAMGroupCollection.FindObject("POCKET_01")
-    tool = setup.CAMGroupCollection.CreateToolWithUserName(
-        pocket, "mill_planar", "MILL",
-        NXOpen.CAM.NCGroupCollection.UseDefaultName.TrueValue, "MILL", "Mill")
-    tb = setup.CAMGroupCollection.CreateMillToolBuilder(tool)
-    tb.TlDiameterBuilder.Value = float(p["tool_diameter"])
-    for prop, val in (("TlNumberBuilder", int(p["tool_number"])),
-                      ("TlHeightBuilder", 75.0)):
-        try:
-            getattr(tb, prop).Value = val
-        except Exception as e:
-            log(f"warn: {prop}={val} не применилось: {e}")
-    tb.Commit()
-    tb.Destroy()
-    log(f"инструмент: фреза Ø{p['tool_diameter']} в POCKET_01, T{p['tool_number']}")
+    # ── 5. Инструменты в карманах POCKET_0N (смена берёт тело из кармана по T) ──
+    # {номер: диаметр} всех фрез программы; fallback — одна фреза tool_number.
+    tools = p.get("tools") or {str(p.get("tool_number", 1)): p["tool_diameter"]}
+    tools = {int(k): float(v) for k, v in tools.items()}
+    for num in sorted(tools):
+        diam = tools[num]
+        pocket_name = f"POCKET_{num:02d}"
+        pocket = setup.CAMGroupCollection.FindObject(pocket_name)
+        if pocket is None:            # карманов в станке меньше, чем фрез
+            log(f"warn: карман {pocket_name} не найден — фреза T{num} пропущена")
+            continue
+        tool = setup.CAMGroupCollection.CreateToolWithUserName(
+            pocket, "mill_planar", "MILL",
+            NXOpen.CAM.NCGroupCollection.UseDefaultName.TrueValue,
+            f"MILL_T{num}", "Mill")
+        tb = setup.CAMGroupCollection.CreateMillToolBuilder(tool)
+        tb.TlDiameterBuilder.Value = diam
+        for prop, val in (("TlNumberBuilder", num), ("TlHeightBuilder", 75.0)):
+            try:
+                getattr(tb, prop).Value = val
+            except Exception as e:
+                log(f"warn: {prop}={val} не применилось: {e}")
+        tb.Commit()
+        tb.Destroy()
+        log(f"инструмент: фреза Ø{diam:g} в {pocket_name}, T{num}")
 
     # ── 6. K-компоненты PART/BLANK ──
     kin = work_part.KinematicConfigurator

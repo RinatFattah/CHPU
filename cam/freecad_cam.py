@@ -124,6 +124,9 @@ def generate_gcode_freecad(model_path: str, gcode_path: str) -> int:
         "dead_zones": list(getattr(config, "DEAD_ZONES", []) or []),
         "extra_zones": list(getattr(config, "EXTRA_ZONES", []) or []),
         "skip_ops": list(getattr(config, "SKIP_OPS", []) or []),
+        "tool_set": [float(d) for d in (getattr(config, "TOOL_SET", None)
+                                        or [config.TOOL_DIAMETER])],
+        "set_op_tools": dict(getattr(config, "SET_OP_TOOLS", {}) or {}),
         "rough_mode": config.ROUGH_MODE,
         "rough_allowance": config.ROUGH_ALLOWANCE,
         "rough_allowance_mode": config.ROUGH_ALLOWANCE_MODE,
