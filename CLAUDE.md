@@ -96,12 +96,17 @@ and direct runs like `python cam/step_diff.py a.step b.stp` work.
   undercuts, Adaptive with Profile-inside fallback, floor-clamped; skip_op = drop a
   named op, validated against op-name pattern; dead_zone XY boxes) → regenerate.
   Op names for the prompt are parsed from `(Begin|Finish operation: X)` G-code
-  comments. Boolean diff gotcha: OCCT booleans with the FACETED sim body are only
-  reliable with it as the RIGHT operand (result.cut(part) silently no-ops) — hence
-  undercut = (bbox−part) − ((bbox−part) − result), the sim body is mesh-laundered
-  (tessellate→makeShapeFromMesh→makeSolid, reverse if inverted), the intentional
-  floor skin is split off by a slab cut, and diffuse tessellation films
-  (fill<2% of own bbox) are filtered as noise.
+  comments. The diff is VOXEL RAY-CASTING, not booleans: OCCT booleans (and even
+  isInside, which is also ~ms/probe) against the NX faceted sim body are
+  unreliable/slow — they silently no-op or Null-shape differently per part.
+  Both bodies are tessellated once; per XY grid column a numpy-vectorized
+  vertical ray counts triangle crossings (parity = inside; orientation of
+  inverted IPW bodies is irrelevant). Cells cluster into zones (6-connectivity),
+  volumes = cells × pitch³; the intentional floor skin (z ≤ bottom+clearance)
+  is tallied separately; thin tessellation films vanish at grid resolution.
+  Feeding a CAM-project .prt (e.g. `*-CAM-DMC-635.prt`, 12 bodies) to the
+  pipeline machines the largest body = the fixture PLATE — garbage; only real
+  part files belong in batches.
   Journal at `<gcode>_autofix.json`. Key safety: `FLOOR_CLEARANCE` (default 0.5 mm)
   clamps FinalDepth of EVERY op (incl. through-holes/perimeter/finish) to part
   bottom + clearance — the part lies on the machine table; `DEAD_ZONES` (XY boxes,
@@ -120,6 +125,11 @@ and direct runs like `python cam/step_diff.py a.step b.stp` work.
   geometry description for LLM/automation (bbox, faces by type, holes, summary).
 - `nx/grbl_to_sinumerik.py` - standalone GRBL→.mpf converter (manual NX sim path,
   see `docs/NX_ПОШАГОВО.md`).
+- `cam/step_combine.py` + `cam/freecad_combine_worker.py` - reference part +
+  sim result as two named bodies (PART_REF/SIM_RESULT) in ONE STEP for visual
+  compare. `nx/nx_compare.py` + `nx/nx_compare_journal.py` - same as a native
+  .prt with NX LAYERS (1 = part, 2 = cut result); compare_many() batches all
+  pairs in a single run_journal launch.
 - `config.py` - parameter defaults + YAML loading (`--config`).
 - `README_CAM.md` - operator-facing parameter reference. **Keep in sync** when
   changing CAM params. `README.md` - main handoff doc.
