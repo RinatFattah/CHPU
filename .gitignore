@@ -42,3 +42,9 @@ desktop.ini
 *_stock.step
 *_part.step
 *_autofix.json
+
+# runs
+runs/
+
+# logs
+*.log
