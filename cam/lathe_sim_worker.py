@@ -114,8 +114,7 @@ def main():
         raise RuntimeError("профиль результата вырожден")
 
     # обход: профиль снизу вверх → к оси → вниз по оси → замыкание
-    outline = clean + [App.Vector(r_eps, 0, clean[-1].z + 0.0)]
-    outline = clean[:]
+    outline = clean
     wire = Part.makePolygon(outline)
     axis_back = Part.makePolygon([outline[-1], App.Vector(r_eps, 0, outline[0].z),
                                   outline[0]])

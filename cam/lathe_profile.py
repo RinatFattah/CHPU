@@ -60,8 +60,7 @@ def extract(model_path, out_json=None, part_out=None, stock_out=None,
         json.dump(params, t)
         params_path = t.name
 
-    worker = freecad_cam._worker_path.__wrapped__ if False else _WORKER
-    w = freecad_cam._ascii_safe(worker)
+    w = freecad_cam._ascii_safe(_WORKER)
     if not w.isascii():
         w = os.path.join(tdir, "lathe_worker.py")
         shutil.copyfile(_WORKER, w)
