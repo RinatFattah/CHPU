@@ -56,6 +56,8 @@ def main():
                     help="черновая подача, мм/об (дефолт 0.15 — как у завода)")
     ap.add_argument("--radius-mode", action="store_true",
                     help="X в радиусах (по умолчанию — в диаметрах, как ждёт стойка)")
+    ap.add_argument("--no-arcs", action="store_true",
+                    help="чистовой проход только отрезками (без G2/G3)")
     ap.add_argument("--no-partoff", action="store_true", help="без отрезки")
     ap.add_argument("--simulate", action="store_true",
                     help="прогнать на токарном станке NX ISV")
@@ -101,6 +103,8 @@ def main():
         "partoff_width": getattr(config, "LATHE_PARTOFF_WIDTH", 3.0),
         "insert": getattr(config, "LATHE_INSERT", "DCMT070204R"),
         "nose_radius": getattr(config, "LATHE_NOSE_RADIUS", 0.4),
+        "arcs": not args.no_arcs,
+        "arc_tol": getattr(config, "LATHE_ARC_TOL", 0.005),
     }
     stock_radial = (args.stock_radial if args.stock_radial is not None
                     else getattr(config, "LATHE_STOCK_RADIAL", 1.0))
@@ -142,7 +146,8 @@ def main():
     print(f"✅ Программа: {stats['lines']} строк → {gcode} "
           f"({os.path.getsize(gcode):,} байт)")
     print(f"   операции: {', '.join(stats['ops'][:8])}"
-          + (f" … всего {len(stats['ops'])}" if len(stats['ops']) > 8 else ""))
+          + (f" … всего {len(stats['ops'])}" if len(stats['ops']) > 8 else "")
+          + (f" | дуг в чистовом: {stats['arcs']}" if stats.get("arcs") else ""))
 
     if args.simulate:
         print("Съём материала по программе...")

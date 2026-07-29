@@ -175,7 +175,10 @@ def profile_from_section(shape, step, simplify_tol):
 
     log(f"профиль снят: {len(prof)} точек, шаг {step} мм, "
         f"Ø{2 * max(r for _, r in prof):.2f} макс")
-    return simplify(prof, simplify_tol)
+    # СЫРОЙ профиль отдаётся вместе с упрощённым: упрощение спрямляет
+    # скругления в ломаную, и восстановить по ней дуги уже нельзя — их надо
+    # искать до потери точек (см. lathe_gcode.fit_arcs)
+    return simplify(prof, simplify_tol), prof
 
 
 def simplify(pts, tol):
@@ -215,9 +218,9 @@ def main():
     log(f"после выравнивания по Z: Ø{max(bb.XLength, bb.YLength):.2f} x "
         f"{bb.ZLength:.2f} мм, Z {bb.ZMin:.2f}..{bb.ZMax:.2f}")
 
-    prof = profile_from_section(aligned, p.get("profile_step", 0.1),
-                                p.get("simplify_tol", 0.01))
-    log(f"после упрощения: {len(prof)} точек")
+    prof, prof_raw = profile_from_section(aligned, p.get("profile_step", 0.1),
+                                          p.get("simplify_tol", 0.01))
+    log(f"после упрощения: {len(prof)} точек (сырых {len(prof_raw)})")
 
     hex_s = find_wrench_flats(aligned)
 
@@ -228,6 +231,7 @@ def main():
         "axis": [round(axis.x, 6), round(axis.y, 6), round(axis.z, 6)],
         "z_range": [round(bb.ZMin, 4), round(bb.ZMax, 4)],
         "hex_across_flats": hex_s,
+        "profile_raw": [[round(z, 4), round(r, 4)] for z, r in prof_raw],
     }
     with open(p["out_json"], "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=1)
