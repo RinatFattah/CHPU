@@ -176,7 +176,8 @@ def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
     machine_time, ipw_prt = "", ""
     try:
         done = nx_sim._wait_marker(log_path, proc, "DONE",
-                                   timeout=getattr(config, "NX_SIM_TIMEOUT", 1800))
+                                   timeout=getattr(config, "NX_SIM_TIMEOUT", 1800),
+                                   prefix="[nxlathe]")
         m = re.search(r"machine_time=(\S+)", done)
         if m:
             machine_time = m.group(1)

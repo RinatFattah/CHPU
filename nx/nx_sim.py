@@ -313,8 +313,10 @@ def simulate(gcode_path: str, stock_step_path: str, out_stem: str | None = None)
             "sim_wall": round(sim_wall, 1), "export_wall": round(export_wall, 1)}
 
 
-def _wait_marker(log_path: str, proc, marker: str, timeout: float) -> str:
-    """Ждёт строку с `marker` в логе журнала; ERROR/смерть NX — исключение."""
+def _wait_marker(log_path: str, proc, marker: str, timeout: float,
+                 prefix: str = "[nxsim]") -> str:
+    """Ждёт строку с `marker` в логе журнала; ERROR/смерть NX — исключение.
+    `prefix` — метка журнала: токарный пишет [nxlathe], фрезерный [nxsim]."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         lines = []
@@ -322,7 +324,7 @@ def _wait_marker(log_path: str, proc, marker: str, timeout: float) -> str:
             with open(log_path, encoding="utf-8", errors="replace") as f:
                 lines = f.read().splitlines()
             for l in lines:
-                if "[nxsim]" in l and marker in l:
+                if prefix in l and marker in l:
                     return l
             if any("ERROR" in l for l in lines):
                 raise RuntimeError("журнал симуляции упал:\n" + "\n".join(lines[-8:]))

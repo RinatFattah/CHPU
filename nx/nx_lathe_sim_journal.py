@@ -61,16 +61,31 @@ def assign_geometry(work_part, geometry, body):
     gset.ScCollector.ReplaceRules([rule], False)
 
 
-def assign_k_component(kin, name, body):
-    """Геометрия в K-компонент станка (PART/BLANK) — без неё стойка отвечает
-    «No part and blank geometry has been specified»."""
+def assign_k_component(kin, name, body, parents=("SETUP",)):
+    """Геометрия в K-компонент станка (PART/BLANK).
+
+    Родитель у токарного станка иной, чем у фрезерного: там заготовка стоит на
+    столе (SETUP), здесь — зажата в патроне на шпинделе, поэтому пробуем
+    CHUCK_HOLDER/SPINDLE прежде, чем SETUP. Если деталь не привязана к
+    вращающемуся узлу, ISV не считает съём и сохраняет заготовку целой.
+    """
+    parent = None
+    for pname in parents:
+        try:
+            parent = kin.ComponentCollection.FindObject(pname)
+            log(f"K-компонент {name}: родитель {pname}")
+            break
+        except Exception:
+            continue
     try:
-        setup_comp = kin.ComponentCollection.FindObject("SETUP")
         comp = kin.ComponentCollection.FindObject(name)
     except Exception as e:
         log(f"warn: K-компонент {name} не найден ({e})")
         return
-    builder = kin.ComponentCollection.CreateComponentBuilder(setup_comp, comp)
+    if parent is None:
+        log(f"warn: родитель для {name} не найден")
+        return
+    builder = kin.ComponentCollection.CreateComponentBuilder(parent, comp)
     try:
         builder.AddGeometry(body)
         builder.Commit()
@@ -197,8 +212,9 @@ def main():
 
     # ── 6. K-компоненты PART/BLANK ──
     kin = work_part.KinematicConfigurator
-    assign_k_component(kin, "PART", body)
-    assign_k_component(kin, "BLANK", body)
+    parents = tuple(p.get("k_parents", ["CHUCK_HOLDER", "SPINDLE", "SETUP"]))
+    assign_k_component(kin, "PART", body, parents)
+    assign_k_component(kin, "BLANK", body, parents)
 
     # ── 7. Симуляция машинного кода (CSE) со съёмом ──
     session.BeginTaskEnvironment()
