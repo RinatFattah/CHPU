@@ -285,8 +285,15 @@ def generate(prof_data, params):
     g.append(f"(X in {'DIAMETER' if dia else 'RADIUS'} mode, feed in "
              f"{'mm/rev G95' if per_rev else 'mm/min G94'})")
     g.append("G18 G21 G90")                       # плоскость ZX, мм, абсолютные
+    g.append("G54")                               # рабочая система координат
+    if dia:
+        g.append("DIAMON")                        # X трактуется как ДИАМЕТР
     g.append("G95" if per_rev else "G94")         # подача: мм/об или мм/мин
-    g.append("T1 M6")
+    # Смена инструмента на ТОКАРНОЙ стойке Sinumerik — «T<n> D<коррекция>»,
+    # без M6: M6 запускает ToolChange.SPF с поворотом револьвера, и виртуальная
+    # стойка на нём зависает. Заводская программа (CNC PILOT) тоже пишет
+    # «T01.0» без M6.
+    g.append(f"T{params.get('tool_number', 1)} D1")
     g.append(f"G97 S{rpm} M3")                    # постоянные обороты
     g.append(f"G0 {X(retract_r)} Z{z_top + clear:.3f}")
 

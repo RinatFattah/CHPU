@@ -60,7 +60,11 @@ def main():
                     help="чистовой проход только отрезками (без G2/G3)")
     ap.add_argument("--no-partoff", action="store_true", help="без отрезки")
     ap.add_argument("--simulate", action="store_true",
-                    help="прогнать на токарном станке NX ISV")
+                    help="съём материала нашей моделью (быстро, но это "
+                         "самопроверка: генератор и симулятор писались вместе)")
+    ap.add_argument("--nx-simulate", action="store_true",
+                    help="прогнать на виртуальном токарном станке NX ISV "
+                         "(независимая проверка; откроется окно NX)")
     args = ap.parse_args()
 
     if args.config:
@@ -168,6 +172,30 @@ def main():
             print(f"   сверка с моделью: недорез {d['undercut_total_mm3']:.1f} мм³, "
                   f"зарез {d['overcut_total_mm3']:.1f} мм³ "
                   f"(деталь {d['part_volume_mm3']:.1f} мм³)")
+        except Exception as e:
+            print(f"   (сверка не выполнена: {e})")
+
+    if args.nx_simulate:
+        print("Симуляция на виртуальном токарном станке NX ISV "
+              "(откроется окно NX, трогать не нужно)...")
+        from nx import nx_lathe_sim
+        try:
+            res = nx_lathe_sim.simulate(gcode, stem + "_stock.stp",
+                                        nose_radius=p["nose_radius"])
+        except Exception as e:
+            print(f"⚠  NX-симуляция не удалась: {e}")
+            sys.exit(2)
+        tail = (f"  (машинное время {res['machine_time']}"
+                + (f", {res['triangles']} треуг." if res.get("triangles") else "")
+                + ")") if res.get("machine_time") else ""
+        print(f"✅ NX ISV: обработанная заготовка → {res['step']}{tail}")
+        try:
+            from cam import step_diff
+            d = step_diff.diff(stem + "_part.step", res["step"],
+                               stem + "_nxdiff.json")
+            print(f"   сверка NX-результата с моделью: "
+                  f"недорез {d['undercut_total_mm3']:.1f} мм³, "
+                  f"зарез {d['overcut_total_mm3']:.1f} мм³")
         except Exception as e:
             print(f"   (сверка не выполнена: {e})")
 
