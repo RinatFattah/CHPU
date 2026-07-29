@@ -66,11 +66,25 @@ def generate(prof_data, params):
     ap = params["depth_of_cut"]
     allowance = params["allowance"]
     clear = params["clearance"]
-    feed = params["feed"]
-    feed_finish = params.get("feed_finish", feed)
     dia = params.get("diameter_mode", True)
     rpm = params["spindle_speed"]
     retract_r = r_stock + clear
+
+    # ПОДАЧА НА ОБОРОТ (G95) — норма для точения: толщина стружки задаётся
+    # миллиметрами на оборот шпинделя и не зависит от оборотов. При подаче в
+    # мм/мин (G94) любое изменение оборотов меняет стружку, а с постоянной
+    # скоростью резания обороты меняются на каждом диаметре.
+    per_rev = params.get("feed_mode", "per_rev") == "per_rev"
+    if per_rev:
+        feed = params.get("feed_per_rev", 0.15)
+        feed_finish = params.get("feed_per_rev_finish", 0.08)
+        feed_partoff = params.get("feed_per_rev_partoff", feed / 2)
+        fmt = lambda f: f"F{f:.3f}"
+    else:
+        feed = params["feed"]
+        feed_finish = params.get("feed_finish", feed)
+        feed_partoff = params.get("feed_partoff", feed / 2)
+        fmt = lambda f: f"F{f:.1f}"
 
     def X(r):
         return f"X{2 * r:.3f}" if dia else f"X{r:.3f}"
@@ -97,10 +111,12 @@ def generate(prof_data, params):
     g.append(f"(Tool: turning insert {params.get('insert', 'DCMT070204R')}, "
              f"nose R{params.get('nose_radius', 0.4)} mm)")
     g.append(f"(Profile points: {len(profile)})")
-    g.append(f"(X in {'DIAMETER' if dia else 'RADIUS'} mode)")
+    g.append(f"(X in {'DIAMETER' if dia else 'RADIUS'} mode, feed in "
+             f"{'mm/rev G95' if per_rev else 'mm/min G94'})")
     g.append("G18 G21 G90")                       # плоскость ZX, мм, абсолютные
+    g.append("G95" if per_rev else "G94")         # подача: мм/об или мм/мин
     g.append("T1 M6")
-    g.append(f"M3 S{rpm}")
+    g.append(f"G97 S{rpm} M3")                    # постоянные обороты
     g.append(f"G0 {X(retract_r)} Z{z_top + clear:.3f}")
 
     # 1. подрезка торца до Z0 (торец детали)
@@ -110,7 +126,7 @@ def generate(prof_data, params):
     for i in range(passes):
         z = z_top - (i + 1) * (z_top - z_face) / passes
         g.append(f"G0 {X(r_stock + clear)} Z{z:.3f}")
-        g.append(f"G1 X0.000 Z{z:.3f} F{feed:.1f}")
+        g.append(f"G1 X0.000 Z{z:.3f} {fmt(feed)}")
         g.append(f"G0 {X(r_stock + clear)} Z{z:.3f}")
     g.append(f"(Finish operation: FaceOff)")
 
@@ -133,7 +149,7 @@ def generate(prof_data, params):
             n_rough += 1
             op(f"Rough{n_rough}")
             g.append(f"G0 {X(r_level)} Z{profile[0][0] + clear:.3f}")
-            g.append(f"G1 {X(r_level)} Z{z_stop:.3f} F{feed:.1f}")
+            g.append(f"G1 {X(r_level)} Z{z_stop:.3f} {fmt(feed)}")
             g.append(f"G0 {X(r_level + clear)} Z{z_stop:.3f}")
             g.append(f"G0 {X(r_level + clear)} Z{profile[0][0] + clear:.3f}")
             g.append(f"(Finish operation: Rough{n_rough})")
@@ -144,7 +160,7 @@ def generate(prof_data, params):
     g.append(f"G0 {X(retract_r)} Z{profile[0][0] + clear:.3f}")
     g.append(f"G0 {X(profile[0][1])} Z{profile[0][0] + clear:.3f}")
     for z, r in profile:
-        g.append(f"G1 {X(r)} Z{z:.3f} F{feed_finish:.1f}")
+        g.append(f"G1 {X(r)} Z{z:.3f} {fmt(feed_finish)}")
     g.append(f"G0 {X(retract_r)} Z{z_end:.3f}")
     g.append("(Finish operation: Finish)")
 
@@ -153,7 +169,7 @@ def generate(prof_data, params):
         op("Partoff")
         z_cut = z_end - params.get("partoff_width", 3.0)
         g.append(f"G0 {X(retract_r)} Z{z_cut:.3f}")
-        g.append(f"G1 X0.000 Z{z_cut:.3f} F{params.get('feed_partoff', feed / 2):.1f}")
+        g.append(f"G1 X0.000 Z{z_cut:.3f} {fmt(feed_partoff)}")
         g.append(f"G0 {X(retract_r)} Z{z_cut:.3f}")
         g.append("(Finish operation: Partoff)")
 
