@@ -180,8 +180,19 @@ def main():
     machine_builder = setup.CAMGroupCollection.CreateMachineGroupBuilder(generic_machine)
     mount = setup.CreateNcmctPartMountingBuilder(p["machine"])
     mount.CreateMachineSpindleObjects = False
-    mount.Positioning = \
-        NXOpen.CAM.NcmctPartMountingBuilder.PositioningTypes.OrientMachineZeroToMainMcs
+    # Способ постановки детали на станок. Для ФРЕЗЕРНОГО подходил
+    # OrientMachineZeroToMainMcs (деталь на стол), для ТОКАРНОГО деталь надо
+    # зажать в патроне — иначе она остаётся в начале координат, резец ездит по
+    # программе внутри станка мимо неё, и IPW сохраняется нетронутым.
+    pos_name = p.get("positioning", "OrientMachineZeroToMainMcs")
+    try:
+        mount.Positioning = getattr(
+            NXOpen.CAM.NcmctPartMountingBuilder.PositioningTypes, pos_name)
+        log(f"постановка детали: {pos_name}")
+    except Exception as e:
+        log(f"warn: positioning={pos_name} не применился ({e}), беру дефолт")
+        mount.Positioning = (NXOpen.CAM.NcmctPartMountingBuilder
+                             .PositioningTypes.OrientMachineZeroToMainMcs)
     mount.Commit()
     machine_builder.ReplaceMachine(
         NXOpen.CAM.MachineGroupBuilder.RetrieveToolPocketInformation.Yes, mount)
@@ -233,6 +244,23 @@ def main():
         so.EnableIpw = NXOpen.CAM.SimulationOptionsBuilderIpwEnable.MotionBased
     except Exception as e:
         log(f"warn: EnableIpw: {e}")
+
+    # Форма инструмента для СЪЁМА. По умолчанию ISV ждёт Assembly — твердотельную
+    # сборку инструмента, которой у параметрически созданного резца нет; тогда
+    # резать нечем, и IPW сохраняется равным необработанной заготовке (ровно
+    # этот симптом и наблюдался: объём IPW = объёму прутка, 454 треугольника).
+    # Parameter заставляет строить форму по параметрам резца (радиус при
+    # вершине, угол, размер пластины, державка).
+    for prop, enum_name in (("Mrshape", "SimulationOptionsBuilderToolShapeMR"),
+                            ("ToolShape", "SimulationOptionsBuilderToolShapeType"),
+                            ("Collshape", "SimulationOptionsBuilderToolShapeColl")):
+        try:
+            before = getattr(so, prop)
+            setattr(so, prop, getattr(NXOpen.CAM, enum_name).Parameter)
+            log(f"{prop}: {before} → Parameter")
+        except Exception as e:
+            log(f"warn: {prop} → Parameter: {type(e).__name__}: {str(e)[:90]}")
+
     so.SaveAsPartfile = True
     so.Commit()
     cpb.ApplySimulationOptions()

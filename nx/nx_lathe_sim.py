@@ -160,6 +160,13 @@ def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
         "log_path": log_path,
         "sim_timeout": max(60, getattr(config, "NX_SIM_TIMEOUT", 1800) - 300),
         "startup_grace": getattr(config, "NX_LATHE_STARTUP_GRACE", 90),
+        # Постановка детали на станок. Перебор всех пяти способов показал:
+        # съём идёт ТОЛЬКО при KeepAssemblyConstraints (IPW 470 КБ против
+        # ~62 КБ у прочих, где сохраняется нетронутый пруток). Деталь у нас
+        # уже приведена в координаты программы, и станок надо строить
+        # вокруг неё, а не переставлять её под станок.
+        "positioning": getattr(config, "NX_LATHE_POSITIONING",
+                               "KeepAssemblyConstraints"),
     }
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
                                      encoding="utf-8") as tmp:
