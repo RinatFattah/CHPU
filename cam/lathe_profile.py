@@ -28,7 +28,8 @@ _WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lathe_worker
 
 def extract(model_path, out_json=None, part_out=None, stock_out=None,
             profile_step=0.1, simplify_tol=0.01, stock_radial=1.0,
-            stock_face=1.0, stock_tail=5.0, verbose=True):
+            stock_face=1.0, stock_tail=5.0, allowance_per_side=3.15,
+            prefer_hex=True, use_standard=True, verbose=True):
     """STEP/IGES/BREP → dict с профилем. Бросает RuntimeError."""
     fc = freecad_cam.find_freecadcmd()
     if not fc:
@@ -54,6 +55,11 @@ def extract(model_path, out_json=None, part_out=None, stock_out=None,
         "stock_radial": stock_radial,
         "stock_face": stock_face,
         "stock_tail": stock_tail,
+        # подбор проката делает сам worker: lathe/stock.py — чистый python,
+        # импортируется и внутри FreeCAD, поэтому второй запуск не нужен
+        "repo_root": _ROOT if use_standard else "",
+        "allowance_per_side": allowance_per_side,
+        "prefer_hex": prefer_hex,
     }
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
                                      encoding="utf-8") as t:
