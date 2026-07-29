@@ -34,8 +34,13 @@ def log(msg):
     print(f"[sim] {msg}")
 
 
-def parse_moves(path, diameter_mode):
-    """G-код → список рабочих движений [(z1, r1, z2, r2)] в РАДИУСАХ."""
+def parse_moves(path, diameter_mode, arc_step=0.05):
+    """G-код → список рабочих движений [(z1, r1, z2, r2)] в РАДИУСАХ.
+
+    Дуги G2/G3 разбиваются на хорды длиной ~arc_step: иначе съём считался бы
+    по хорде во всю дугу, и выигрыш от дуг в чистовом проходе был бы не виден.
+    """
+    import math
     moves = []
     x = z = None
     with open(path, encoding="utf-8", errors="replace") as f:
@@ -54,9 +59,32 @@ def parse_moves(path, diameter_mode):
                 nx = float(mx.group(1)) / (2.0 if diameter_mode else 1.0)
             if mz:
                 nz = float(mz.group(1))
-            if code >= 1 and x is not None and z is not None \
-                    and nx is not None and nz is not None:
-                moves.append((z, x, nz, nx))
+            if code >= 1 and None not in (x, z, nx, nz):
+                mi = re.search(r"I(-?\d+\.?\d*)", line)
+                mk = re.search(r"K(-?\d+\.?\d*)", line)
+                if code in (2, 3) and mi and mk:
+                    # I/K — смещение центра от НАЧАЛЬНОЙ точки, I в радиусах
+                    xc, zc = x + float(mi.group(1)), z + float(mk.group(1))
+                    rad = math.hypot(x - xc, z - zc)
+                    a0 = math.atan2(x - xc, z - zc)
+                    a1 = math.atan2(nx - xc, nz - zc)
+                    da = a1 - a0
+                    if code == 2:                      # по часовой
+                        while da > 0:
+                            da -= 2 * math.pi
+                    else:
+                        while da < 0:
+                            da += 2 * math.pi
+                    steps = max(2, int(abs(da) * rad / arc_step) + 1)
+                    pz, px = z, x
+                    for s in range(1, steps + 1):
+                        a = a0 + da * s / steps
+                        cz = zc + rad * math.cos(a)
+                        cx = xc + rad * math.sin(a)
+                        moves.append((pz, px, cz, cx))
+                        pz, px = cz, cx
+                else:
+                    moves.append((z, x, nz, nx))
             x, z = nx, nz
     return moves
 

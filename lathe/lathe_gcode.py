@@ -54,6 +54,177 @@ def _max_r_between(profile, z_from, z_to):
     return max(rs)
 
 
+def _circle_through(p1, p2, p3):
+    """Окружность через три точки (z, r) → (zc, rc, radius) или None."""
+    (z1, r1), (z2, r2), (z3, r3) = p1, p2, p3
+    d = 2.0 * (z1 * (r2 - r3) + z2 * (r3 - r1) + z3 * (r1 - r2))
+    if abs(d) < 1e-9:                       # точки на одной прямой
+        return None
+    s1, s2, s3 = z1 * z1 + r1 * r1, z2 * z2 + r2 * r2, z3 * z3 + r3 * r3
+    zc = (s1 * (r2 - r3) + s2 * (r3 - r1) + s3 * (r1 - r2)) / d
+    rc = (s1 * (z3 - z2) + s2 * (z1 - z3) + s3 * (z2 - z1)) / d
+    rad = ((z1 - zc) ** 2 + (r1 - rc) ** 2) ** 0.5
+    return zc, rc, rad
+
+
+def _arc_dir(z0, r0, z1, r1, zm, rm, zc, rc):
+    """Направление обхода дуги ПО СРЕДНЕЙ точке участка.
+
+    Знак векторного произведения (начало→центр)×(начало→конец) сам по себе не
+    годится: он говорит лишь, с какой стороны центр, но не по какой из двух
+    дуг идти. Через среднюю точку профиля выбирается та дуга, что реально
+    описывает деталь, — иначе резец пойдёт длинной стороной окружности и
+    оставит материал.
+
+    Возвращает True для G2 (по часовой в плоскости ZX).
+    """
+    import math
+    a0 = math.atan2(r0 - rc, z0 - zc)
+    a1 = math.atan2(r1 - rc, z1 - zc)
+    am = math.atan2(rm - rc, zm - zc)
+
+    def norm(a):
+        while a < 0:
+            a += 2 * math.pi
+        while a >= 2 * math.pi:
+            a -= 2 * math.pi
+        return a
+
+    # идём против часовой: лежит ли середина между началом и концом?
+    d_end = norm(a1 - a0)
+    d_mid = norm(am - a0)
+    ccw = d_mid < d_end
+    return not ccw
+
+
+def _simplify(pts, tol):
+    """Douglas–Peucker для прямых участков между дугами."""
+    if len(pts) < 3:
+        return pts
+    z0, r0 = pts[0]
+    z1, r1 = pts[-1]
+    dz, dr = z1 - z0, r1 - r0
+    norm = (dz * dz + dr * dr) ** 0.5 or 1.0
+    imax, dmax = 0, 0.0
+    for i in range(1, len(pts) - 1):
+        z, r = pts[i]
+        d = abs(dr * (z - z0) - dz * (r - r0)) / norm
+        if d > dmax:
+            imax, dmax = i, d
+    if dmax <= tol:
+        return [pts[0], pts[-1]]
+    return _simplify(pts[:imax + 1], tol)[:-1] + _simplify(pts[imax:], tol)
+
+
+def compress_lines(segs, first_point, tol=0.01):
+    """Схлопывает подряд идущие отрезки: дуги ищутся по СЫРОМУ профилю, где
+    прямые участки представлены сотнями точек через 0.1 мм. Дуги остаются
+    как есть, прямые между ними упрощаются."""
+    out = []
+    buf = [first_point]
+    for s in segs:
+        if s[0] == "line":
+            buf.append((s[1], s[2]))
+            continue
+        if len(buf) > 1:
+            out += [("line", z, r) for z, r in _simplify(buf, tol)[1:]]
+        out.append(s)
+        buf = [(s[1], s[2])]
+    if len(buf) > 1:
+        out += [("line", z, r) for z, r in _simplify(buf, tol)[1:]]
+    return out
+
+
+def _arc_error(profile, p_start, p_end, zc, rc, rad, cw, samples=24):
+    """Максимальное отклонение построенной ДУГИ от профиля, мм."""
+    import math
+    z0, r0 = p_start
+    z1, r1 = p_end
+    a0 = math.atan2(r0 - rc, z0 - zc)
+    a1 = math.atan2(r1 - rc, z1 - zc)
+    da = a1 - a0
+    if cw:
+        while da > 0:
+            da -= 2 * math.pi
+    else:
+        while da < 0:
+            da += 2 * math.pi
+    worst = 0.0
+    for k in range(1, samples):
+        a = a0 + da * k / samples
+        z = zc + rad * math.cos(a)
+        r = rc + rad * math.sin(a)
+        if z > max(z0, z1) + 1e-9 or z < min(z0, z1) - 1e-9:
+            return float("inf")        # дуга вышла за диапазон Z участка
+        worst = max(worst, abs(r - _r_at(profile, z)))
+    return worst
+
+
+def fit_arcs(profile, tol=0.005, min_pts=4, max_radius=5.0, min_sagitta=0.01):
+    """Ломаный профиль → последовательность отрезков и ДУГ.
+
+    Профиль снимается численно, поэтому скругления и радиусные переходы
+    приходят пачками точек. Печатать их как G1 значит резать выпуклости
+    хордами — это и даёт мелкий зарез на кромках. Здесь подряд идущие точки
+    жадно укладываются в окружность: если все промежуточные лежат от неё не
+    дальше tol, участок выводится одной дугой G2/G3.
+
+    Возвращает список сегментов от ВТОРОЙ точки профиля:
+      ("line", z, r) либо ("arc", z, r, zc, rc, cw)
+    """
+    segs = []
+    i = 0
+    n = len(profile)
+    while i < n - 1:
+        best = None
+        # пробуем максимально длинный участок, начиная с самого длинного
+        for j in range(n - 1, i + min_pts - 2, -1):
+            mid = profile[(i + j) // 2]
+            c = _circle_through(profile[i], mid, profile[j])
+            if c is None:
+                continue
+            zc, rc, rad = c
+            if rad > max_radius or rad < 1e-6:
+                continue
+            ok = True
+            for k in range(i + 1, j):
+                z, r = profile[k]
+                if abs(((z - zc) ** 2 + (r - rc) ** 2) ** 0.5 - rad) > tol:
+                    ok = False
+                    break
+            if not ok:
+                continue
+            # почти прямой участок дугой не описываем: стрелка прогиба меньше
+            # min_sagitta означает, что это прямая, а дуга огромного радиуса
+            # только теряет точность на I/K и путает стойку
+            chord = ((profile[j][0] - profile[i][0]) ** 2
+                     + (profile[j][1] - profile[i][1]) ** 2) ** 0.5
+            half = min(chord / 2.0, rad)
+            sagitta = rad - (rad * rad - half * half) ** 0.5
+            if sagitta < min_sagitta:
+                continue
+            # ГЛАВНАЯ проверка — по самой дуге, а не по точкам профиля.
+            # Точки профиля лежать на окружности могут, а дуга между ними
+            # всё равно выгибаться наружу: на прямом участке длиной 5.6 мм
+            # окружность R2.9 проходит через оба конца и уходит от детали на
+            # 1.8 мм. Дискретизируем построенную дугу и сравниваем с профилем.
+            cw_try = _arc_dir(profile[i][0], profile[i][1], profile[j][0],
+                              profile[j][1], mid[0], mid[1], zc, rc)
+            if _arc_error(profile, profile[i], profile[j], zc, rc, rad,
+                          cw_try) > tol:
+                continue
+            best = (j, zc, rc, rad, cw_try)
+            break
+        if best:
+            j, zc, rc, rad, cw = best
+            segs.append(("arc", profile[j][0], profile[j][1], zc, rc, cw))
+            i = j
+        else:
+            i += 1
+            segs.append(("line", profile[i][0], profile[i][1]))
+    return segs
+
+
 def generate(prof_data, params):
     """Профиль + параметры → (строки G-кода, статистика)."""
     profile = [(z, r) for z, r in prof_data["profile"]]
@@ -155,12 +326,37 @@ def generate(prof_data, params):
             g.append(f"(Finish operation: Rough{n_rough})")
         r_level -= ap
 
-    # 3. чистовой проход по профилю
+    # 3. чистовой проход по профилю — отрезками и ДУГАМИ
     op("Finish")
     g.append(f"G0 {X(retract_r)} Z{profile[0][0] + clear:.3f}")
     g.append(f"G0 {X(profile[0][1])} Z{profile[0][0] + clear:.3f}")
-    for z, r in profile:
-        g.append(f"G1 {X(r)} Z{z:.3f} {fmt(feed_finish)}")
+    g.append(f"G1 {X(profile[0][1])} Z{profile[0][0]:.3f} {fmt(feed_finish)}")
+    n_arcs = 0
+    raw = prof_data.get("profile_raw")
+    if params.get("arcs", True) and raw:
+        # дуги ищем по СЫРОМУ профилю: упрощение уже спрямило скругления,
+        # и по ломаной окружность не восстановить
+        src = sorted([(z, r) for z, r in raw], key=lambda t: -t[0])
+        segs = compress_lines(fit_arcs(src, params.get("arc_tol", 0.005)),
+                              src[0], params.get("line_tol", 0.01))
+        profile = src            # чистовой идёт по сырому профилю
+    elif params.get("arcs", True):
+        segs = fit_arcs(profile, params.get("arc_tol", 0.005))
+    else:
+        segs = [("line", z, r) for z, r in profile[1:]]
+    zp, rp = profile[0]
+    for s in segs:
+        if s[0] == "line":
+            _, z, r = s
+            g.append(f"G1 {X(r)} Z{z:.3f} {fmt(feed_finish)}")
+        else:
+            _, z, r, zc, rc, cw = s
+            # I и K — смещение ЦЕНТРА от начальной точки; I всегда в радиусах,
+            # даже когда X выводится диаметром (так его читают Sinumerik/Fanuc)
+            n_arcs += 1
+            g.append(f"G{2 if cw else 3} {X(r)} Z{z:.3f} "
+                     f"I{rc - rp:.4f} K{zc - zp:.4f} {fmt(feed_finish)}")
+        zp, rp = s[1], s[2]
     g.append(f"G0 {X(retract_r)} Z{z_end:.3f}")
     g.append("(Finish operation: Finish)")
 
@@ -178,7 +374,8 @@ def generate(prof_data, params):
     g.append("M2")
 
     stats = {"lines": len(g), "ops": ops, "rough_passes": n_rough,
-             "stock_radius": r_stock, "profile_points": len(profile)}
+             "stock_radius": r_stock, "profile_points": len(profile),
+             "arcs": n_arcs}
     return g, stats
 
 
