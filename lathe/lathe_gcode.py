@@ -84,7 +84,16 @@ def generate(prof_data, params):
 
     g.append(f"(Lathe part: L{prof_data['length']:.2f} x "
              f"Dmax{2 * prof_data['max_radius']:.2f} mm)")
-    g.append(f"(Stock: bar D{2 * r_stock:.2f} mm, Z {z_top:.2f}..{z_end:.2f})")
+    pick = prof_data.get("stock_pick")
+    if pick and pick.get("kind") == "hex":
+        g.append(f"(Stock: HEX bar S{pick['size']:g} [{pick['series']}], "
+                 f"circumscribed D{pick['diameter']:.2f}, "
+                 f"Z {z_top:.2f}..{z_end:.2f})")
+    elif pick:
+        g.append(f"(Stock: round bar D{pick['size']:g} [{pick['series']}], "
+                 f"Z {z_top:.2f}..{z_end:.2f})")
+    else:
+        g.append(f"(Stock: bar D{2 * r_stock:.2f} mm, Z {z_top:.2f}..{z_end:.2f})")
     g.append(f"(Tool: turning insert {params.get('insert', 'DCMT070204R')}, "
              f"nose R{params.get('nose_radius', 0.4)} mm)")
     g.append(f"(Profile points: {len(profile)})")

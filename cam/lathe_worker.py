@@ -73,6 +73,52 @@ def find_rotation_axis(shape):
     return App.Vector(*key), c
 
 
+def find_wrench_flats(shape, tol=0.05):
+    """Грани «под ключ»: шесть плоскостей с нормалями через 60° вокруг оси Z,
+    равноудалённых от неё. Возвращает размер S (между противоположными
+    гранями) или None. Деталь ищется УЖЕ выровненной осью на Z.
+
+    Признак нужен для выбора проката: если грани совпадают с размером
+    шестигранного проката, точить их не надо — они достаются от заготовки.
+    """
+    import math
+    flats = []
+    for f in shape.Faces:
+        if type(f.Surface).__name__ != "Plane":
+            continue
+        n = f.Surface.Axis
+        if abs(n.z) > 0.1:                       # не боковая — торец
+            continue
+        c = f.CenterOfMass
+        dist = abs(n.x * c.x + n.y * c.y)        # расстояние от оси до грани
+        ang = math.degrees(math.atan2(n.y, n.x)) % 60.0
+        flats.append((dist, ang, round(f.BoundBox.ZMin, 1),
+                      round(f.BoundBox.ZMax, 1)))
+    if len(flats) < 6:
+        return None
+
+    # группируем по (расстояние от оси, диапазон Z) — один пояс граней
+    groups = {}
+    for dist, ang, z0, z1 in flats:
+        key = (round(dist / max(tol, 1e-6)), z0, z1)
+        groups.setdefault(key, []).append((dist, ang))
+    for (_, z0, z1), items in groups.items():
+        if len(items) != 6:
+            continue
+        dists = [d for d, _ in items]
+        if max(dists) - min(dists) > tol:
+            continue
+        # нормали должны стоять через 60°, то есть по модулю 60 совпадать
+        angs = [a for _, a in items]
+        spread = max(angs) - min(angs)
+        if spread > 2.0 and spread < 58.0:
+            continue
+        s = 2.0 * (sum(dists) / len(dists))
+        log(f"грани под ключ: 6 плоскостей, S={s:.2f} мм, Z {z1:.1f}..{z0:.1f}")
+        return round(s, 3)
+    return None
+
+
 def align_to_z(shape, axis, centre):
     """Ставит деталь осью вдоль Z, центром оси в X0Y0, правым торцом в Z0
     (обработка идёт в −Z, как принято в токарных программах)."""
@@ -173,12 +219,15 @@ def main():
                                 p.get("simplify_tol", 0.01))
     log(f"после упрощения: {len(prof)} точек")
 
+    hex_s = find_wrench_flats(aligned)
+
     out = {
         "profile": [[round(z, 4), round(r, 4)] for z, r in prof],
         "length": round(bb.ZLength, 4),
         "max_radius": round(max(r for _, r in prof), 4),
         "axis": [round(axis.x, 6), round(axis.y, 6), round(axis.z, 6)],
         "z_range": [round(bb.ZMin, 4), round(bb.ZMax, 4)],
+        "hex_across_flats": hex_s,
     }
     with open(p["out_json"], "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=1)
@@ -188,19 +237,52 @@ def main():
         aligned.exportStep(p["part_out"])
         log(f"деталь в СК программы → {os.path.basename(p['part_out'])}")
 
-    # заготовка-пруток: цилиндр по максимальному радиусу + припуск
+    # заготовка-пруток из СОРТАМЕНТА (ГОСТ 2590 / 8560), см. lathe/stock.py
     if p.get("stock_out"):
-        r = out["max_radius"] + p.get("stock_radial", 1.0)
+        import math
+        pick = None
+        if p.get("repo_root"):
+            # lathe.stock — чистый python без зависимостей, импортируется и
+            # внутри FreeCAD; путь передаёт хост (корень может быть кириллицей)
+            if p["repo_root"] not in sys.path:
+                sys.path.insert(0, p["repo_root"])
+            try:
+                from lathe import stock as stock_std
+                pick = stock_std.pick(2 * out["max_radius"],
+                                      p.get("allowance_per_side", 3.15),
+                                      hex_across_flats=hex_s,
+                                      prefer_hex=p.get("prefer_hex", True))
+                log(f"прокат: {stock_std.describe(pick)} — {pick['note']}")
+            except Exception as e:
+                log(f"warn: подбор сортамента не удался ({e}), "
+                    f"беру деталь + припуск")
+        if pick is None:                          # прежнее поведение
+            d = 2 * (out["max_radius"] + p.get("stock_radial", 1.0))
+            pick = {"kind": "round", "size": round(d, 3), "diameter": d,
+                    "series": "без сортамента", "note": "деталь + припуск"}
+
         z0 = bb.ZMax + p.get("stock_face", 1.0)
-        stock = Part.makeCylinder(r, bb.ZLength + p.get("stock_face", 1.0)
-                                  + p.get("stock_tail", 5.0),
-                                  App.Vector(0, 0, z0), App.Vector(0, 0, -1))
+        height = bb.ZLength + p.get("stock_face", 1.0) + p.get("stock_tail", 5.0)
+        r_out = pick["diameter"] / 2.0
+        if pick["kind"] == "hex":
+            # шестигранный прокат: грани детали достаются от заготовки
+            s = pick["size"]
+            rc = s / math.sqrt(3.0)               # радиус описанной окружности
+            pts = [App.Vector(rc * math.cos(math.radians(60 * i)),
+                              rc * math.sin(math.radians(60 * i)), z0)
+                   for i in range(6)]
+            wire = Part.makePolygon(pts + [pts[0]])
+            stock = Part.Face(wire).extrude(App.Vector(0, 0, -height))
+        else:
+            stock = Part.makeCylinder(r_out, height, App.Vector(0, 0, z0),
+                                      App.Vector(0, 0, -1))
         stock.exportStep(p["stock_out"])
-        log(f"заготовка-пруток Ø{2 * r:.2f} x {stock.BoundBox.ZLength:.2f} мм "
-            f"→ {os.path.basename(p['stock_out'])}")
-        out["stock_radius"] = round(r, 4)
+        log(f"заготовка: {pick['kind']} {pick['size']:g} × "
+            f"{height:.2f} мм → {os.path.basename(p['stock_out'])}")
+        out["stock_radius"] = round(r_out, 4)
         out["stock_z_top"] = round(z0, 4)
         out["stock_z_bottom"] = round(stock.BoundBox.ZMin, 4)
+        out["stock_pick"] = pick
         with open(p["out_json"], "w", encoding="utf-8") as f:
             json.dump(out, f, ensure_ascii=False, indent=1)
 

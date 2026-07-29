@@ -39,7 +39,16 @@ def main():
     ap.add_argument("--depth-of-cut", type=float, help="глубина резания за проход, мм")
     ap.add_argument("--allowance", type=float, help="припуск на чистовую, мм")
     ap.add_argument("--stock-radial", type=float,
-                    help="припуск заготовки-прутка по радиусу, мм")
+                    help="припуск заготовки-прутка по радиусу, мм "
+                         "(только при --no-standard-stock)")
+    ap.add_argument("--allowance-per-side", type=float,
+                    help="припуск на обточку по радиусу для подбора проката, мм "
+                         "(дефолт 3.15 — по заводскому эталону 14-31A)")
+    ap.add_argument("--no-standard-stock", action="store_true",
+                    help="не подбирать прокат по ГОСТ, взять деталь + припуск")
+    ap.add_argument("--no-hex-stock", action="store_true",
+                    help="не предлагать шестигранный прокат для деталей "
+                         "с гранями под ключ — только круг")
     ap.add_argument("--radius-mode", action="store_true",
                     help="X в радиусах (по умолчанию — в диаметрах, как ждёт стойка)")
     ap.add_argument("--no-partoff", action="store_true", help="без отрезки")
@@ -91,7 +100,13 @@ def main():
     print(f"Резец:     {p['insert']} | радиус при вершине {p['nose_radius']} мм")
     print(f"Режимы:    глубина {p['depth_of_cut']} мм | припуск {p['allowance']} мм | "
           f"подача {p['feed']}/{p['feed_finish']} мм/мин | {p['spindle_speed']} об/мин")
-    print(f"Заготовка: пруток, +{stock_radial} мм по радиусу")
+    allowance_side = (args.allowance_per_side if args.allowance_per_side is not None
+                      else getattr(config, "LATHE_ALLOWANCE_PER_SIDE", 3.15))
+    if args.no_standard_stock:
+        print(f"Заготовка: пруток, +{stock_radial} мм по радиусу (без сортамента)")
+    else:
+        print(f"Заготовка: прокат по ГОСТ, припуск {allowance_side} мм на сторону"
+              + (" (шестигранник не предлагать)" if args.no_hex_stock else ""))
     print("Извлечение осевого профиля...")
 
     try:
@@ -99,6 +114,9 @@ def main():
             model, out_json=stem + "_profile.json",
             part_out=stem + "_part.step", stock_out=stem + "_stock.stp",
             stock_radial=stock_radial,
+            allowance_per_side=allowance_side,
+            prefer_hex=not args.no_hex_stock,
+            use_standard=not args.no_standard_stock,
             profile_step=getattr(config, "LATHE_PROFILE_STEP", 0.1),
             simplify_tol=getattr(config, "LATHE_SIMPLIFY_TOL", 0.01))
     except Exception as e:
