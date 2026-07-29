@@ -49,6 +49,11 @@ def main():
     ap.add_argument("--no-hex-stock", action="store_true",
                     help="не предлагать шестигранный прокат для деталей "
                          "с гранями под ключ — только круг")
+    ap.add_argument("--feed-per-min", action="store_true",
+                    help="подача в мм/мин (G94); по умолчанию — на оборот "
+                         "(G95), как принято в точении")
+    ap.add_argument("--feed-rev", type=float, metavar="MM",
+                    help="черновая подача, мм/об (дефолт 0.15 — как у завода)")
     ap.add_argument("--radius-mode", action="store_true",
                     help="X в радиусах (по умолчанию — в диаметрах, как ждёт стойка)")
     ap.add_argument("--no-partoff", action="store_true", help="без отрезки")
@@ -85,6 +90,10 @@ def main():
         "clearance": getattr(config, "LATHE_CLEARANCE", 2.0),
         "feed": getattr(config, "LATHE_FEED", 150.0),
         "feed_finish": getattr(config, "LATHE_FEED_FINISH", 80.0),
+        "feed_mode": "per_min" if args.feed_per_min else "per_rev",
+        "feed_per_rev": (args.feed_rev if args.feed_rev is not None
+                         else getattr(config, "LATHE_FEED_PER_REV", 0.15)),
+        "feed_per_rev_finish": getattr(config, "LATHE_FEED_PER_REV_FINISH", 0.08),
         "spindle_speed": getattr(config, "LATHE_SPINDLE_SPEED", 1500),
         "scan_step": getattr(config, "LATHE_SCAN_STEP", 0.2),
         "diameter_mode": not args.radius_mode,
@@ -98,8 +107,11 @@ def main():
 
     print(f"Модель:    {args.model}")
     print(f"Резец:     {p['insert']} | радиус при вершине {p['nose_radius']} мм")
+    feed_txt = (f"подача {p['feed_per_rev']}/{p['feed_per_rev_finish']} мм/об (G95)"
+                if p["feed_mode"] == "per_rev"
+                else f"подача {p['feed']}/{p['feed_finish']} мм/мин (G94)")
     print(f"Режимы:    глубина {p['depth_of_cut']} мм | припуск {p['allowance']} мм | "
-          f"подача {p['feed']}/{p['feed_finish']} мм/мин | {p['spindle_speed']} об/мин")
+          f"{feed_txt} | {p['spindle_speed']} об/мин")
     allowance_side = (args.allowance_per_side if args.allowance_per_side is not None
                       else getattr(config, "LATHE_ALLOWANCE_PER_SIDE", 3.15))
     if args.no_standard_stock:
