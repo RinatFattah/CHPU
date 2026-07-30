@@ -17,6 +17,7 @@ nx_lathe_sim.py — ТОКАРНАЯ симуляция G-Code на виртуа
 
 import glob
 import json
+import math
 import os
 import re
 import shutil
@@ -36,6 +37,9 @@ _JOURNAL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "nx_lathe_sim_journal.py")
 _EXPORT_JOURNAL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "nx_sim_export_journal.py")
+_SPINDLE_PROBE_JOURNAL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                      "nx_spindle_probe_journal.py")
+_SPINDLE_MEM = {}   # кэш оси шпинделя на процесс: machine -> [x,y,z]
 
 # Положение режущей кромки (Schneidenlage) для наружного точения справа
 # налево. Значения 1..9; 3 — стандарт для правого наружного резца.
@@ -101,6 +105,96 @@ def _rotate_step(in_path, out_path, axis=(0.0, 1.0, 0.0), angle=90.0):
     except OSError:
         pass
     return out_path
+
+
+def spindle_axis(machine, sample_step):
+    """Ось шпинделя станка в МИРОВЫХ координатах [x,y,z] или None.
+
+    Разовый headless-зонд NX (кэш на процесс + на диск в папке станка), чтобы
+    поворот детали на шпиндель считался автоматически, а не был зашит под
+    конкретный станок. sample_step — любое тело, нужно лишь чтобы у зонда был
+    рабочий part; результат от детали не зависит.
+    """
+    if machine in _SPINDLE_MEM:
+        return _SPINDLE_MEM[machine]
+    mdir = nx_sim.find_machine_dir(machine)
+    cache = os.path.join(mdir, "spindle_axis.json") if mdir else None
+    if cache and os.path.exists(cache):
+        try:
+            ax = json.load(open(cache, encoding="utf-8")).get("spindle_axis")
+            if ax and len(ax) == 3:
+                _SPINDLE_MEM[machine] = ax
+                return ax
+        except (OSError, ValueError):
+            pass
+    base = nx_export.find_nx_base()
+    if not base or not sample_step or not os.path.exists(sample_step):
+        return None
+    from cam.freecad_cam import _ascii_safe
+    tdir = tempfile.gettempdir()
+    out_json = os.path.join(tdir, f"spindle_{abs(hash(machine)) % 100000}.json")
+    if os.path.exists(out_json):
+        os.unlink(out_json)
+    params = {
+        "stock_step": _ascii_safe(os.path.abspath(sample_step)),
+        "machine": machine,
+        "work_prt": os.path.join(tdir, "spindle_probe.prt"),
+        "out_json": out_json,
+        "log_path": os.path.join(tdir, "spindle_probe.log"),
+    }
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
+                                     encoding="utf-8") as tmp:
+        json.dump(params, tmp)
+        pp = tmp.name
+    journal = os.path.join(tdir, "nx_spindle_probe_journal.py")
+    shutil.copyfile(_SPINDLE_PROBE_JOURNAL, journal)
+    rj = os.path.join(base, "NXBIN", "run_journal.exe")
+    _log("определяю ось шпинделя станка (разовый зонд NX)...")
+    try:
+        subprocess.run([rj, journal], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace",
+                       env={**os.environ, "NX_SPINDLE_PROBE": pp}, timeout=300)
+    except Exception as e:
+        _log(f"зонд оси шпинделя не удался: {e}")
+    finally:
+        try:
+            os.unlink(pp)
+        except OSError:
+            pass
+    if not os.path.exists(out_json):
+        return None
+    try:
+        ax = json.load(open(out_json, encoding="utf-8")).get("spindle_axis")
+    except (OSError, ValueError):
+        return None
+    if not ax or len(ax) != 3:
+        return None
+    _SPINDLE_MEM[machine] = ax
+    if cache:
+        try:
+            shutil.copyfile(out_json, cache)   # нет прав на папку станка — ок,
+        except OSError:                        # просто не кэшируем на диск
+            pass
+    return ax
+
+
+def _rotation_to_spindle(spindle):
+    """Поворот (axis, angle°), переводящий ось детали +Z на ось шпинделя.
+
+    axis = нормаль (Z × spindle), angle = угол между Z и spindle. Для шпинделя
+    вдоль X даёт (0,1,0)/90°. Коллинеарные случаи: 0° или 180°.
+    """
+    sx, sy, sz = (float(v) for v in spindle)
+    n = math.sqrt(sx * sx + sy * sy + sz * sz) or 1.0
+    sx, sy, sz = sx / n, sy / n, sz / n
+    dot = max(-1.0, min(1.0, sz))               # (0,0,1)·spindle
+    angle = math.degrees(math.acos(dot))
+    ax = (-sy, sx, 0.0)                          # (0,0,1) × spindle
+    axn = math.sqrt(ax[0] ** 2 + ax[1] ** 2 + ax[2] ** 2)
+    if axn < 1e-9:                              # уже коллинеарны оси Z
+        return (1.0, 0.0, 0.0), (0.0 if dot > 0 else 180.0)
+    # + 0.0 нормализует -0.0 -> 0.0 (косметика лога)
+    return (ax[0] / axn + 0.0, ax[1] / axn + 0.0, ax[2] / axn + 0.0), angle
 
 
 def gcode_to_mpf(gcode_path, mpf_path, tool_number=1):
@@ -219,12 +313,27 @@ def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
     # Y); G-код НЕ трогаем — его Z остаётся логической осью, стойка сама мапит
     # Z→ось станка. Только BREP-солиды (фасетный результат так крутить нельзя).
     do_rotate = getattr(config, "NX_LATHE_ROTATE_TO_SPINDLE", True)
-    rot_axis = tuple(getattr(config, "NX_LATHE_SPINDLE_ROT_AXIS", (0.0, 1.0, 0.0)))
-    rot_angle = float(getattr(config, "NX_LATHE_SPINDLE_ROT_ANGLE", 90.0))
+    # поворот детали на ось шпинделя: по умолчанию АВТО — зонд читает ось
+    # шпинделя станка (кэш на станок) и считает поворот +Z → ось шпинделя;
+    # config может переопределить вручную (NX_LATHE_SPINDLE_ROT_AXIS/ANGLE)
+    rot_axis = getattr(config, "NX_LATHE_SPINDLE_ROT_AXIS", None)
+    rot_angle = getattr(config, "NX_LATHE_SPINDLE_ROT_ANGLE", None)
+    if do_rotate and (rot_axis is None or rot_angle is None):
+        spindle = spindle_axis(machine, stock_step_path)
+        if spindle:
+            rot_axis, rot_angle = _rotation_to_spindle(spindle)
+            _log(f"ось шпинделя станка {tuple(round(v, 3) for v in spindle)} → "
+                 f"поворот детали {rot_angle:.1f}° вокруг "
+                 f"{tuple(round(v, 2) for v in rot_axis)}")
+        else:
+            rot_axis, rot_angle = (0.0, 1.0, 0.0), 90.0
+            _log("ось шпинделя зондом не определена — беру дефолт (0,1,0)/90°")
+    rot_axis = tuple(rot_axis) if rot_axis is not None else (0.0, 1.0, 0.0)
+    rot_angle = float(rot_angle) if rot_angle is not None else 90.0
     if do_rotate:
         stock_for_nx = os.path.join(tdir, f"{stem}_stock_nx.stp")
         _rotate_step(stock_step_path, stock_for_nx, rot_axis, rot_angle)
-        _log("заготовка повёрнута на ось шпинделя станка (Z→X)")
+        _log("заготовка повёрнута на ось шпинделя станка")
     else:
         stock_for_nx = stock_step_path
 
