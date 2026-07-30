@@ -195,11 +195,14 @@ def main():
                 + (f", {res['triangles']} треуг." if res.get("triangles") else "")
                 + ")") if res.get("machine_time") else ""
         print(f"✅ NX ISV: обработанная заготовка → {res['step']}{tail}")
-        # результат лежит в раме станка (ось на X); эталон повёрнут туда же,
-        # чтобы они накладывались в NX и корректно сравнивались
+        # результат ISV рождается в раме станка (ось X); для наложения на
+        # ИСХОДНУЮ деталь его возвращают в раму детали (Z) как STL
+        if res.get("stl_z"):
+            print(f"   ▶ наложить на исходную деталь: {res['stl_z']}  "
+                  f"+  {stem + '_part.step'}  (обе в раме детали, ось Z)")
         ref = res.get("part_ref") or (stem + "_part.step")
         if res.get("part_ref"):
-            print(f"   эталон в раме станка (наложить на результат): {ref}")
+            print(f"   (числовая сверка — в раме станка: {res['step']} + {ref})")
         try:
             from cam import step_diff
             d = step_diff.diff(ref, res["step"], stem + "_nxdiff.json")
