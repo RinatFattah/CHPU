@@ -60,11 +60,16 @@ def main():
                     help="чистовой проход только отрезками (без G2/G3)")
     ap.add_argument("--no-partoff", action="store_true", help="без отрезки")
     ap.add_argument("--simulate", action="store_true",
-                    help="съём материала нашей моделью (быстро, но это "
-                         "самопроверка: генератор и симулятор писались вместе)")
-    ap.add_argument("--nx-simulate", action="store_true",
-                    help="прогнать на виртуальном токарном станке NX ISV "
-                         "(независимая проверка; откроется окно NX)")
+                    help="после генерации прогнать G-Code на виртуальном "
+                         "токарном станке NX ISV (нужен установленный NX); "
+                         "результат — обработанная заготовка <gcode>_nxsim.stp "
+                         "и _nxsim.prt (как --simulate у фрезеровки)")
+    ap.add_argument("--simulate-own", action="store_true",
+                    help="съём нашей собственной моделью (быстро, но это "
+                         "самопроверка: генератор и симулятор писались вместе, "
+                         "не независимая проверка) → <gcode>_sim.step")
+    ap.add_argument("--nx-simulate", dest="simulate", action="store_true",
+                    help=argparse.SUPPRESS)  # устаревший алиас для --simulate
     args = ap.parse_args()
 
     if args.config:
@@ -153,7 +158,7 @@ def main():
           + (f" … всего {len(stats['ops'])}" if len(stats['ops']) > 8 else "")
           + (f" | дуг в чистовом: {stats['arcs']}" if stats.get("arcs") else ""))
 
-    if args.simulate:
+    if args.simulate_own:
         print("Съём материала по программе...")
         from lathe import lathe_sim
         try:
@@ -175,13 +180,14 @@ def main():
         except Exception as e:
             print(f"   (сверка не выполнена: {e})")
 
-    if args.nx_simulate:
+    if args.simulate:
         print("Симуляция на виртуальном токарном станке NX ISV "
               "(откроется окно NX, трогать не нужно)...")
         from nx import nx_lathe_sim
         try:
             res = nx_lathe_sim.simulate(gcode, stem + "_stock.stp",
-                                        nose_radius=p["nose_radius"])
+                                        nose_radius=p["nose_radius"],
+                                        part_step=stem + "_part.step")
         except Exception as e:
             print(f"⚠  NX-симуляция не удалась: {e}")
             sys.exit(2)
@@ -189,10 +195,14 @@ def main():
                 + (f", {res['triangles']} треуг." if res.get("triangles") else "")
                 + ")") if res.get("machine_time") else ""
         print(f"✅ NX ISV: обработанная заготовка → {res['step']}{tail}")
+        # результат лежит в раме станка (ось на X); эталон повёрнут туда же,
+        # чтобы они накладывались в NX и корректно сравнивались
+        ref = res.get("part_ref") or (stem + "_part.step")
+        if res.get("part_ref"):
+            print(f"   эталон в раме станка (наложить на результат): {ref}")
         try:
             from cam import step_diff
-            d = step_diff.diff(stem + "_part.step", res["step"],
-                               stem + "_nxdiff.json")
+            d = step_diff.diff(ref, res["step"], stem + "_nxdiff.json")
             print(f"   сверка NX-результата с моделью: "
                   f"недорез {d['undercut_total_mm3']:.1f} мм³, "
                   f"зарез {d['overcut_total_mm3']:.1f} мм³")

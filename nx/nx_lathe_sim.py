@@ -46,6 +46,63 @@ def _log(msg):
     print(f"[lathe-sim] {msg}")
 
 
+_ROTATE_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "_rotate_worker.py")
+
+
+def _rotate_step(in_path, out_path, axis=(0.0, 1.0, 0.0), angle=90.0):
+    """Повернуть BREP-STEP (деталь/заготовку) в другую раму через freecadcmd.
+
+    Нужно, чтобы посадить тело на физическую ось шпинделя NX-станка. OCCT не
+    пишет в неASCII-пути → результат идёт в ASCII-temp и копируется на место.
+    Только для BREP-солидов (фасетный результат NX так крутить нельзя).
+    """
+    from cam.freecad_cam import find_freecadcmd
+    fc = find_freecadcmd()
+    if not fc:
+        raise RuntimeError("freecadcmd не найден — поворот в раму станка "
+                           "невозможен (укажите FREECAD_CMD в конфиге)")
+    # OCCT не читает неASCII-пути И спотыкается о 8.3-имя с усечённым расширением
+    # (.step → .STE = «unknown extension»). Поэтому вход копируем в ASCII-temp с
+    # СОХРАНЁННЫМ расширением, а не подставляем 8.3-короткое имя.
+    ext = os.path.splitext(in_path)[1] or ".step"
+    tmp_in = os.path.join(tempfile.gettempdir(),
+                          f"roti_{os.getpid()}_{abs(hash(in_path)) % 100000}{ext}")
+    shutil.copyfile(in_path, tmp_in)
+    tmp_out = os.path.join(tempfile.gettempdir(),
+                           f"rot_{os.getpid()}_{abs(hash(out_path)) % 100000}.step")
+    params = {"in": tmp_in, "out": tmp_out,
+              "axis": list(axis), "angle": float(angle)}
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
+                                     encoding="utf-8") as tmp:
+        json.dump(params, tmp)
+        pp = tmp.name
+    # freecadcmd не откроет сам воркер по неASCII-пути (репо под ...\Работа\...)
+    # — копируем его в TEMP, как это делает журнал станка
+    worker_tmp = os.path.join(tempfile.gettempdir(), "_lathe_rotate_worker.py")
+    shutil.copyfile(_ROTATE_WORKER, worker_tmp)
+    try:
+        r = subprocess.run([fc, worker_tmp], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace",
+                           env={**os.environ, "ROTATE_PARAMS": pp,
+                                "QT_QPA_PLATFORM": "offscreen"}, timeout=180)
+    finally:
+        for f in (pp, tmp_in):
+            try:
+                os.unlink(f)
+            except OSError:
+                pass
+    if "[rotate] OK" not in (r.stdout or "") or not os.path.exists(tmp_out):
+        raise RuntimeError("поворот STEP не удался: "
+                           + ((r.stdout or "") + (r.stderr or ""))[-300:])
+    shutil.copyfile(tmp_out, out_path)
+    try:
+        os.unlink(tmp_out)
+    except OSError:
+        pass
+    return out_path
+
+
 def gcode_to_mpf(gcode_path, mpf_path, tool_number=1):
     """Токарный G-Code → .mpf для Sinumerik. В отличие от фрезерного варианта
     движения НЕ переписываются: наш код уже в G18 с диаметральным X и G95/G97.
@@ -112,8 +169,12 @@ def write_to_ini(machine_dir, nose_radius, tool_number=1,
 
 
 def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
-             machine=None):
-    """Прогоняет токарный G-Code на виртуальном станке NX ISV."""
+             machine=None, part_step=None):
+    """Прогоняет токарный G-Code на виртуальном станке NX ISV.
+
+    part_step (опц.) — эталонная деталь: её повернут в ту же раму станка и
+    вернут как `part_ref`, чтобы результат и эталон накладывались друг на друга.
+    """
     base = nx_export.find_nx_base()
     if not base:
         raise RuntimeError("Siemens NX не найден — симуляция недоступна")
@@ -147,11 +208,38 @@ def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
     _log(f"программа для стойки: {n} строк → {os.path.basename(mpf_path)}")
 
     from cam.freecad_cam import _ascii_safe
+
+    # Посадить заготовку (и эталон) на ФИЗИЧЕСКУЮ ось шпинделя станка. Наш
+    # пайплайн канонизирует деталь осью на Z (профиль R(z), G-код Z=ось), а у
+    # sim11 шпиндель идёт вдоль мирового X — замерено зондом: MCS_MAIN_SPINDLE
+    # Zaxis=(1,0,0), патрон в (−76.2,0,0). Без поворота шпиндель крутит тело
+    # вокруг чужой оси → несимметричная стружка. Крутим тело Z→X (+90° вокруг
+    # Y); G-код НЕ трогаем — его Z остаётся логической осью, стойка сама мапит
+    # Z→ось станка. Только BREP-солиды (фасетный результат так крутить нельзя).
+    do_rotate = getattr(config, "NX_LATHE_ROTATE_TO_SPINDLE", True)
+    rot_axis = tuple(getattr(config, "NX_LATHE_SPINDLE_ROT_AXIS", (0.0, 1.0, 0.0)))
+    rot_angle = float(getattr(config, "NX_LATHE_SPINDLE_ROT_ANGLE", 90.0))
+    part_ref = ""
+    if do_rotate:
+        stock_for_nx = os.path.join(tdir, f"{stem}_stock_nx.stp")
+        _rotate_step(stock_step_path, stock_for_nx, rot_axis, rot_angle)
+        _log("заготовка повёрнута на ось шпинделя станка (Z→X)")
+        if part_step and os.path.exists(part_step):
+            try:
+                part_ref = out_stem + "_part_nx.step"
+                _rotate_step(part_step, part_ref, rot_axis, rot_angle)
+                _log("эталон повёрнут в раму станка (для наложения/сверки)")
+            except Exception as e:
+                _log(f"warn: эталон в раму станка не повёрнут: {e}")
+                part_ref = ""
+    else:
+        stock_for_nx = stock_step_path
+
     log_path = os.path.join(tdir, f"{stem}_lathe_journal.log")
     if os.path.exists(log_path):
         os.unlink(log_path)
     params = {
-        "stock_step": _ascii_safe(os.path.abspath(stock_step_path)),
+        "stock_step": _ascii_safe(os.path.abspath(stock_for_nx)),
         "mpf": mpf_path,
         "machine": machine,
         "nose_radius": nose_radius,
@@ -251,4 +339,4 @@ def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
     _log(f"реальное время: прогон {sim_wall:.0f} с + экспорт "
          f"{time.perf_counter() - t1:.0f} с")
     return {"step": out_step, "prt": out_prt, "machine_time": machine_time,
-            "triangles": triangles}
+            "triangles": triangles, "part_ref": part_ref}
