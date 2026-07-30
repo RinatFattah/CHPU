@@ -37,7 +37,8 @@ def main():
     ap.add_argument("gcode", nargs="?", help="куда писать G-Code")
     ap.add_argument("--config", metavar="FILE", help="YAML-конфиг")
     ap.add_argument("--depth-of-cut", type=float, help="глубина резания за проход, мм")
-    ap.add_argument("--allowance", type=float, help="припуск на чистовую, мм")
+    ap.add_argument("--allowance", type=float,
+                    help="припуск на чистовую по радиусу, мм (дефолт 0.2)")
     ap.add_argument("--stock-radial", type=float,
                     help="припуск заготовки-прутка по радиусу, мм "
                          "(только при --no-standard-stock)")
@@ -97,7 +98,7 @@ def main():
         "depth_of_cut": args.depth_of_cut if args.depth_of_cut is not None
             else getattr(config, "LATHE_DEPTH_OF_CUT", 1.0),
         "allowance": args.allowance if args.allowance is not None
-            else getattr(config, "LATHE_ALLOWANCE", 0.3),
+            else getattr(config, "LATHE_ALLOWANCE", 0.2),
         "clearance": getattr(config, "LATHE_CLEARANCE", 2.0),
         "feed": getattr(config, "LATHE_FEED", 150.0),
         "feed_finish": getattr(config, "LATHE_FEED_FINISH", 80.0),
