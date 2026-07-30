@@ -103,56 +103,6 @@ def _rotate_step(in_path, out_path, axis=(0.0, 1.0, 0.0), angle=90.0):
     return out_path
 
 
-_FACET_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             "_facet_stl_worker.py")
-
-
-def _facet_to_stl(in_step, out_stl, axis=(0.0, 1.0, 0.0), angle=-90.0):
-    """Повернуть ФАСЕТНОЕ тело NX (STEP) в другую раму и записать STL.
-
-    OCCT рассыпает фасет при BREP-повороте (exportStep→0 граней), поэтому
-    крутим как меш. Пути с кириллицей: вход/воркер → ASCII-temp, STL пишется в
-    ASCII-temp и копируется на место.
-    """
-    from cam.freecad_cam import find_freecadcmd
-    fc = find_freecadcmd()
-    if not fc:
-        raise RuntimeError("freecadcmd не найден — STL в раме детали не сделать")
-    tmp_in = os.path.join(tempfile.gettempdir(),
-                          f"faci_{os.getpid()}_{abs(hash(in_step)) % 100000}.stp")
-    tmp_out = os.path.join(tempfile.gettempdir(),
-                           f"faco_{os.getpid()}_{abs(hash(out_stl)) % 100000}.stl")
-    shutil.copyfile(in_step, tmp_in)
-    params = {"in": tmp_in, "out_stl": tmp_out, "axis": list(axis),
-              "angle": float(angle)}
-    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
-                                     encoding="utf-8") as tmp:
-        json.dump(params, tmp)
-        pp = tmp.name
-    worker_tmp = os.path.join(tempfile.gettempdir(), "_lathe_facet_worker.py")
-    shutil.copyfile(_FACET_WORKER, worker_tmp)
-    try:
-        r = subprocess.run([fc, worker_tmp], capture_output=True, text=True,
-                           encoding="utf-8", errors="replace",
-                           env={**os.environ, "FACET_PARAMS": pp,
-                                "QT_QPA_PLATFORM": "offscreen"}, timeout=180)
-    finally:
-        for f in (pp, tmp_in):
-            try:
-                os.unlink(f)
-            except OSError:
-                pass
-    if "[facet] OK" not in (r.stdout or "") or not os.path.exists(tmp_out):
-        raise RuntimeError("STL-поворот не удался: "
-                           + ((r.stdout or "") + (r.stderr or ""))[-300:])
-    shutil.copyfile(tmp_out, out_stl)
-    try:
-        os.unlink(tmp_out)
-    except OSError:
-        pass
-    return out_stl
-
-
 def gcode_to_mpf(gcode_path, mpf_path, tool_number=1):
     """Токарный G-Code → .mpf для Sinumerik. В отличие от фрезерного варианта
     движения НЕ переписываются: наш код уже в G18 с диаметральным X и G95/G97.
@@ -219,11 +169,13 @@ def write_to_ini(machine_dir, nose_radius, tool_number=1,
 
 
 def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
-             machine=None, part_step=None):
+             machine=None):
     """Прогоняет токарный G-Code на виртуальном станке NX ISV.
 
-    part_step (опц.) — эталонная деталь: её повернут в ту же раму станка и
-    вернут как `part_ref`, чтобы результат и эталон накладывались друг на друга.
+    Результат возвращается в раме ДЕТАЛИ (ось Z): заготовку сажают на ось
+    шпинделя станка (X) для съёма, затем фасетный результат поворачивают обратно
+    на Z прямо в экспортном журнале NX — тогда out_nxsim.stp ложится на
+    out_part.step и исходную модель без всяких промежуточных форматов.
     """
     base = nx_export.find_nx_base()
     if not base:
@@ -269,19 +221,10 @@ def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
     do_rotate = getattr(config, "NX_LATHE_ROTATE_TO_SPINDLE", True)
     rot_axis = tuple(getattr(config, "NX_LATHE_SPINDLE_ROT_AXIS", (0.0, 1.0, 0.0)))
     rot_angle = float(getattr(config, "NX_LATHE_SPINDLE_ROT_ANGLE", 90.0))
-    part_ref = ""
     if do_rotate:
         stock_for_nx = os.path.join(tdir, f"{stem}_stock_nx.stp")
         _rotate_step(stock_step_path, stock_for_nx, rot_axis, rot_angle)
         _log("заготовка повёрнута на ось шпинделя станка (Z→X)")
-        if part_step and os.path.exists(part_step):
-            try:
-                part_ref = out_stem + "_part_nx.step"
-                _rotate_step(part_step, part_ref, rot_axis, rot_angle)
-                _log("эталон повёрнут в раму станка (для наложения/сверки)")
-            except Exception as e:
-                _log(f"warn: эталон в раму станка не повёрнут: {e}")
-                part_ref = ""
     else:
         stock_for_nx = stock_step_path
 
@@ -348,8 +291,13 @@ def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
     _log(f"прогон завершён за {sim_wall:.0f} с (машинное время "
          f"{machine_time or 'н/д'}), IPW: {os.path.basename(ipw_prt)}")
 
-    # IPW → STEP тем же батч-журналом, что у фрезеровки
+    # IPW → STEP тем же батч-журналом, что у фрезеровки; для токарки просим
+    # журнал повернуть фасетный результат ОБРАТНО в раму детали (X→Z) — поворот,
+    # обратный посадке заготовки на шпиндель, чтобы STEP лёг на out_part.step
     exp_params = {"prt": ipw_prt, "out_step": tmp_step, "min_triangles": 50}
+    if do_rotate:
+        exp_params["rot_axis"] = list(rot_axis)
+        exp_params["rot_angle"] = -rot_angle
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
                                      encoding="utf-8") as tmp:
         json.dump(exp_params, tmp)
@@ -388,20 +336,5 @@ def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
         out_prt = ""
     _log(f"реальное время: прогон {sim_wall:.0f} с + экспорт "
          f"{time.perf_counter() - t1:.0f} с")
-
-    # Результат ISV рождается в раме станка (ось на X). Возвращаем его ещё и
-    # повёрнутым ОБРАТНО в раму детали (Z) как STL — тогда он ложится прямо на
-    # исходную модель / out_part.step. Фасет через STEP не переносится (OCCT
-    # его рассыпает в 0 граней), поэтому именно STL.
-    stl_z = ""
-    if do_rotate:
-        try:
-            stl_z = out_stem + "_nxsim.stl"
-            _facet_to_stl(out_step, stl_z, rot_axis, -rot_angle)
-            _log("результат повёрнут обратно в раму детали (Z) → STL для наложения")
-        except Exception as e:
-            _log(f"warn: STL в раме детали не сделан: {e}")
-            stl_z = ""
-
     return {"step": out_step, "prt": out_prt, "machine_time": machine_time,
-            "triangles": triangles, "part_ref": part_ref, "stl_z": stl_z}
+            "triangles": triangles}

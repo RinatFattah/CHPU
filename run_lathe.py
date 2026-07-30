@@ -186,8 +186,7 @@ def main():
         from nx import nx_lathe_sim
         try:
             res = nx_lathe_sim.simulate(gcode, stem + "_stock.stp",
-                                        nose_radius=p["nose_radius"],
-                                        part_step=stem + "_part.step")
+                                        nose_radius=p["nose_radius"])
         except Exception as e:
             print(f"⚠  NX-симуляция не удалась: {e}")
             sys.exit(2)
@@ -195,17 +194,13 @@ def main():
                 + (f", {res['triangles']} треуг." if res.get("triangles") else "")
                 + ")") if res.get("machine_time") else ""
         print(f"✅ NX ISV: обработанная заготовка → {res['step']}{tail}")
-        # результат ISV рождается в раме станка (ось X); для наложения на
-        # ИСХОДНУЮ деталь его возвращают в раму детали (Z) как STL
-        if res.get("stl_z"):
-            print(f"   ▶ наложить на исходную деталь: {res['stl_z']}  "
-                  f"+  {stem + '_part.step'}  (обе в раме детали, ось Z)")
-        ref = res.get("part_ref") or (stem + "_part.step")
-        if res.get("part_ref"):
-            print(f"   (числовая сверка — в раме станка: {res['step']} + {ref})")
+        # результат возвращён в раму детали (ось Z) — ложится на out_part.step
+        print(f"   ▶ наложить на деталь: {res['step']}  +  "
+              f"{stem + '_part.step'}  (обе в раме детали, ось Z)")
         try:
             from cam import step_diff
-            d = step_diff.diff(ref, res["step"], stem + "_nxdiff.json")
+            d = step_diff.diff(stem + "_part.step", res["step"],
+                               stem + "_nxdiff.json")
             print(f"   сверка NX-результата с моделью: "
                   f"недорез {d['undercut_total_mm3']:.1f} мм³, "
                   f"зарез {d['overcut_total_mm3']:.1f} мм³")
