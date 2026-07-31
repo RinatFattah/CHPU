@@ -47,9 +47,15 @@ def main():
                          "(дефолт 3.15 — по заводскому эталону 14-31A)")
     ap.add_argument("--no-standard-stock", action="store_true",
                     help="не подбирать прокат по ГОСТ, взять деталь + припуск")
+    ap.add_argument("--hex-stock", action="store_true",
+                    help="брать ШЕСТИГРАННЫЙ прокат для деталей с гранями под "
+                         "ключ (тогда грани достаются от проката). По умолчанию "
+                         "круг — как на заводе, грани отдельной операцией")
     ap.add_argument("--no-hex-stock", action="store_true",
-                    help="не предлагать шестигранный прокат для деталей "
-                         "с гранями под ключ — только круг")
+                    help=argparse.SUPPRESS)   # устаревший: круг и так по умолчанию
+    ap.add_argument("--no-nose-comp", action="store_true",
+                    help="не компенсировать радиус при вершине (чистовой пойдёт "
+                         "прямо по профилю — оставит зарез r·tg(угол уклона))")
     ap.add_argument("--feed-per-min", action="store_true",
                     help="подача в мм/мин (G94); по умолчанию — на оборот "
                          "(G95), как принято в точении")
@@ -133,6 +139,10 @@ def main():
                          else getattr(config, "LATHE_GROOVE_WIDTH", 3.0)),
         "groove_width_min": getattr(config, "LATHE_GROOVE_WIDTH_MIN", 1.0),
         "groove_tool_number": getattr(config, "LATHE_GROOVE_TOOL_NUMBER", 2),
+        # компенсация радиуса при вершине (эквидистанта в чистовом проходе)
+        "nose_comp": (not args.no_nose_comp
+                      and getattr(config, "LATHE_NOSE_COMP", True)),
+        "tip_offset": tuple(getattr(config, "LATHE_TIP_OFFSET", (1.0, -1.0))),
     }
     stock_radial = (args.stock_radial if args.stock_radial is not None
                     else getattr(config, "LATHE_STOCK_RADIAL", 1.0))
@@ -150,7 +160,7 @@ def main():
         print(f"Заготовка: пруток, +{stock_radial} мм по радиусу (без сортамента)")
     else:
         print(f"Заготовка: прокат по ГОСТ, припуск {allowance_side} мм на сторону"
-              + (" (шестигранник не предлагать)" if args.no_hex_stock else ""))
+              + (" (шестигранный прокат)" if args.hex_stock else " (круг)"))
     print("Извлечение осевого профиля...")
 
     try:
@@ -159,7 +169,9 @@ def main():
             part_out=stem + "_part.step", stock_out=stem + "_stock.stp",
             stock_radial=stock_radial,
             allowance_per_side=allowance_side,
-            prefer_hex=not args.no_hex_stock,
+            prefer_hex=(args.hex_stock
+                        or (getattr(config, "LATHE_PREFER_HEX", False)
+                            and not args.no_hex_stock)),
             use_standard=not args.no_standard_stock,
             profile_step=getattr(config, "LATHE_PROFILE_STEP", 0.1),
             simplify_tol=getattr(config, "LATHE_SIMPLIFY_TOL", 0.01))

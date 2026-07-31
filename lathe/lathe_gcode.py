@@ -234,6 +234,59 @@ def fit_arcs(profile, tol=0.005, min_pts=4, max_radius=5.0, min_sagitta=0.01):
     return segs
 
 
+def _outward_normals(profile):
+    """Внешняя нормаль детали в каждой точке профиля (z по убыванию).
+
+    Направление вдоль профиля берётся центральной разностью, нормаль — поворотом
+    на −90°: n = (d_r, −d_z). На цилиндре даёт (0, 1), то есть строго наружу.
+    """
+    n = len(profile)
+    out = []
+    for i in range(n):
+        j0 = max(0, i - 1)
+        j1 = min(n - 1, i + 1)
+        dz = profile[j1][0] - profile[j0][0]
+        dr = profile[j1][1] - profile[j0][1]
+        norm = (dz * dz + dr * dr) ** 0.5 or 1.0
+        out.append((dr / norm, -dz / norm))
+    return out
+
+
+def compensate_nose(profile, nose_radius, tip=(1.0, -1.0)):
+    """Профиль детали → траектория ПРОГРАММНОЙ ТОЧКИ резца (эквидистанта).
+
+    Зачем. У резца скруглённая вершина R, а мы до сих пор печатали точки самого
+    профиля, как будто вершина острая. На цилиндре и торце это погрешности не
+    даёт, а на КАЖДОМ уклоне даёт — замерено в NX ISV: до 0.3 мм на пологом
+    конусе и 1.65 мм на крутом уступе. Заводская программа идёт с `G40`, то есть
+    коррекция на стойке выключена и эквидистанту считает CAM — делаем так же.
+
+    Геометрия: центр скругления должен идти по эквидистанте детали,
+        C = точка_профиля + R · внешняя_нормаль,
+    а печатаем мы МНИМУЮ ВЕРШИНУ — угол габаритного квадрата вокруг скругления,
+    её положение задаётся положением режущей кромки (Schneidenlage, $TC_DP2):
+        P = C + R · tip,   tip = (±1, −1) в долях R.
+    Радиальная часть −1 обязательна: только с ней цилиндр выходит ровно в
+    программный размер (проверено — цилиндры Ø10 дают ровно 5.000). Осевая
+    часть зависит от соглашения стойки, поэтому вынесена в параметр.
+
+    Профиль может дать самопересечение эквидистанты во вогнутых углах — путь
+    прореживается до монотонного по z, иначе резец пойдёт назад.
+    """
+    if not nose_radius:
+        return list(profile)
+    normals = _outward_normals(profile)
+    path = []
+    for (z, r), (nz, nr) in zip(profile, normals):
+        cz, cr = z + nose_radius * nz, r + nose_radius * nr
+        path.append((cz + nose_radius * tip[0], cr + nose_radius * tip[1]))
+    out = [path[0]]
+    for pt in path[1:]:
+        if pt[0] <= out[-1][0] + 1e-9:        # z не должен расти обратно
+            out.append(pt)
+    return out
+
+
 def generate(prof_data, params):
     """Профиль + параметры → (строки G-кода, статистика)."""
     profile = [(z, r) for z, r in prof_data["profile"]]
@@ -375,22 +428,29 @@ def generate(prof_data, params):
 
     # 3. чистовой проход по профилю — отрезками и ДУГАМИ
     op("Finish")
-    g.append(f"G0 {X(retract_r)} Z{profile[0][0] + clear:.3f}")
-    g.append(f"G0 {X(profile[0][1])} Z{profile[0][0] + clear:.3f}")
-    g.append(f"G1 {X(profile[0][1])} Z{profile[0][0]:.3f} {fmt(feed_finish)}")
     n_arcs = 0
-    if params.get("arcs", True) and raw:
-        # дуги ищем по СЫРОМУ профилю: упрощение уже спрямило скругления,
-        # и по ломаной окружность не восстановить
-        src = sorted([(z, r) for z, r in raw], key=lambda t: -t[0])
+    # ЭКВИДИСТАНТА: чистовой идёт не по профилю детали, а по траектории
+    # ПРОГРАММНОЙ ТОЧКИ резца — иначе на каждом уклоне остаётся зарез r·tg(α).
+    # Считается ДО всего остального: и заход, и дуги должны строиться уже по
+    # ней, иначе первый ход уйдёт назад (заход в одну точку, траектория из
+    # другой) и центры первых дуг посчитаются от чужого начала.
+    nose_r = params.get("nose_radius", 0.4) if params.get("nose_comp", True) else 0.0
+    src = sorted([(z, r) for z, r in (raw or profile)], key=lambda t: -t[0])
+    if nose_r:
+        src = compensate_nose(src, nose_r, params.get("tip_offset", (1.0, -1.0)))
+    if params.get("arcs", True):
+        # дуги ищем по СЫРОМУ (неупрощённому) пути: упрощение уже спрямило
+        # скругления, и по ломаной окружность не восстановить
         segs = compress_lines(fit_arcs(src, params.get("arc_tol", 0.005)),
                               src[0], params.get("line_tol", 0.01))
-        profile = src            # чистовой идёт по сырому профилю
-    elif params.get("arcs", True):
-        segs = fit_arcs(profile, params.get("arc_tol", 0.005))
     else:
-        segs = [("line", z, r) for z, r in profile[1:]]
-    zp, rp = profile[0]
+        segs = [("line", z, r) for z, r in src[1:]]
+    turn_profile = list(profile)  # что оставил T1 (огибающая) — нужно канавкам
+    profile = src                # дальше по тексту чистовой идёт по этому пути
+    g.append(f"G0 {X(retract_r)} Z{src[0][0] + clear:.3f}")
+    g.append(f"G0 {X(src[0][1])} Z{src[0][0] + clear:.3f}")
+    g.append(f"G1 {X(src[0][1])} Z{src[0][0]:.3f} {fmt(feed_finish)}")
+    zp, rp = src[0]
     for s in segs:
         if s[0] == "line":
             _, z, r = s
@@ -457,7 +517,9 @@ def generate(prof_data, params):
             lo, hi = z_c - blade / 2.0, z_c + blade / 2.0
             r_t = max(_max_r_between(part_profile, hi, lo),
                       _r_at(part_profile, hi), _r_at(part_profile, lo))
-            if r_t < _r_at(profile, z_c) - 0.02:      # есть что снимать
+            # сравнивать надо с тем, что оставил проходной резец (огибающая),
+            # а не с эквидистантой чистового прохода
+            if r_t < _r_at(turn_profile, z_c) - 0.02:   # есть что снимать
                 cuts.append((z_c, r_t))
         if not cuts:
             continue
