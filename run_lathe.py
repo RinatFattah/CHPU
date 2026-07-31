@@ -56,6 +56,10 @@ def main():
     ap.add_argument("--no-left-tool", action="store_true",
                     help="не использовать левый проходной резец T3 — участки за "
                          "уступом отдать канавочному (даёт гребёнку) ")
+    ap.add_argument("--finish-only", action="store_true",
+                    help="ОТЛАДКА: без черновых проходов и без припуска — по "
+                         "одной траектории на инструмент, чтобы дефект в "
+                         "результате однозначно относился к своему проходу")
     ap.add_argument("--no-nose-comp", action="store_true",
                     help="не компенсировать радиус при вершине (чистовой пойдёт "
                          "прямо по профилю — оставит зарез r·tg(угол уклона))")
@@ -113,8 +117,10 @@ def main():
     p = {
         "depth_of_cut": args.depth_of_cut if args.depth_of_cut is not None
             else getattr(config, "LATHE_DEPTH_OF_CUT", 1.0),
-        "allowance": args.allowance if args.allowance is not None
-            else getattr(config, "LATHE_ALLOWANCE", 0.2),
+        "allowance": 0.0 if args.finish_only else (
+            args.allowance if args.allowance is not None
+            else getattr(config, "LATHE_ALLOWANCE", 0.2)),
+        "finish_only": args.finish_only,
         "clearance": getattr(config, "LATHE_CLEARANCE", 2.0),
         "feed": getattr(config, "LATHE_FEED", 150.0),
         "feed_finish": getattr(config, "LATHE_FEED_FINISH", 80.0),

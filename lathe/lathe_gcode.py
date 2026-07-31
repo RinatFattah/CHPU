@@ -310,9 +310,9 @@ def generate(prof_data, params):
     # позади (замерено в NX ISV, см. lathe_reach). Поэтому профиль делится на
     # достижимую огибающую (её берёт T1) и канавки (их берёт канавочный T2).
     raw = prof_data.get("profile_raw")
+    from lathe import lathe_reach
     grooves, left_zones, blade, blade_tight = [], [], 0.0, False
     if params.get("groove_tool", True):
-        from lathe import lathe_reach
         env, left_zones, grooves = lathe_reach.split_by_hand(
             raw or prof_data["profile"],
             approach_deg=params.get("approach_angle", 107.5),
@@ -416,8 +416,14 @@ def generate(prof_data, params):
     g.append(f"(Finish operation: FaceOff)")
 
     # 2. черновая продольными проходами
+    #
+    # finish_only — отладочный режим «всё начисто»: черновой нет, припуска нет,
+    # на инструмент остаётся ОДНА траектория. Нужен, чтобы любой дефект в
+    # результате однозначно относился к конкретному проходу, а не был суммой
+    # черновых и чистового. Для настоящей программы не годится: чистовой возьмёт
+    # всю глубину от заготовки до детали за раз.
     n_rough = 0
-    r_level = r_stock - ap
+    r_level = r_stock - ap if not params.get("finish_only") else -1.0
     r_min_target = max(min(r for _, r in profile), 0.0) + allowance
     while r_level > r_min_target:
         # докуда можно идти на этом радиусе: пока деталь ниже уровня
@@ -452,6 +458,17 @@ def generate(prof_data, params):
     src = sorted([(z, r) for z, r in (raw or profile)], key=lambda t: -t[0])
     if nose_r:
         src = compensate_nose(src, nose_r, params.get("tip_offset", (1.0, -1.0)))
+        # ОГРАНИЧЕНИЕ ОГИБАЮЩЕЙ — ПОСЛЕ компенсации, а не до.
+        # Огибающая — это предельное положение ВЕРШИНЫ резца, а не поверхность
+        # детали. Компенсировать её нельзя: компенсация опускает путь ниже
+        # предела, и вспомогательная кромка начинает волочить по соседнему
+        # уступу. На 4-13A так срезался шестигранник — перемычка через канавку
+        # шла на 0.107 мм ниже предела по всей длине.
+        if params.get("groove_tool", True):
+            src, _ = lathe_reach.envelope(
+                src, approach_deg=params.get("approach_angle", 107.5),
+                nose_deg=params.get("nose_angle", 55.0),
+                edge_len=params.get("insert_edge", 6.35))
     if params.get("arcs", True):
         # дуги ищем по СЫРОМУ (неупрощённому) пути: упрощение уже спрямило
         # скругления, и по ломаной окружность не восстановить
