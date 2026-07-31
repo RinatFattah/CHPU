@@ -115,7 +115,7 @@ def envelope(profile, approach_deg=107.5, nose_deg=55.0, edge_len=6.35,
             j += 1
         seg = list(range(i, j))
         r_min = min(rs[k] for k in seg)
-        flat = [zs[k] for k in seg if rs[k] <= r_min + 0.05]
+        flat = [zs[k] for k in seg if rs[k] <= r_min + 0.02]
         vol = sum(math.pi * (env[k] ** 2 - rs[k] ** 2) * dz for k in seg)
         grooves.append({
             "z_hi": zs[seg[0]], "z_lo": zs[seg[-1]], "r_min": r_min,
@@ -137,7 +137,11 @@ def fit_blade(grooves, wanted, w_min=1.0, ignore_below=0.3):
 
     Возвращает (ширина, есть_ли_зона_уже_пластины).
     """
-    widths = [g["width_bottom"] for g in grooves if g["width_bottom"] >= ignore_below]
+    # ЗАПАС на попадание: пластина ровно по ширине дна дойдёт до низа только при
+    # идеальном позиционировании, любой сдвиг — и она сядет на стенку. Берём
+    # чуть уже дна.
+    widths = [g["width_bottom"] - 0.1 for g in grooves
+              if g["width_bottom"] >= ignore_below]
     w = max(w_min, min(wanted, min(widths))) if widths else float(wanted)
     w = math.floor(w * 10) / 10.0                       # до 0.1 мм вниз
     too_narrow = any(0 < g["width_bottom"] < w - 1e-6 for g in grooves)
@@ -200,7 +204,7 @@ def split_by_hand(profile, approach_deg=107.5, nose_deg=55.0, edge_len=6.35,
     grooves = []
     for gz in runs("G"):
         seg_z = [z for z, _ in env_r if gz["z_lo"] <= z <= gz["z_hi"]]
-        flat = [z for z in seg_z if R(z) <= gz["r_min"] + 0.05]
+        flat = [z for z in seg_z if R(z) <= gz["r_min"] + 0.02]
         gz["width_bottom"] = (max(flat) - min(flat)) if len(flat) > 1 else 0.0
         grooves.append(gz)
     return env_r, runs("L"), grooves

@@ -56,6 +56,10 @@ def main():
     ap.add_argument("--no-left-tool", action="store_true",
                     help="не использовать левый проходной резец T3 — участки за "
                          "уступом отдать канавочному (даёт гребёнку) ")
+    ap.add_argument("--groove-contour", action="store_true",
+                    help="ЭКСПЕРИМЕНТ: чистовой контур канавки углом пластины "
+                         "после врезаний (чистит донья, но пока даёт зарез на "
+                         "границе канавки)")
     ap.add_argument("--finish-only", action="store_true",
                     help="ОТЛАДКА: без черновых проходов и без припуска — по "
                          "одной траектории на инструмент, чтобы дефект в "
@@ -121,6 +125,7 @@ def main():
             args.allowance if args.allowance is not None
             else getattr(config, "LATHE_ALLOWANCE", 0.2)),
         "finish_only": args.finish_only,
+        "groove_contour": args.groove_contour,
         "clearance": getattr(config, "LATHE_CLEARANCE", 2.0),
         "feed": getattr(config, "LATHE_FEED", 150.0),
         "feed_finish": getattr(config, "LATHE_FEED_FINISH", 80.0),
@@ -204,6 +209,9 @@ def main():
         print(f"   T3 левый проходной: {stats['left_passes']} проход(а), "
               f"{stats['left_volume_mm3']:.0f} мм³ — правому резцу за уступ "
               f"не зайти")
+    if stats.get("uncut_mm3"):
+        print(f"   ⚠  НЕ ОБРАБОТАНО: {stats['uncut_mm3']:.0f} мм³ "
+              f"(второй установ + недобранные донья канавок)")
     for z_hi, z_lo, vol in stats.get("second_setup", []):
         print(f"   ↦ ВТОРОЙ УСТАНОВ: z {z_hi:.1f}..{z_lo:.1f}, {vol:.0f} мм³ — "
               f"упирается в торец детали, в этом установе не обработать")

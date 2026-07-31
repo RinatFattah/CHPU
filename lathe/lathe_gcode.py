@@ -415,36 +415,13 @@ def generate(prof_data, params):
         g.append(f"G0 {X(r_stock + clear)} Z{z:.3f}")
     g.append(f"(Finish operation: FaceOff)")
 
-    # 2. черновая продольными проходами
-    #
-    # finish_only — отладочный режим «всё начисто»: черновой нет, припуска нет,
-    # на инструмент остаётся ОДНА траектория. Нужен, чтобы любой дефект в
-    # результате однозначно относился к конкретному проходу, а не был суммой
-    # черновых и чистового. Для настоящей программы не годится: чистовой возьмёт
-    # всю глубину от заготовки до детали за раз.
+    # ЧЕРНОВОЙ НЕТ. Убрана намеренно: проходы постоянного радиуса не знают ни
+    # компенсации радиуса при вершине, ни ограничения огибающей, и волочат
+    # кромкой на каждом уклоне — замерено, они давали зарез 0.29 мм на уступе
+    # 43° и 1.23 мм на уступе 75°, тогда как один чистовой проход даёт 0.04.
+    # Съём идёт за один проход на инструмент; для настоящего станка это надо
+    # будет вернуть, но уже с той же дисциплиной по огибающей, что у чистового.
     n_rough = 0
-    r_level = r_stock - ap if not params.get("finish_only") else -1.0
-    r_min_target = max(min(r for _, r in profile), 0.0) + allowance
-    while r_level > r_min_target:
-        # докуда можно идти на этом радиусе: пока деталь ниже уровня
-        z = profile[0][0]
-        z_stop = z
-        step = params["scan_step"]
-        while z > z_end:
-            z_next = max(z - step, z_end)
-            if _max_r_between(profile, z, z_next) + allowance > r_level:
-                break
-            z_stop = z_next
-            z = z_next
-        if z_stop < profile[0][0] - 1e-6:
-            n_rough += 1
-            op(f"Rough{n_rough}")
-            g.append(f"G0 {X(r_level)} Z{profile[0][0] + clear:.3f}")
-            g.append(f"G1 {X(r_level)} Z{z_stop:.3f} {fmt(feed)}")
-            g.append(f"G0 {X(r_level + clear)} Z{z_stop:.3f}")
-            g.append(f"G0 {X(r_level + clear)} Z{profile[0][0] + clear:.3f}")
-            g.append(f"(Finish operation: Rough{n_rough})")
-        r_level -= ap
 
     # 3. чистовой проход по профилю — отрезками и ДУГАМИ
     op("Finish")
@@ -547,6 +524,7 @@ def generate(prof_data, params):
     # ISV — так срезался шестигранник у 4-13A). Заводской техпроцесс делает
     # ровно это: канавки и отрезка отдельным канавочным резцом.
     n_groove = 0
+    groove_cuts = []
     t2 = params.get("groove_tool_number", 2)
     want_partoff = params.get("partoff", True)
     if grooves or (want_partoff and blade):
@@ -579,8 +557,15 @@ def generate(prof_data, params):
             n_cut = int((span - blade) / step_cut + 0.999) + 1
             zs_cut = [z_hi - blade / 2.0
                       - i * (span - blade) / (n_cut - 1) for i in range(n_cut)]
-        z_deep = min(((_r_at(part_profile, z_hi - k * span / 100.0),
-                       z_hi - k * span / 100.0) for k in range(101)))[1]
+        # ЦЕНТР ДНА канавки. Не «первый минимум»: дно бывает шириной с пластину
+        # (у 4-13A 1.55 мм при пластине 1.5), и попасть в него можно только
+        # серединой — со сдвигом хоть на 0.1 мм пластина заденет стенку, и
+        # ограничитель глубины не пустит резец вниз.
+        samples = [(z_hi - k * span / 200.0) for k in range(201)]
+        rr = [_r_at(part_profile, z) for z in samples]
+        r_low = min(rr)
+        flat = [z for z, r in zip(samples, rr) if r <= r_low + 0.02]
+        z_deep = (max(flat) + min(flat)) / 2.0
         if all(abs(z_deep - z) > blade * 0.1 for z in zs_cut):
             zs_cut.append(z_deep)
             zs_cut.sort(reverse=True)
@@ -595,12 +580,38 @@ def generate(prof_data, params):
             # а не с эквидистантой чистового прохода
             if r_t < _r_at(turn_profile, z_c) - 0.02:   # есть что снимать
                 cuts.append((z_c, r_t))
+        groove_cuts.append(cuts)
         if not cuts:
             continue
         n_groove += 1
         op(f"Groove{n_groove}")
         for z_c, r_t in cuts:
             plunge(z_c, r_t)
+        # ЧИСТОВОЙ КОНТУР канавки. Врезания оставляют стенки ступеньками — их
+        # снимает проход УГЛОМ пластины: чтобы угол шёл по стенке, центр
+        # пластины смещён на полширины В СТОРОНУ ДНА. Спускаемся по стенке со
+        # стороны торца, идём по дну, поднимаемся по дальней стенке.
+        prof_g = [(z, r) for z, r in part_raw
+                  if z_lo - 1e-9 <= z <= z_hi + 1e-9]
+        # ПО УМОЛЧАНИЮ ВЫКЛЮЧЕН: замерено, что контур чистит донья, но даёт
+        # новый зарез на границе канавки (на 4-13A −2.55 мм у стенки к
+        # шестиграннику и −0.34 у второй канавки). Причина не разобрана,
+        # поэтому в дефолт не берём.
+        if params.get("groove_contour") and len(prof_g) >= 3:
+            r_low = min(r for _, r in prof_g)
+            flat = [z for z, r in prof_g if r <= r_low + 0.02]
+            z_mid = (max(flat) + min(flat)) / 2.0 if flat else (z_hi + z_lo) / 2
+            contour = []
+            for z, r in sorted(prof_g, key=lambda t: -t[0]):
+                zc = z - blade / 2.0 if z > z_mid else z + blade / 2.0
+                if z_lo - blade <= zc <= z_hi + blade:
+                    contour.append((zc, r))
+            if contour:
+                g.append(f"G0 {X(retract_r)} Z{contour[0][0]:.3f}")
+                g.append(f"G0 {X(contour[0][1])} Z{contour[0][0]:.3f}")
+                for zc, r in contour[1:]:
+                    g.append(f"G1 {X(r)} Z{zc:.3f} {fmt(feed_partoff)}")
+                g.append(f"G0 {X(retract_r)} Z{contour[-1][0]:.3f}")
         g.append(f"(Finish operation: Groove{n_groove})")
 
     if want_partoff:
@@ -614,6 +625,18 @@ def generate(prof_data, params):
         g.append(f"G0 {X(retract_r)} Z{z_cut:.3f}")
         g.append("(Finish operation: Partoff)")
 
+    # Сколько осталось нетронутым: считаем по врезаниям канавочного, до какого
+    # радиуса он реально добрался, и сравниваем с номиналом. Это честная строка
+    # отчёта — лучше назвать остаток, чем сделать вид, что деталь готова.
+    import math as _m
+    uncut = sum(lz["volume_mm3"] for lz in second_setup)
+    for gr, cuts in zip(grooves, groove_cuts):
+        if not cuts:
+            uncut += gr["volume_mm3"]
+            continue
+        reached = min(r for _, r in cuts)
+        uncut += _m.pi * max(0.0, reached ** 2 - gr["r_min"] ** 2) *             (gr["z_hi"] - gr["z_lo"])
+
     g.append(f"G0 {X(retract_r)} Z{z_top + clear + 10:.3f}")
     g.append("M5")
     g.append("M2")
@@ -626,7 +649,8 @@ def generate(prof_data, params):
              "left_passes": n_left,
              "left_volume_mm3": sum(lz["volume_mm3"] for lz in doable),
              "second_setup": [(lz["z_hi"], lz["z_lo"], lz["volume_mm3"])
-                              for lz in second_setup]}
+                              for lz in second_setup],
+             "uncut_mm3": uncut}
     return g, stats
 
 
