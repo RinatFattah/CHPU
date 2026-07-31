@@ -53,6 +53,9 @@ def main():
                          "круг — как на заводе, грани отдельной операцией")
     ap.add_argument("--no-hex-stock", action="store_true",
                     help=argparse.SUPPRESS)   # устаревший: круг и так по умолчанию
+    ap.add_argument("--no-left-tool", action="store_true",
+                    help="не использовать левый проходной резец T3 — участки за "
+                         "уступом отдать канавочному (даёт гребёнку) ")
     ap.add_argument("--no-nose-comp", action="store_true",
                     help="не компенсировать радиус при вершине (чистовой пойдёт "
                          "прямо по профилю — оставит зарез r·tg(угол уклона))")
@@ -139,6 +142,9 @@ def main():
                          else getattr(config, "LATHE_GROOVE_WIDTH", 3.0)),
         "groove_width_min": getattr(config, "LATHE_GROOVE_WIDTH_MIN", 1.0),
         "groove_tool_number": getattr(config, "LATHE_GROOVE_TOOL_NUMBER", 2),
+        "left_tool": (not args.no_left_tool
+                      and getattr(config, "LATHE_LEFT_TOOL", True)),
+        "left_tool_number": getattr(config, "LATHE_LEFT_TOOL_NUMBER", 3),
         # компенсация радиуса при вершине (эквидистанта в чистовом проходе)
         "nose_comp": (not args.no_nose_comp
                       and getattr(config, "LATHE_NOSE_COMP", True)),
@@ -188,6 +194,13 @@ def main():
     print(f"   операции: {', '.join(stats['ops'][:8])}"
           + (f" … всего {len(stats['ops'])}" if len(stats['ops']) > 8 else "")
           + (f" | дуг в чистовом: {stats['arcs']}" if stats.get("arcs") else ""))
+    if stats.get("left_passes"):
+        print(f"   T3 левый проходной: {stats['left_passes']} проход(а), "
+              f"{stats['left_volume_mm3']:.0f} мм³ — правому резцу за уступ "
+              f"не зайти")
+    for z_hi, z_lo, vol in stats.get("second_setup", []):
+        print(f"   ↦ ВТОРОЙ УСТАНОВ: z {z_hi:.1f}..{z_lo:.1f}, {vol:.0f} мм³ — "
+              f"упирается в торец детали, в этом установе не обработать")
     if stats.get("blade"):
         print(f"   T2 канавочный: пластина {stats['blade']:.2f} мм, "
               f"{stats['grooves']} канавк(и) объёмом "
@@ -232,7 +245,10 @@ def main():
                                         nose_angle=p["nose_angle"],
                                         insert_size=p["insert_edge"],
                                         groove_width=stats.get("blade") or 0.0,
-                                        groove_tool_number=p["groove_tool_number"])
+                                        groove_tool_number=p["groove_tool_number"],
+                                        left_tool_number=(p["left_tool_number"]
+                                                          if stats.get("left_passes")
+                                                          else 0))
         except Exception as e:
             print(f"⚠  NX-симуляция не удалась: {e}")
             sys.exit(2)

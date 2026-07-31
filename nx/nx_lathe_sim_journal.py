@@ -130,14 +130,21 @@ def first_existing(collection, names):
 POCKETS = [f"POCKET_{i:02d}" for i in range(1, 13)] + ["GENERIC_MACHINE"]
 
 
-def make_tool(setup, subtype, uname, props, used, report):
-    """Резец подтипа `subtype` в первом свободном кармане револьвера.
+def make_tool(setup, subtype, uname, props, used, report, pocket_no=None):
+    """Резец подтипа `subtype` в кармане револьвера с номером pocket_no.
+
+    НОМЕР КАРМАНА ОБЯЗАН СОВПАДАТЬ С НОМЕРОМ ИНСТРУМЕНТА в программе: стойка
+    поворачивает револьвер на станцию по номеру T, а не ищет инструмент по
+    TlNumber. Если положить T3 в POCKET_02, то команда T2 возьмёт левый резец —
+    проверено, отрезка тогда идёт полноразмерной пластиной и протаскивает
+    концевой конус на 3 мм.
 
     props — [(имя свойства билдера, значение)]; report — какие свойства
     перечитать ПОСЛЕ Commit новым билдером и напечатать: только так видно, что
     реально сохранилось в резце, а что осталось унаследованным от кармана.
     """
-    for pname in POCKETS:
+    order = ([f"POCKET_{pocket_no:02d}"] if pocket_no else []) + POCKETS
+    for pname in order:
         if pname in used:
             continue
         try:
@@ -303,9 +310,24 @@ def main():
         props.append((name if name.endswith("Builder") else name + "Builder", val))
     make_tool(setup, subtype, "TURN_OD", props, used,
               ("OrientAngleBuilder", "NoseAngleBuilder", "NoseRadiusBuilder",
-               "SizeBuilder", "ReliefAngleBuilder"))
+               "SizeBuilder", "ReliefAngleBuilder"),
+              pocket_no=int(p.get("tool_number", 1)))
     log("(форму съёма задаёт ПОДТИП: φ₁ = 180 − φ − ε — вспомогательный угол "
         "в плане; чем он меньше, тем сильнее резец волочит по готовой стенке)")
+
+    # Левый проходной T3 — зеркальный подтип. Он берёт участки, куда правый не
+    # заходит (за уступом, остающимся у него позади). Тип тот же токарный,
+    # поэтому ISV его проводит нормально — в отличие от канавочного.
+    lt = int(p.get("left_tool_number") or 0)
+    if lt:
+        make_tool(setup, p.get("left_subtype", "OD_55_L"), "TURN_OD_L",
+                  [("NoseRadiusBuilder", float(p.get("nose_radius", 0.4))),
+                   ("TlNumberBuilder", lt),
+                   ("NoseAngleBuilder", float(p.get("nose_angle", 55.0))),
+                   ("SizeBuilder", float(p.get("insert_size", 6.35)))],
+                  used,
+                  ("OrientAngleBuilder", "NoseAngleBuilder", "NoseRadiusBuilder",
+                   "SizeBuilder"), pocket_no=lt)
 
     # Канавочный резец T2. Программа отдаёт ему канавки и отрезку — то, куда
     # проходной физически не лезет. Если его не создать, стойка на T2 возьмёт
@@ -343,6 +365,8 @@ def main():
                 f"подменён узкой проходной пластиной {gsub} шириной {gw} мм — "
                 f"ISV параметрический канавочный не проводит")
         make_tool(setup, gsub, "TURN_GROOVE", gprops, used,
+                  pocket_no=int(p.get("groove_tool_number", 2)),
+                  report=
                   ("InsertWidthBuilder", "SizeBuilder", "RadiusBuilder",
                    "NoseRadiusBuilder", "ThicknessBuilder", "OrientAngleBuilder"))
 

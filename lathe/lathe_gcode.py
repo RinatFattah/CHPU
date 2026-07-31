@@ -287,26 +287,40 @@ def compensate_nose(profile, nose_radius, tip=(1.0, -1.0)):
     return out
 
 
+def compensate_nose_left(profile_asc, nose_radius, tip=(1.0, -1.0)):
+    """Эквидистанта для ЛЕВОГО резца (идёт в +Z). Профиль подаётся по
+    возрастанию z. Считается зеркалированием по z и той же функцией, что для
+    правого, — чтобы не заводить вторую реализацию, которая разойдётся."""
+    mirrored = [(-z, r) for z, r in profile_asc]        # тут z уже по убыванию
+    out = compensate_nose(mirrored, nose_radius, tip)
+    return [(-z, r) for z, r in out]
+
+
 def generate(prof_data, params):
     """Профиль + параметры → (строки G-кода, статистика)."""
     profile = [(z, r) for z, r in prof_data["profile"]]
     profile.sort(key=lambda p: -p[0])            # от торца (Z max) вглубь
     part_profile = list(profile)                 # НОМИНАЛ детали, до огибающей
+    part_raw = sorted([(z, r) for z, r in (prof_data.get("profile_raw")
+                                          or prof_data["profile"])],
+                      key=lambda t: -t[0])       # сырой номинал, для левого резца
 
     # Разделение работы между инструментами. Проходной резец — клин, и в канавку
     # он не лезет: вспомогательная кромка волочит по уже обточенной стенке
     # позади (замерено в NX ISV, см. lathe_reach). Поэтому профиль делится на
     # достижимую огибающую (её берёт T1) и канавки (их берёт канавочный T2).
     raw = prof_data.get("profile_raw")
-    grooves, blade, blade_tight = [], 0.0, False
+    grooves, left_zones, blade, blade_tight = [], [], 0.0, False
     if params.get("groove_tool", True):
         from lathe import lathe_reach
-        env, grooves = lathe_reach.envelope(
+        env, left_zones, grooves = lathe_reach.split_by_hand(
             raw or prof_data["profile"],
             approach_deg=params.get("approach_angle", 107.5),
             nose_deg=params.get("nose_angle", 55.0),
             edge_len=params.get("insert_edge", 6.35))
-        if grooves:
+        if not params.get("left_tool", True):
+            left_zones = []          # без левого резца — всё как раньше
+        if grooves or left_zones:
             blade, blade_tight = lathe_reach.fit_blade(
                 grooves, params.get("groove_width", 3.0),
                 params.get("groove_width_min", 1.0))
@@ -466,6 +480,49 @@ def generate(prof_data, params):
     g.append(f"G0 {X(retract_r)} Z{z_end:.3f}")
     g.append("(Finish operation: Finish)")
 
+
+    # 3b. ЛЕВЫЙ проходной резец T3 — то, куда правый не достаёт
+    #
+    # Правый резец не заходит за уступ, который остаётся у него ПОЗАДИ, со
+    # стороны торца: вспомогательная кромка волочит по нему (это и срезало
+    # шестигранник). У левого кромки зеркальны, он точит от патрона (+Z) и эти
+    # участки берёт штатно. Заводской комплект 14-31A устроен так же: правый
+    # проходной OD_55_L, левый OD_35_L, канавочный.
+    #
+    # Участок, упирающийся В ТОРЕЦ ДЕТАЛИ, левому недоступен тоже: заходить
+    # некуда, там ещё не отрезанный пруток. Это честно ВТОРОЙ УСТАНОВ — так же
+    # поступает завод (UST1.NC + UST2.NC), и мы его не режем, а выносим в отчёт.
+    n_left = 0
+    second_setup = []
+    doable = []
+    for lz in left_zones:
+        (second_setup if lz["z_lo"] <= z_end + 1e-6 else doable).append(lz)
+    if doable:
+        g.append(f"G0 {X(retract_r)} Z{z_top + clear:.3f}")
+        g.append("M5")
+        g.append(f"T{params.get('left_tool_number', 3)}")
+        g.append("M6")
+        g.append(f"G97 S{rpm} M3")
+        g.append("(Tool T%d: left-hand turning insert, cuts towards +Z)"
+                 % params.get("left_tool_number", 3))
+    for lz in doable:
+        pts = sorted([(z, r) for z, r in part_raw
+                      if lz["z_lo"] - 1e-9 <= z <= lz["z_hi"] + 1e-9],
+                     key=lambda t: t[0])          # по возрастанию z: идём в +Z
+        if len(pts) < 2:
+            continue
+        path = (compensate_nose_left(pts, nose_r, params.get("tip_offset", (1.0, -1.0)))
+                if nose_r else pts)
+        n_left += 1
+        op(f"LeftTurn{n_left}")
+        # подход радиально в том z, где правый резец уже снял материал до профиля
+        g.append(f"G0 {X(retract_r)} Z{path[0][0]:.3f}")
+        g.append(f"G0 {X(path[0][1])} Z{path[0][0]:.3f}")
+        for z, r in path[1:]:
+            g.append(f"G1 {X(r)} Z{z:.3f} {fmt(feed_finish)}")
+        g.append(f"G0 {X(retract_r)} Z{path[-1][0]:.3f}")
+        g.append(f"(Finish operation: LeftTurn{n_left})")
+
     # 4. канавки и отрезка — КАНАВОЧНЫМ резцом T2
     #
     # Проходной резец сюда не лезет: он клин, и врезаясь вглубь волочит
@@ -548,7 +605,11 @@ def generate(prof_data, params):
              "stock_radius": r_stock, "profile_points": len(profile),
              "arcs": n_arcs, "grooves": n_groove, "blade": blade,
              "blade_tight": blade_tight,
-             "groove_volume_mm3": sum(gr["volume_mm3"] for gr in grooves)}
+             "groove_volume_mm3": sum(gr["volume_mm3"] for gr in grooves),
+             "left_passes": n_left,
+             "left_volume_mm3": sum(lz["volume_mm3"] for lz in doable),
+             "second_setup": [(lz["z_hi"], lz["z_lo"], lz["volume_mm3"])
+                              for lz in second_setup]}
     return g, stats
 
 

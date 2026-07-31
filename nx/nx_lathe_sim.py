@@ -226,7 +226,8 @@ def gcode_to_mpf(gcode_path, mpf_path, tool_number=1):
 def write_to_ini(machine_dir, nose_radius, tool_number=1,
                  insert_position=INSERT_POSITION_OD_RIGHT,
                  length_x=0.0, length_z=0.0,
-                 groove_width=0.0, groove_tool_number=2):
+                 groove_width=0.0, groove_tool_number=2,
+                 left_tool_number=0):
     """TO_INI.SPF для ТОКАРНЫХ резцов (проходной T1 + канавочный T2).
 
     Отличия от фрезы (см. nx_sim.write_to_ini): $TC_DP1 = 500 — тип «токарный
@@ -260,6 +261,16 @@ def write_to_ini(machine_dir, nose_radius, tool_number=1,
             f'$TC_DP6[{groove_tool_number},1]=0{nl}'
             f'$TC_DP7[{groove_tool_number},1]={groove_width:g}{nl}'
         )
+    if left_tool_number:
+        content += (
+            f'$TC_TP1[{left_tool_number}]={left_tool_number}{nl}'
+            f'$TC_TP2[{left_tool_number}]="TURN_OD_L"{nl}'
+            f'$TC_DP1[{left_tool_number},1]=500{nl}'
+            f'$TC_DP2[{left_tool_number},1]=4{nl}'   # левый: другая Schneidenlage
+            f'$TC_DP3[{left_tool_number},1]=0{nl}'
+            f'$TC_DP4[{left_tool_number},1]=0{nl}'
+            f'$TC_DP6[{left_tool_number},1]={nose_radius:g}{nl}'
+        )
     content += "M17" + nl
     path = os.path.join(sub, "TO_INI.SPF")
     try:
@@ -284,7 +295,8 @@ def write_to_ini(machine_dir, nose_radius, tool_number=1,
 def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
              machine=None, nose_angle=None, insert_size=None,
              relief_angle=None, tool_params=None, groove_width=0.0,
-             groove_tool_number=2, groove_params=None):
+             groove_tool_number=2, groove_params=None,
+             left_tool_number=0):
     """Прогоняет токарный G-Code на виртуальном станке NX ISV.
 
     Результат возвращается в раме ДЕТАЛИ (ось Z): заготовку сажают на ось
@@ -307,7 +319,8 @@ def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
         raise RuntimeError(f"файл заготовки не найден: {stock_step_path}")
 
     write_to_ini(mdir, nose_radius, groove_width=groove_width,
-                 groove_tool_number=groove_tool_number)
+                 groove_tool_number=groove_tool_number,
+                 left_tool_number=left_tool_number)
 
     if out_stem is None:
         out_stem = os.path.splitext(os.path.abspath(gcode_path))[0]
@@ -401,6 +414,9 @@ def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
                                   "OD_GROOVE_L"),
         "groove_orient_angle": getattr(config, "NX_LATHE_GROOVE_ORIENT_ANGLE",
                                        None),
+        # левый проходной T3 — зеркальный подтип того же класса
+        "left_tool_number": int(left_tool_number or 0),
+        "left_subtype": getattr(config, "NX_LATHE_LEFT_SUBTYPE", "OD_55_L"),
         "groove_geometry": getattr(config, "NX_LATHE_GROOVE_GEOMETRY", True),
         "groove_params": dict(getattr(config, "NX_LATHE_GROOVE_PARAMS", None)
                               or {}, **(groove_params or {})),
