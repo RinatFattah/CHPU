@@ -432,13 +432,24 @@ def generate(prof_data, params):
     for gr in grooves:
         z_hi, z_lo = gr["z_hi"], gr["z_lo"]
         span = z_hi - z_lo
-        # позиции врезаний с перекрытием в половину пластины
+        # Позиции врезаний. Шаг мелкий (четверть пластины) не ради красоты:
+        # глубина каждого врезания ограничена профилем под ВСЕЙ шириной
+        # пластины, поэтому у крутой стенки резец вглубь не идёт, и попасть в
+        # узкое дно можно только частой сеткой. Плюс отдельно ставится позиция
+        # ПО САМОМУ ДНУ канавки — иначе при дне шириной с пластину её можно
+        # проскочить и оставить канавку невыбранной.
         if span <= blade:
             zs_cut = [(z_hi + z_lo) / 2.0]
         else:
-            n_cut = max(2, int((span - blade) / (blade * 0.5) + 0.999) + 1)
+            step_cut = max(blade * 0.25, 0.1)
+            n_cut = int((span - blade) / step_cut + 0.999) + 1
             zs_cut = [z_hi - blade / 2.0
                       - i * (span - blade) / (n_cut - 1) for i in range(n_cut)]
+        z_deep = min(((_r_at(part_profile, z_hi - k * span / 100.0),
+                       z_hi - k * span / 100.0) for k in range(101)))[1]
+        if all(abs(z_deep - z) > blade * 0.1 for z in zs_cut):
+            zs_cut.append(z_deep)
+            zs_cut.sort(reverse=True)
         cuts = []
         for z_c in zs_cut:
             # глубина ограничена профилем под ВСЕЙ пластиной: так резец не

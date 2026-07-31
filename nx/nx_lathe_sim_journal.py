@@ -155,10 +155,16 @@ def make_tool(setup, subtype, uname, props, used, report):
         used.add(pname)
         tb = setup.CAMGroupCollection.CreateMillToolBuilder(tool)
         for prop, val in props:
+            # часть свойств — билдеры (значение в .Value), часть простые
+            # атрибуты (HolderUse, AdapterUse); пробуем оба вида
             try:
                 getattr(tb, prop).Value = val
-            except Exception as e:
-                log(f"warn: {prop}={val} не применилось: {type(e).__name__}: {e}")
+            except Exception:
+                try:
+                    setattr(tb, prop.replace("Builder", ""), val)
+                except Exception as e:
+                    log(f"warn: {prop}={val} не применилось: "
+                        f"{type(e).__name__}: {e}")
         tb.Commit()
         tb.Destroy()
         check = []
@@ -306,21 +312,39 @@ def main():
     # что попало и съём пойдёт чужой формой.
     gw = float(p.get("groove_width") or 0.0)
     if gw > 0:
-        # NoseWidth — РЕЖУЩАЯ ширина пластины. В шаблоне она 0, и с нулём ISV
-        # не строит форму съёма: программа исполняется, но материал не снимается
-        # и IPW не сохраняется вовсе (проверено). InsertWidth задаёт корпус.
-        make_tool(setup, p.get("groove_subtype", "OD_GROOVE_L"), "TURN_GROOVE",
-                  [("InsertWidthBuilder", gw),
-                   ("NoseWidthBuilder", gw),
-                   # в кармане револьвера канавочный наследует OrientAngle=180
-                   # (пластина смотрит вдоль оси) — для НАРУЖНОЙ канавки нужно
-                   # 90°, иначе врезаться нечем
-                   ("OrientAngleBuilder",
-                    float(p.get("groove_orient_angle") or 90.0)),
-                   ("TlNumberBuilder", int(p.get("groove_tool_number", 2)))],
-                  used,
-                  ("InsertWidthBuilder", "NoseWidthBuilder", "ThicknessBuilder",
-                   "OrientAngleBuilder"))
+        # У канавочного СВОЙ билдер (GrooveToolBuilder) и свой набор свойств:
+        # InsertWidth (ширина пластины), InsertLength, Radius (радиус уголка),
+        # SideAngle, Thickness. NoseWidth/NoseRadius у него НЕ СУЩЕСТВУЮТ
+        # (None) — их выставлять бессмысленно. Геометрию правим по флагу:
+        # шаблонная заведомо валидна, а наша могла оказаться вырожденной.
+        gsub = p.get("groove_subtype", "OD_55_R")
+        gprops = [("TlNumberBuilder", int(p.get("groove_tool_number", 2)))]
+        if p.get("groove_geometry", True):
+            if gsub.startswith("OD_GROOVE"):
+                gprops.append(("InsertWidthBuilder", gw))
+                if p.get("groove_orient_angle") is not None:
+                    gprops.append(("OrientAngleBuilder",
+                                   float(p["groove_orient_angle"])))
+            else:
+                # ПОДСТАНОВКА: настоящий канавочный ISV не тянет (роняет прогон
+                # сразу после смены инструмента, без сообщения — проверено на
+                # OD_GROOVE_L и OD_GROOVE_L_FNR, в POCKET_01 и POCKET_02, со
+                # штатной и с нашей геометрией, с державкой и без). Вместо него
+                # ставим УЗКУЮ ПРОХОДНУЮ пластину шириной с канавочную: врезание
+                # моделируется, погрешность по стенкам канавки ≤ w·tg(φ₁).
+                gprops.append(("SizeBuilder", gw))
+                gprops.append(("NoseRadiusBuilder",
+                               float(p.get("nose_radius", 0.4))))
+        for name, val in (p.get("groove_params") or {}).items():
+            gprops.append((name if name.endswith("Builder") else name + "Builder",
+                           val))
+        if not gsub.startswith("OD_GROOVE"):
+            log(f"ВНИМАНИЕ: канавочный T{p.get('groove_tool_number', 2)} "
+                f"подменён узкой проходной пластиной {gsub} шириной {gw} мм — "
+                f"ISV параметрический канавочный не проводит")
+        make_tool(setup, gsub, "TURN_GROOVE", gprops, used,
+                  ("InsertWidthBuilder", "SizeBuilder", "RadiusBuilder",
+                   "NoseRadiusBuilder", "ThicknessBuilder", "OrientAngleBuilder"))
 
     # ── 6. K-компоненты PART/BLANK ──
     kin = work_part.KinematicConfigurator

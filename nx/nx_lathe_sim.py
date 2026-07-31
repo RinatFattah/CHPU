@@ -284,7 +284,7 @@ def write_to_ini(machine_dir, nose_radius, tool_number=1,
 def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
              machine=None, nose_angle=None, insert_size=None,
              relief_angle=None, tool_params=None, groove_width=0.0,
-             groove_tool_number=2):
+             groove_tool_number=2, groove_params=None):
     """Прогоняет токарный G-Code на виртуальном станке NX ISV.
 
     Результат возвращается в раме ДЕТАЛИ (ось Z): заготовку сажают на ось
@@ -400,7 +400,10 @@ def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
         "groove_subtype": getattr(config, "NX_LATHE_GROOVE_SUBTYPE",
                                   "OD_GROOVE_L"),
         "groove_orient_angle": getattr(config, "NX_LATHE_GROOVE_ORIENT_ANGLE",
-                                       90.0),
+                                       None),
+        "groove_geometry": getattr(config, "NX_LATHE_GROOVE_GEOMETRY", True),
+        "groove_params": dict(getattr(config, "NX_LATHE_GROOVE_PARAMS", None)
+                              or {}, **(groove_params or {})),
         # Задний угол пластины — в параметрической модели ISV это ЗАДНЯЯ ГРАНЬ,
         # то есть та самая граница инструмента со стороны +Z. Она и определяет,
         # насколько резец волочит по уже обточенной поверхности, когда врезается
