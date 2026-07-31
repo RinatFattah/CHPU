@@ -37,7 +37,8 @@ def main():
     ap.add_argument("gcode", nargs="?", help="куда писать G-Code")
     ap.add_argument("--config", metavar="FILE", help="YAML-конфиг")
     ap.add_argument("--depth-of-cut", type=float, help="глубина резания за проход, мм")
-    ap.add_argument("--allowance", type=float, help="припуск на чистовую, мм")
+    ap.add_argument("--allowance", type=float,
+                    help="припуск на чистовую по радиусу, мм (дефолт 0.2)")
     ap.add_argument("--stock-radial", type=float,
                     help="припуск заготовки-прутка по радиусу, мм "
                          "(только при --no-standard-stock)")
@@ -59,8 +60,24 @@ def main():
     ap.add_argument("--no-arcs", action="store_true",
                     help="чистовой проход только отрезками (без G2/G3)")
     ap.add_argument("--no-partoff", action="store_true", help="без отрезки")
+    ap.add_argument("--no-groove-tool", action="store_true",
+                    help="не выделять канавки отдельному резцу T2 — всё одним "
+                         "проходным (прежнее поведение; проходной резец в канавку "
+                         "физически не лезет и подрезает стенку позади)")
+    ap.add_argument("--groove-width", type=float, metavar="MM",
+                    help="ширина канавочной пластины, мм (дефолт 3.0; под более "
+                         "узкую канавку подбирается автоматически)")
     ap.add_argument("--simulate", action="store_true",
-                    help="прогнать на токарном станке NX ISV")
+                    help="после генерации прогнать G-Code на виртуальном "
+                         "токарном станке NX ISV (нужен установленный NX); "
+                         "результат — обработанная заготовка <gcode>_nxsim.stp "
+                         "и _nxsim.prt (как --simulate у фрезеровки)")
+    ap.add_argument("--simulate-own", action="store_true",
+                    help="съём нашей собственной моделью (быстро, но это "
+                         "самопроверка: генератор и симулятор писались вместе, "
+                         "не независимая проверка) → <gcode>_sim.step")
+    ap.add_argument("--nx-simulate", dest="simulate", action="store_true",
+                    help=argparse.SUPPRESS)  # устаревший алиас для --simulate
     args = ap.parse_args()
 
     if args.config:
@@ -88,7 +105,7 @@ def main():
         "depth_of_cut": args.depth_of_cut if args.depth_of_cut is not None
             else getattr(config, "LATHE_DEPTH_OF_CUT", 1.0),
         "allowance": args.allowance if args.allowance is not None
-            else getattr(config, "LATHE_ALLOWANCE", 0.3),
+            else getattr(config, "LATHE_ALLOWANCE", 0.2),
         "clearance": getattr(config, "LATHE_CLEARANCE", 2.0),
         "feed": getattr(config, "LATHE_FEED", 150.0),
         "feed_finish": getattr(config, "LATHE_FEED_FINISH", 80.0),
@@ -105,6 +122,17 @@ def main():
         "nose_radius": getattr(config, "LATHE_NOSE_RADIUS", 0.4),
         "arcs": not args.no_arcs,
         "arc_tol": getattr(config, "LATHE_ARC_TOL", 0.005),
+        # проходной резец: чем он достаёт, считает lathe_reach
+        "nose_angle": getattr(config, "LATHE_NOSE_ANGLE", 55.0),
+        "approach_angle": getattr(config, "LATHE_APPROACH_ANGLE", 107.5),
+        "insert_edge": getattr(config, "LATHE_INSERT_SIZE", 6.35),
+        # канавочный резец T2
+        "groove_tool": (not args.no_groove_tool
+                        and getattr(config, "LATHE_GROOVE_TOOL", True)),
+        "groove_width": (args.groove_width if args.groove_width is not None
+                         else getattr(config, "LATHE_GROOVE_WIDTH", 3.0)),
+        "groove_width_min": getattr(config, "LATHE_GROOVE_WIDTH_MIN", 1.0),
+        "groove_tool_number": getattr(config, "LATHE_GROOVE_TOOL_NUMBER", 2),
     }
     stock_radial = (args.stock_radial if args.stock_radial is not None
                     else getattr(config, "LATHE_STOCK_RADIAL", 1.0))
@@ -148,8 +176,19 @@ def main():
     print(f"   операции: {', '.join(stats['ops'][:8])}"
           + (f" … всего {len(stats['ops'])}" if len(stats['ops']) > 8 else "")
           + (f" | дуг в чистовом: {stats['arcs']}" if stats.get("arcs") else ""))
+    if stats.get("blade"):
+        print(f"   T2 канавочный: пластина {stats['blade']:.2f} мм, "
+              f"{stats['grooves']} канавк(и) объёмом "
+              f"{stats['groove_volume_mm3']:.0f} мм³ — проходным резцом они "
+              f"недостижимы")
+        if stats.get("blade_tight"):
+            print(f"   ⚠  есть канавка уже пластины {stats['blade']:.2f} мм — "
+                  f"её дно останется недорезанным (нужна более тонкая пластина)")
+    elif not p["groove_tool"]:
+        print("   T2 отключён (--no-groove-tool): канавки режет проходной резец, "
+              "он подрежет стенку позади")
 
-    if args.simulate:
+    if args.simulate_own:
         print("Съём материала по программе...")
         from lathe import lathe_sim
         try:
@@ -168,6 +207,37 @@ def main():
             print(f"   сверка с моделью: недорез {d['undercut_total_mm3']:.1f} мм³, "
                   f"зарез {d['overcut_total_mm3']:.1f} мм³ "
                   f"(деталь {d['part_volume_mm3']:.1f} мм³)")
+        except Exception as e:
+            print(f"   (сверка не выполнена: {e})")
+
+    if args.simulate:
+        print("Симуляция на виртуальном токарном станке NX ISV "
+              "(откроется окно NX, трогать не нужно)...")
+        from nx import nx_lathe_sim
+        try:
+            res = nx_lathe_sim.simulate(gcode, stem + "_stock.stp",
+                                        nose_radius=p["nose_radius"],
+                                        nose_angle=p["nose_angle"],
+                                        insert_size=p["insert_edge"],
+                                        groove_width=stats.get("blade") or 0.0,
+                                        groove_tool_number=p["groove_tool_number"])
+        except Exception as e:
+            print(f"⚠  NX-симуляция не удалась: {e}")
+            sys.exit(2)
+        tail = (f"  (машинное время {res['machine_time']}"
+                + (f", {res['triangles']} треуг." if res.get("triangles") else "")
+                + ")") if res.get("machine_time") else ""
+        print(f"✅ NX ISV: обработанная заготовка → {res['step']}{tail}")
+        # результат возвращён в раму детали (ось Z) — ложится на out_part.step
+        print(f"   ▶ наложить на деталь: {res['step']}  +  "
+              f"{stem + '_part.step'}  (обе в раме детали, ось Z)")
+        try:
+            from cam import step_diff
+            d = step_diff.diff(stem + "_part.step", res["step"],
+                               stem + "_nxdiff.json")
+            print(f"   сверка NX-результата с моделью: "
+                  f"недорез {d['undercut_total_mm3']:.1f} мм³, "
+                  f"зарез {d['overcut_total_mm3']:.1f} мм³")
         except Exception as e:
             print(f"   (сверка не выполнена: {e})")
 
