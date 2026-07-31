@@ -263,7 +263,8 @@ def write_to_ini(machine_dir, nose_radius, tool_number=1,
 
 
 def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
-             machine=None):
+             machine=None, nose_angle=None, insert_size=None,
+             relief_angle=None, tool_params=None):
     """Прогоняет токарный G-Code на виртуальном станке NX ISV.
 
     Результат возвращается в раме ДЕТАЛИ (ось Z): заготовку сажают на ось
@@ -348,6 +349,26 @@ def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
         "tool_number": 1,
         "work_prt": work_prt,
         "log_path": log_path,
+        # Резец. Подтип задаёт РУКУ (OrientAngle): наша программа точит справа
+        # налево, к патрону, значит нужен ПРАВЫЙ (OD_80_R, OrientAngle 95°).
+        # С левым (OD_80_L, 5°) кромка идёт впереди хода и режет конус ровно
+        # в 5° — это была причина «зареза и конусности» на 4-13A.
+        "tool_subtype": getattr(config, "NX_LATHE_TOOL_SUBTYPE", "OD_80_R"),
+        "nose_angle": (nose_angle if nose_angle is not None
+                       else getattr(config, "LATHE_NOSE_ANGLE", 55.0)),
+        "insert_size": (insert_size if insert_size is not None
+                        else getattr(config, "LATHE_INSERT_SIZE", 6.35)),
+        "orient_angle": getattr(config, "NX_LATHE_ORIENT_ANGLE", None),
+        # Задний угол пластины — в параметрической модели ISV это ЗАДНЯЯ ГРАНЬ,
+        # то есть та самая граница инструмента со стороны +Z. Она и определяет,
+        # насколько резец волочит по уже обточенной поверхности, когда врезается
+        # глубже. Дефолт шаблона 5° соответствует кромке почти вдоль оси; у
+        # настоящего 55°-ромба в державке 95° вспомогательный угол в плане 40°.
+        "relief_angle": (relief_angle if relief_angle is not None
+                         else getattr(config, "LATHE_RELIEF_ANGLE", 40.0)),
+        # произвольные свойства TurnToolBuilder для подбора геометрии резца
+        "tool_params": dict(getattr(config, "NX_LATHE_TOOL_PARAMS", None) or {},
+                            **(tool_params or {})),
         "sim_timeout": max(60, getattr(config, "NX_SIM_TIMEOUT", 1800) - 300),
         "startup_grace": getattr(config, "NX_LATHE_STARTUP_GRACE", 90),
         # Постановка детали на станок. Перебор всех пяти способов показал:

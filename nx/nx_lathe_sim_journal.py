@@ -6,9 +6,10 @@ nx_lathe_sim_journal.py — ТОКАРНАЯ симуляция в NX ISV. Вы�
   * setup создаётся как "turning" (не "mill_planar");
   * группа заготовки называется WORKPIECE_MAIN (не WORKPIECE); рядом лежат
     TURNING_WORKPIECE_MAIN, MCS_MAIN_SPINDLE и методы FACING/ROUGHING/...;
-  * POCKET_01 у токарного станка НЕТ (там револьвер, а не карманы) — резец
-    создаётся в GENERIC_MACHINE;
-  * тип инструмента "OD_80_L" шаблона "turning" (наружный резец);
+  * резец создаётся в кармане револьвера POCKET_01 (если его нет — в
+    GENERIC_MACHINE) и НАСЛЕДУЕТ оттуда геометрию;
+  * тип инструмента — наружный резец шаблона "turning"; ПОДТИП определяет форму
+    съёма, и от него напрямую зависит зарез — см. блок 5;
   * билдер берётся методом CreateMillToolBuilder (имя вводит в заблуждение,
     но объект возвращается TurnToolBuilder) и имеет NoseRadiusBuilder,
     NoseAngleBuilder, InsertPositionBuilder — то есть настоящий резец.
@@ -18,8 +19,9 @@ nx_lathe_sim_journal.py — ТОКАРНАЯ симуляция в NX ISV. Вы�
 сообщений; результат съёма достаётся через SimulationOptionsBuilder
 .SaveAsPartfile = True (лицензия ug_isv_full).
 
-Параметры (env NX_LATHE_SIM_PARAMS, JSON): stock_step, mpf, machine,
-nose_radius, tool_number, work_prt, log_path, sim_timeout.
+Параметры (env NX_LATHE_SIM_PARAMS, JSON): stock_step, mpf, machine, work_prt,
+log_path, sim_timeout, positioning; резец — tool_subtype, tool_number,
+nose_radius, nose_angle, insert_size, relief_angle, orient_angle, tool_params.
 """
 
 import json
@@ -200,26 +202,78 @@ def main():
     machine_builder.Destroy()
     log(f"станок подключён: {p['machine']}")
 
-    # ── 5. Резец: у токарного станка карманов нет, создаём в GENERIC_MACHINE ──
+    # ── 5. Резец (в кармане револьвера POCKET_01) ──
+    #
+    # ФОРМУ СЪЁМА ЗАДАЁТ ПОДТИП, а не числовые параметры. Проверено прогонами:
+    # OrientAngle / NoseAngle / ReliefAngle / CuttingEdgeAngle записываются в
+    # резец (перечитываются после Commit), но на срезаемый объём НЕ влияют —
+    # ISV строит форму по геометрии пластины ШАБЛОНА подтипа. Из числовых
+    # действует только Size (масштаб кромки) и NoseRadius.
+    #
+    # Решает ВСПОМОГАТЕЛЬНЫЙ угол в плане φ₁ = 180 − φ − ε (φ — угол в плане
+    # подтипа, ε — угол при вершине пластины). Именно он говорит, насколько
+    # резец волочит по уже обточенной поверхности, врезаясь глубже:
+    #   OD_80_R: φ=95°,   ε=80° → φ₁ = 5°    — подрез до 6 мм длиной (Size)
+    #   OD_55_R: φ=107.5°, ε=55° → φ₁ = 17.5° — подрез ~2 мм ← наш DCMT
+    #   OD_80_L: φ=5°     — левый, кромка идёт впереди хода: конус в 5°
+    # Замерено на пробной программе: наклон подреза совпал с φ₁ до 0.2°.
+    # Наша программа точит справа налево (к патрону) пластиной DCMT (ромб 55°),
+    # поэтому OD_55_R.
     parent, parent_name = first_existing(setup.CAMGroupCollection,
                                          ["POCKET_01", "GENERIC_MACHINE"])
-    tool = setup.CAMGroupCollection.CreateToolWithUserName(
-        parent, "turning", "OD_80_L",
-        NXOpen.CAM.NCGroupCollection.UseDefaultName.TrueValue, "TURN_OD", "TurnOD")
+    subtype = p.get("tool_subtype", "OD_55_R")
+    try:
+        tool = setup.CAMGroupCollection.CreateToolWithUserName(
+            parent, "turning", subtype,
+            NXOpen.CAM.NCGroupCollection.UseDefaultName.TrueValue,
+            "TURN_OD", "TurnOD")
+    except Exception as e:      # занятый карман принимает не всякий подтип
+        log(f"warn: подтип {subtype} не создался ({e}); беру OD_80_L — "
+            f"ВНИМАНИЕ, у него φ₁=5°, зарез по готовым стенкам будет больше")
+        subtype = "OD_80_L"
+        tool = setup.CAMGroupCollection.CreateToolWithUserName(
+            parent, "turning", subtype,
+            NXOpen.CAM.NCGroupCollection.UseDefaultName.TrueValue,
+            "TURN_OD", "TurnOD")
     tb = setup.CAMGroupCollection.CreateMillToolBuilder(tool)   # → TurnToolBuilder
-    applied = []
-    for prop, val in (("NoseRadiusBuilder", float(p.get("nose_radius", 0.4))),
-                      ("TlNumberBuilder", int(p.get("tool_number", 1))),
-                      ("NoseAngleBuilder", float(p.get("nose_angle", 80.0))),
-                      ("InsertLengthBuilder", float(p.get("insert_length", 12.0)))):
+    props = [("NoseRadiusBuilder", float(p.get("nose_radius", 0.4))),
+             ("TlNumberBuilder", int(p.get("tool_number", 1))),
+             ("NoseAngleBuilder", float(p.get("nose_angle", 55.0))),
+             ("SizeBuilder", float(p.get("insert_size", 6.35))),
+             ("ReliefAngleBuilder", float(p.get("relief_angle", 40.0)))]
+    if p.get("orient_angle") is not None:      # ручной override, обычно не нужен
+        props.append(("OrientAngleBuilder", float(p["orient_angle"])))
+    # Сквозной проход остальных свойств билдера из конфига: {"CuttingEdgeAngle":
+    # 95, ...} → CuttingEdgeAngleBuilder.Value. Нужен, чтобы подбирать геометрию
+    # резца под ISV без правки кода (полный список свойств — см.
+    # nx/research/turn_tool_probe_journal.py).
+    for name, val in (p.get("tool_params") or {}).items():
+        props.append((name if name.endswith("Builder") else name + "Builder", val))
+    for prop, val in props:
         try:
             getattr(tb, prop).Value = val
-            applied.append(f"{prop}={val}")
         except Exception as e:
-            log(f"warn: {prop}={val} не применилось: {e}")
+            log(f"warn: {prop}={val} не применилось: {type(e).__name__}: {e}")
     tb.Commit()
     tb.Destroy()
-    log(f"резец OD_80_L в {parent_name}: {', '.join(applied)}")
+    # читаем НОВЫМ билдером: только так видно, что реально сохранилось в резце,
+    # а не осталось унаследованным от кармана
+    check = []
+    try:
+        tb2 = setup.CAMGroupCollection.CreateMillToolBuilder(tool)
+        for prop in ("OrientAngleBuilder", "NoseAngleBuilder", "NoseRadiusBuilder",
+                     "SizeBuilder", "ReliefAngleBuilder", "CuttingEdgeAngleBuilder"):
+            try:
+                check.append(f"{prop.replace('Builder', '')}="
+                             f"{getattr(tb2, prop).Value:g}")
+            except Exception:
+                check.append(f"{prop.replace('Builder', '')}=н/д")
+        tb2.Destroy()
+    except Exception as e:
+        check.append(f"<перечитать не удалось: {e}>")
+    log(f"резец {subtype} в {parent_name}: {', '.join(check)}")
+    log("(форму съёма задаёт ПОДТИП: φ₁ = 180 − φ − ε — вспомогательный угол "
+        "в плане; чем он меньше, тем сильнее резец волочит по готовой стенке)")
 
     # ── 6. K-компоненты PART/BLANK ──
     kin = work_part.KinematicConfigurator

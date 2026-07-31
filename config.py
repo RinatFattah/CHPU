@@ -117,6 +117,48 @@ NX_SIM_MACHINE      = "sim01_mill_3ax_sinumerik"  # станок из библи
                               # (installed_machines; нужен вариант _sinumerik)
 NX_SIM_TIMEOUT      = 1800    # сек — таймаут на прогон симуляции
 
+# ── ТОЧЕНИЕ (run_lathe.py) ───────────────────────────────────────────────────────
+# Значения совпадают с дефолтами, которые run_lathe.py брал через getattr; здесь
+# они собраны, чтобы их можно было переопределить из YAML.
+LATHE_DEPTH_OF_CUT      = 1.0     # глубина резания за черновой проход, мм (по радиусу)
+LATHE_ALLOWANCE         = 0.2     # припуск чернового на чистовую, мм по радиусу
+LATHE_CLEARANCE         = 2.0     # безопасный отвод, мм
+LATHE_FEED              = 150.0   # черновая подача, мм/мин (режим G94)
+LATHE_FEED_FINISH       = 80.0    # чистовая подача, мм/мин (режим G94)
+LATHE_FEED_PER_REV      = 0.15    # черновая подача, мм/об (режим G95 — по умолчанию)
+LATHE_FEED_PER_REV_FINISH = 0.08  # чистовая подача, мм/об
+LATHE_SPINDLE_SPEED     = 1500    # об/мин (G97)
+LATHE_SCAN_STEP         = 0.2     # шаг разбиения траектории, мм
+LATHE_PARTOFF_WIDTH     = 3.0     # ширина отрезного паза, мм
+LATHE_INSERT            = "DCMT070204R"  # обозначение пластины (в шапку G-кода)
+LATHE_NOSE_RADIUS       = 0.4     # радиус при вершине, мм (DCMT ...04 → 0.4)
+LATHE_NOSE_ANGLE        = 55.0    # угол при вершине, ° (DCMT: D = ромб 55°)
+LATHE_INSERT_SIZE       = 6.35    # размер пластины (вписанная окружность), мм — DCMT 07
+LATHE_ARC_TOL           = 0.005   # допуск подгонки дуг в чистовом проходе, мм
+LATHE_STOCK_RADIAL      = 1.0     # припуск прутка по радиусу (только --no-standard-stock)
+LATHE_ALLOWANCE_PER_SIDE = 3.15   # припуск на обточку для подбора проката по ГОСТ, мм
+LATHE_PROFILE_STEP      = 0.1     # шаг сетки z при съёме профиля, мм
+LATHE_SIMPLIFY_TOL      = 0.01    # допуск упрощения профиля (Дуглас-Пекер), мм
+
+# Станочная симуляция точения в NX ISV (флаг --simulate у run_lathe.py)
+NX_LATHE_MACHINE        = "sim11_turn_2ax_sinumerik"  # токарный станок библиотеки NX
+# Подтип резца шаблона "turning". ИМЕННО ОН задаёт форму съёма в ISV: числовые
+# углы (OrientAngle/NoseAngle/ReliefAngle) в резец пишутся, но на срезаемый объём
+# не влияют. Решает вспомогательный угол в плане φ₁ = 180 − φ − ε:
+#   OD_55_R  φ=107.5°, ε=55° → φ₁=17.5° — пластина DCMT, наш случай
+#   OD_80_R  φ=95°,    ε=80° → φ₁=5°    — резец волочит по готовой стенке
+#                                          на всю длину кромки (замерено)
+#   OD_80_L  φ=5°   — левый, точит ОТ патрона: кромка идёт впереди хода
+NX_LATHE_TOOL_SUBTYPE   = "OD_55_R"
+NX_LATHE_ORIENT_ANGLE   = None    # ручной override угла в плане, ° (обычно не нужен)
+NX_LATHE_TOOL_PARAMS    = {}      # произвольные свойства TurnToolBuilder, напр.
+                                  # {"ThicknessBuilder": 3.18}
+NX_LATHE_ROTATE_TO_SPINDLE = True # сажать заготовку на физическую ось шпинделя
+NX_LATHE_SPINDLE_ROT_AXIS = None  # ручной override оси поворота (иначе зонд)
+NX_LATHE_SPINDLE_ROT_ANGLE = None # ручной override угла поворота, °
+NX_LATHE_POSITIONING    = "KeepAssemblyConstraints"  # способ постановки на станок
+NX_LATHE_STARTUP_GRACE  = 90      # сек — сколько ждать, пока стойка начнёт счёт
+
 # ── Вывод и система ──────────────────────────────────────────────────────────────
 POSTPROCESSOR   = "grbl"  # диалект G-Code: grbl / linuxcnc / fanuc / mach3_mach4 …
 FREECAD_CMD     = ""      # путь к freecadcmd; пусто → автопоиск (AppImage/PATH/snap)
