@@ -225,25 +225,42 @@ def gcode_to_mpf(gcode_path, mpf_path, tool_number=1):
 
 def write_to_ini(machine_dir, nose_radius, tool_number=1,
                  insert_position=INSERT_POSITION_OD_RIGHT,
-                 length_x=0.0, length_z=0.0):
-    """TO_INI.SPF для ТОКАРНОГО резца.
+                 length_x=0.0, length_z=0.0,
+                 groove_width=0.0, groove_tool_number=2):
+    """TO_INI.SPF для ТОКАРНЫХ резцов (проходной T1 + канавочный T2).
 
     Отличия от фрезы (см. nx_sim.write_to_ini): $TC_DP1 = 500 — тип «токарный
     инструмент» вместо 120 («концевая фреза»); $TC_DP2 — положение режущей
     кромки, для точения это не формальность, а то, с какой стороны стойка
     считает вершину; $TC_DP6 — радиус ПРИ ВЕРШИНЕ (у фрезы там радиус фрезы).
+
+    Канавочный идёт типом 520 («отрезной/канавочный»), его ширина — $TC_DP7:
+    без записи T2 в таблицу смена инструмента виснет, потому что ToolChange.SPF
+    читает $TC_TP1 несуществующего номера.
     """
     sub = os.path.join(machine_dir, "cse_driver", "sinumerik", "subprog")
+    nl = "\n"
     content = (
-        f'$TC_TP1[{tool_number}]={tool_number}\n'
-        f'$TC_TP2[{tool_number}]="TURN_OD"\n'
-        f'$TC_DP1[{tool_number},1]=500\n'
-        f'$TC_DP2[{tool_number},1]={insert_position}\n'
-        f'$TC_DP3[{tool_number},1]={length_x:g}\n'
-        f'$TC_DP4[{tool_number},1]={length_z:g}\n'
-        f'$TC_DP6[{tool_number},1]={nose_radius:g}\n'
-        f'M17\n'
+        f'$TC_TP1[{tool_number}]={tool_number}{nl}'
+        f'$TC_TP2[{tool_number}]="TURN_OD"{nl}'
+        f'$TC_DP1[{tool_number},1]=500{nl}'
+        f'$TC_DP2[{tool_number},1]={insert_position}{nl}'
+        f'$TC_DP3[{tool_number},1]={length_x:g}{nl}'
+        f'$TC_DP4[{tool_number},1]={length_z:g}{nl}'
+        f'$TC_DP6[{tool_number},1]={nose_radius:g}{nl}'
     )
+    if groove_width:
+        content += (
+            f'$TC_TP1[{groove_tool_number}]={groove_tool_number}{nl}'
+            f'$TC_TP2[{groove_tool_number}]="GROOVE"{nl}'
+            f'$TC_DP1[{groove_tool_number},1]=520{nl}'
+            f'$TC_DP2[{groove_tool_number},1]={insert_position}{nl}'
+            f'$TC_DP3[{groove_tool_number},1]=0{nl}'
+            f'$TC_DP4[{groove_tool_number},1]=0{nl}'
+            f'$TC_DP6[{groove_tool_number},1]=0{nl}'
+            f'$TC_DP7[{groove_tool_number},1]={groove_width:g}{nl}'
+        )
+    content += "M17" + nl
     path = os.path.join(sub, "TO_INI.SPF")
     try:
         if os.path.exists(path):
@@ -253,8 +270,10 @@ def write_to_ini(machine_dir, nose_radius, tool_number=1,
         os.makedirs(sub, exist_ok=True)
         with open(path, "w", encoding="ascii", newline="\r\n") as f:
             f.write(content)
-        _log(f"TO_INI.SPF записан (T{tool_number}, резец, вершина R{nose_radius:g}, "
-             f"кромка {insert_position})")
+        extra = (f" + T{groove_tool_number} канавочный {groove_width:g} мм"
+                 if groove_width else "")
+        _log(f"TO_INI.SPF записан (T{tool_number} резец, вершина "
+             f"R{nose_radius:g}, кромка {insert_position}{extra})")
     except PermissionError:
         _log(f"warn: нет прав записи в {path} — таблица инструментов стойки "
              f"могла устареть. Дайте себе права на папку станка "
@@ -264,7 +283,8 @@ def write_to_ini(machine_dir, nose_radius, tool_number=1,
 
 def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
              machine=None, nose_angle=None, insert_size=None,
-             relief_angle=None, tool_params=None):
+             relief_angle=None, tool_params=None, groove_width=0.0,
+             groove_tool_number=2):
     """Прогоняет токарный G-Code на виртуальном станке NX ISV.
 
     Результат возвращается в раме ДЕТАЛИ (ось Z): заготовку сажают на ось
@@ -286,7 +306,8 @@ def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
     if not os.path.exists(stock_step_path):
         raise RuntimeError(f"файл заготовки не найден: {stock_step_path}")
 
-    write_to_ini(mdir, nose_radius)
+    write_to_ini(mdir, nose_radius, groove_width=groove_width,
+                 groove_tool_number=groove_tool_number)
 
     if out_stem is None:
         out_stem = os.path.splitext(os.path.abspath(gcode_path))[0]
@@ -303,6 +324,17 @@ def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
 
     n = gcode_to_mpf(gcode_path, mpf_path)
     _log(f"программа для стойки: {n} строк → {os.path.basename(mpf_path)}")
+    if groove_width:
+        # ISV НЕ МОДЕЛИРУЕТ канавочный резец параметрически: подтип OD_GROOVE_L
+        # исполняется стойкой (машинное время идёт, смена инструмента проходит),
+        # но материал не снимает и IPW не сохраняется вовсе. Проверено в
+        # POCKET_01 и POCKET_02, с NoseWidth 0 и 1.5, OrientAngle 180 и 90;
+        # проходные подтипы в том же кармане работают. Для съёма канавочным
+        # нужна СБОРКА инструмента (Mrshape=Assembly), а не параметры.
+        _log("⚠  в программе есть канавочный резец T"
+             f"{groove_tool_number}: ISV его параметрически не моделирует, "
+             "съём по нему не пойдёт. Для станочной симуляции запускайте "
+             "с --no-groove-tool.")
 
     from cam.freecad_cam import _ascii_safe
 
@@ -359,6 +391,16 @@ def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
         "insert_size": (insert_size if insert_size is not None
                         else getattr(config, "LATHE_INSERT_SIZE", 6.35)),
         "orient_angle": getattr(config, "NX_LATHE_ORIENT_ANGLE", None),
+        # Канавочный резец T2. Проходной в канавку не лезет (волочит
+        # вспомогательной кромкой по стенке позади), поэтому генератор отдаёт
+        # канавки и отрезку отдельному инструменту — надо создать его и в ISV,
+        # иначе съём по T2 пойдёт формой проходного.
+        "groove_width": float(groove_width or 0.0),
+        "groove_tool_number": int(groove_tool_number),
+        "groove_subtype": getattr(config, "NX_LATHE_GROOVE_SUBTYPE",
+                                  "OD_GROOVE_L"),
+        "groove_orient_angle": getattr(config, "NX_LATHE_GROOVE_ORIENT_ANGLE",
+                                       90.0),
         # Задний угол пластины — в параметрической модели ISV это ЗАДНЯЯ ГРАНЬ,
         # то есть та самая граница инструмента со стороны +Z. Она и определяет,
         # насколько резец волочит по уже обточенной поверхности, когда врезается
@@ -371,6 +413,9 @@ def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
                             **(tool_params or {})),
         "sim_timeout": max(60, getattr(config, "NX_SIM_TIMEOUT", 1800) - 300),
         "startup_grace": getattr(config, "NX_LATHE_STARTUP_GRACE", 90),
+        # сколько секунд без роста машинного времени считать концом программы;
+        # смена инструмента с отъездом в точку смены занимает заметную паузу
+        "settle": getattr(config, "NX_LATHE_SETTLE", 45),
         # Постановка детали на станок. Перебор всех пяти способов показал:
         # съём идёт ТОЛЬКО при KeepAssemblyConstraints (IPW 470 КБ против
         # ~62 КБ у прочих, где сохраняется нетронутый пруток). Деталь у нас

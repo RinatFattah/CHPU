@@ -98,13 +98,19 @@ def assign_k_component(kin, name, body, parents=("SETUP",)):
         builder.Destroy()
 
 
-def find_ipw_prt(work_prt):
+def find_ipw_prt(work_prt, since):
+    """IPW ЭТОГО прогона: файл своего стема и не старше начала прогона.
+
+    Фолбэк «взять любой *_ipw.prt» был опасен: когда ISV ничего не сохранил,
+    подбирался файл соседнего прогона, экспортный журнал крутил его фасеты
+    ещё раз и на выход шёл мусор, выглядящий как результат. Лучше честно
+    упасть.
+    """
     import glob
     d = os.path.dirname(work_prt)
     stem = os.path.splitext(os.path.basename(work_prt))[0]
-    hits = glob.glob(os.path.join(d, f"{stem}*_ipw.prt"))
-    if not hits:
-        hits = glob.glob(os.path.join(d, "*_ipw.prt"))
+    hits = [f for f in glob.glob(os.path.join(d, f"{stem}*_ipw.prt"))
+            if os.path.getmtime(f) >= since - 1.0]
     return max(hits, key=os.path.getmtime) if hits else None
 
 
@@ -116,6 +122,61 @@ def first_existing(collection, names):
         except Exception:
             continue
     return None, None
+
+
+# Карманы револьвера. Резец создаётся В КАРМАНЕ и наследует оттуда геометрию;
+# в занятый карман второй инструмент не встаёт («Input parameter is out of
+# range»), поэтому для T2 ищется следующий свободный.
+POCKETS = [f"POCKET_{i:02d}" for i in range(1, 13)] + ["GENERIC_MACHINE"]
+
+
+def make_tool(setup, subtype, uname, props, used, report):
+    """Резец подтипа `subtype` в первом свободном кармане револьвера.
+
+    props — [(имя свойства билдера, значение)]; report — какие свойства
+    перечитать ПОСЛЕ Commit новым билдером и напечатать: только так видно, что
+    реально сохранилось в резце, а что осталось унаследованным от кармана.
+    """
+    for pname in POCKETS:
+        if pname in used:
+            continue
+        try:
+            parent = setup.CAMGroupCollection.FindObject(pname)
+        except Exception:
+            continue
+        try:
+            tool = setup.CAMGroupCollection.CreateToolWithUserName(
+                parent, "turning", subtype,
+                NXOpen.CAM.NCGroupCollection.UseDefaultName.TrueValue,
+                uname, uname)
+        except Exception as e:
+            log(f"warn: {subtype} в {pname} не создался ({e})")
+            continue
+        used.add(pname)
+        tb = setup.CAMGroupCollection.CreateMillToolBuilder(tool)
+        for prop, val in props:
+            try:
+                getattr(tb, prop).Value = val
+            except Exception as e:
+                log(f"warn: {prop}={val} не применилось: {type(e).__name__}: {e}")
+        tb.Commit()
+        tb.Destroy()
+        check = []
+        try:
+            tb2 = setup.CAMGroupCollection.CreateMillToolBuilder(tool)
+            for prop in report:
+                try:
+                    check.append(f"{prop.replace('Builder', '')}="
+                                 f"{getattr(tb2, prop).Value:g}")
+                except Exception:
+                    check.append(f"{prop.replace('Builder', '')}=н/д")
+            tb2.Destroy()
+        except Exception as e:
+            check.append(f"<перечитать не удалось: {e}>")
+        log(f"резец {subtype} ({uname}) в {pname}: {', '.join(check)}")
+        return tool
+    log(f"warn: резец {subtype} создать НЕ УДАЛОСЬ — свободных карманов нет")
+    return None
 
 
 def main():
@@ -202,7 +263,7 @@ def main():
     machine_builder.Destroy()
     log(f"станок подключён: {p['machine']}")
 
-    # ── 5. Резец (в кармане револьвера POCKET_01) ──
+    # ── 5. Резцы: проходной T1 и (если нужен) канавочный T2 ──
     #
     # ФОРМУ СЪЁМА ЗАДАЁТ ПОДТИП, а не числовые параметры. Проверено прогонами:
     # OrientAngle / NoseAngle / ReliefAngle / CuttingEdgeAngle записываются в
@@ -219,23 +280,8 @@ def main():
     # Замерено на пробной программе: наклон подреза совпал с φ₁ до 0.2°.
     # Наша программа точит справа налево (к патрону) пластиной DCMT (ромб 55°),
     # поэтому OD_55_R.
-    parent, parent_name = first_existing(setup.CAMGroupCollection,
-                                         ["POCKET_01", "GENERIC_MACHINE"])
+    used = set()
     subtype = p.get("tool_subtype", "OD_55_R")
-    try:
-        tool = setup.CAMGroupCollection.CreateToolWithUserName(
-            parent, "turning", subtype,
-            NXOpen.CAM.NCGroupCollection.UseDefaultName.TrueValue,
-            "TURN_OD", "TurnOD")
-    except Exception as e:      # занятый карман принимает не всякий подтип
-        log(f"warn: подтип {subtype} не создался ({e}); беру OD_80_L — "
-            f"ВНИМАНИЕ, у него φ₁=5°, зарез по готовым стенкам будет больше")
-        subtype = "OD_80_L"
-        tool = setup.CAMGroupCollection.CreateToolWithUserName(
-            parent, "turning", subtype,
-            NXOpen.CAM.NCGroupCollection.UseDefaultName.TrueValue,
-            "TURN_OD", "TurnOD")
-    tb = setup.CAMGroupCollection.CreateMillToolBuilder(tool)   # → TurnToolBuilder
     props = [("NoseRadiusBuilder", float(p.get("nose_radius", 0.4))),
              ("TlNumberBuilder", int(p.get("tool_number", 1))),
              ("NoseAngleBuilder", float(p.get("nose_angle", 55.0))),
@@ -249,31 +295,32 @@ def main():
     # nx/research/turn_tool_probe_journal.py).
     for name, val in (p.get("tool_params") or {}).items():
         props.append((name if name.endswith("Builder") else name + "Builder", val))
-    for prop, val in props:
-        try:
-            getattr(tb, prop).Value = val
-        except Exception as e:
-            log(f"warn: {prop}={val} не применилось: {type(e).__name__}: {e}")
-    tb.Commit()
-    tb.Destroy()
-    # читаем НОВЫМ билдером: только так видно, что реально сохранилось в резце,
-    # а не осталось унаследованным от кармана
-    check = []
-    try:
-        tb2 = setup.CAMGroupCollection.CreateMillToolBuilder(tool)
-        for prop in ("OrientAngleBuilder", "NoseAngleBuilder", "NoseRadiusBuilder",
-                     "SizeBuilder", "ReliefAngleBuilder", "CuttingEdgeAngleBuilder"):
-            try:
-                check.append(f"{prop.replace('Builder', '')}="
-                             f"{getattr(tb2, prop).Value:g}")
-            except Exception:
-                check.append(f"{prop.replace('Builder', '')}=н/д")
-        tb2.Destroy()
-    except Exception as e:
-        check.append(f"<перечитать не удалось: {e}>")
-    log(f"резец {subtype} в {parent_name}: {', '.join(check)}")
+    make_tool(setup, subtype, "TURN_OD", props, used,
+              ("OrientAngleBuilder", "NoseAngleBuilder", "NoseRadiusBuilder",
+               "SizeBuilder", "ReliefAngleBuilder"))
     log("(форму съёма задаёт ПОДТИП: φ₁ = 180 − φ − ε — вспомогательный угол "
         "в плане; чем он меньше, тем сильнее резец волочит по готовой стенке)")
+
+    # Канавочный резец T2. Программа отдаёт ему канавки и отрезку — то, куда
+    # проходной физически не лезет. Если его не создать, стойка на T2 возьмёт
+    # что попало и съём пойдёт чужой формой.
+    gw = float(p.get("groove_width") or 0.0)
+    if gw > 0:
+        # NoseWidth — РЕЖУЩАЯ ширина пластины. В шаблоне она 0, и с нулём ISV
+        # не строит форму съёма: программа исполняется, но материал не снимается
+        # и IPW не сохраняется вовсе (проверено). InsertWidth задаёт корпус.
+        make_tool(setup, p.get("groove_subtype", "OD_GROOVE_L"), "TURN_GROOVE",
+                  [("InsertWidthBuilder", gw),
+                   ("NoseWidthBuilder", gw),
+                   # в кармане револьвера канавочный наследует OrientAngle=180
+                   # (пластина смотрит вдоль оси) — для НАРУЖНОЙ канавки нужно
+                   # 90°, иначе врезаться нечем
+                   ("OrientAngleBuilder",
+                    float(p.get("groove_orient_angle") or 90.0)),
+                   ("TlNumberBuilder", int(p.get("groove_tool_number", 2)))],
+                  used,
+                  ("InsertWidthBuilder", "NoseWidthBuilder", "ThicknessBuilder",
+                   "OrientAngleBuilder"))
 
     # ── 6. K-компоненты PART/BLANK ──
     kin = work_part.KinematicConfigurator
@@ -359,6 +406,7 @@ def main():
     with open(p["mpf"], encoding="ascii", errors="replace") as f:
         n_lines = sum(1 for _ in f)
     log(f"исполнение программы ({n_lines} строк)...")
+    t_start = time.time()
     cpb.PlayForward()
 
     deadline = time.time() + float(p.get("sim_timeout", 1500))
@@ -375,9 +423,13 @@ def main():
         pump_messages(2)
         t = machine_time()
         if t != last:
+            # прогресс в лог: по нему видно, ГДЕ программа встала (например на
+            # смене инструмента), а не только что она встала
+            log(f"  машинное время {t} (+{time.time() - last_change:.0f} с)")
             last, last_change = t, time.time()
-        elif t not in ("", "00:00:00.000") and time.time() - last_change > 20:
-            log("машинное время стабилизировалось")
+        elif (t not in ("", "00:00:00.000")
+              and time.time() - last_change > float(p.get("settle", 45))):
+            log(f"машинное время стабилизировалось на {t}")
             break
         if (t in ("", "00:00:00.000")) and time.time() - started > grace:
             raise RuntimeError(
@@ -404,10 +456,31 @@ def main():
     except Exception as e:
         log(f"warn: сохранение work part: {e}")
 
-    ipw = find_ipw_prt(p["work_prt"])
+    # ISV пишет IPW не мгновенно после выхода из среды симуляции — ждём файл,
+    # а не проверяем один раз
+    ipw = None
+    for _ in range(30):
+        ipw = find_ipw_prt(p["work_prt"], t_start)
+        if ipw:
+            break
+        time.sleep(2)
     if not ipw:
-        raise RuntimeError("ISV не сохранил IPW (*_ipw.prt) — проверьте, что съём "
-                           "реально шёл и доступна лицензия ug_isv_full")
+        import glob as _g
+        seen = sorted(_g.glob(os.path.join(os.path.dirname(p["work_prt"]),
+                                           "*_ipw.prt")),
+                      key=os.path.getmtime)[-3:]
+        log("в TEMP лежат (последние): "
+            + ", ".join(f"{os.path.basename(f)}"
+                        f"@{time.strftime('%H:%M:%S', time.localtime(os.path.getmtime(f)))}"
+                        for f in seen) or "ничего")
+        log(f"прогон стартовал в "
+            f"{time.strftime('%H:%M:%S', time.localtime(t_start))}")
+        raise RuntimeError(
+            "ISV не сохранил IPW этого прогона (*_ipw.prt рядом с "
+            f"{os.path.basename(p['work_prt'])}). Обычно это значит, что "
+            "программа не дошла до конца — стойка встала (смена инструмента, "
+            "лимиты осей), и симуляцию свернули по таймауту. Смотрите ход "
+            "машинного времени выше.")
     log(f"DONE ipw={ipw} machine_time={mtime}")
 
 

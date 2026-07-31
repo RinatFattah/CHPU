@@ -60,6 +60,13 @@ def main():
     ap.add_argument("--no-arcs", action="store_true",
                     help="чистовой проход только отрезками (без G2/G3)")
     ap.add_argument("--no-partoff", action="store_true", help="без отрезки")
+    ap.add_argument("--no-groove-tool", action="store_true",
+                    help="не выделять канавки отдельному резцу T2 — всё одним "
+                         "проходным (прежнее поведение; проходной резец в канавку "
+                         "физически не лезет и подрезает стенку позади)")
+    ap.add_argument("--groove-width", type=float, metavar="MM",
+                    help="ширина канавочной пластины, мм (дефолт 3.0; под более "
+                         "узкую канавку подбирается автоматически)")
     ap.add_argument("--simulate", action="store_true",
                     help="после генерации прогнать G-Code на виртуальном "
                          "токарном станке NX ISV (нужен установленный NX); "
@@ -115,6 +122,17 @@ def main():
         "nose_radius": getattr(config, "LATHE_NOSE_RADIUS", 0.4),
         "arcs": not args.no_arcs,
         "arc_tol": getattr(config, "LATHE_ARC_TOL", 0.005),
+        # проходной резец: чем он достаёт, считает lathe_reach
+        "nose_angle": getattr(config, "LATHE_NOSE_ANGLE", 55.0),
+        "approach_angle": getattr(config, "LATHE_APPROACH_ANGLE", 107.5),
+        "insert_edge": getattr(config, "LATHE_INSERT_SIZE", 6.35),
+        # канавочный резец T2
+        "groove_tool": (not args.no_groove_tool
+                        and getattr(config, "LATHE_GROOVE_TOOL", True)),
+        "groove_width": (args.groove_width if args.groove_width is not None
+                         else getattr(config, "LATHE_GROOVE_WIDTH", 3.0)),
+        "groove_width_min": getattr(config, "LATHE_GROOVE_WIDTH_MIN", 1.0),
+        "groove_tool_number": getattr(config, "LATHE_GROOVE_TOOL_NUMBER", 2),
     }
     stock_radial = (args.stock_radial if args.stock_radial is not None
                     else getattr(config, "LATHE_STOCK_RADIAL", 1.0))
@@ -158,6 +176,17 @@ def main():
     print(f"   операции: {', '.join(stats['ops'][:8])}"
           + (f" … всего {len(stats['ops'])}" if len(stats['ops']) > 8 else "")
           + (f" | дуг в чистовом: {stats['arcs']}" if stats.get("arcs") else ""))
+    if stats.get("blade"):
+        print(f"   T2 канавочный: пластина {stats['blade']:.2f} мм, "
+              f"{stats['grooves']} канавк(и) объёмом "
+              f"{stats['groove_volume_mm3']:.0f} мм³ — проходным резцом они "
+              f"недостижимы")
+        if stats.get("blade_tight"):
+            print(f"   ⚠  есть канавка уже пластины {stats['blade']:.2f} мм — "
+                  f"её дно останется недорезанным (нужна более тонкая пластина)")
+    elif not p["groove_tool"]:
+        print("   T2 отключён (--no-groove-tool): канавки режет проходной резец, "
+              "он подрежет стенку позади")
 
     if args.simulate_own:
         print("Съём материала по программе...")
@@ -187,7 +216,11 @@ def main():
         from nx import nx_lathe_sim
         try:
             res = nx_lathe_sim.simulate(gcode, stem + "_stock.stp",
-                                        nose_radius=p["nose_radius"])
+                                        nose_radius=p["nose_radius"],
+                                        nose_angle=p["nose_angle"],
+                                        insert_size=p["insert_edge"],
+                                        groove_width=stats.get("blade") or 0.0,
+                                        groove_tool_number=p["groove_tool_number"])
         except Exception as e:
             print(f"⚠  NX-симуляция не удалась: {e}")
             sys.exit(2)

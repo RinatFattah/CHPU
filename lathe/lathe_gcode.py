@@ -2,14 +2,23 @@
 """
 lathe_gcode.py — осевой профиль детали → токарная управляющая программа.
 
-Стратегия — продольное наружное точение, как у технолога:
+Стратегия — продольное наружное точение, как у технолога, ДВУМЯ инструментами:
+  T1, проходной резец:
   1. FaceOff   — подрезка торца заготовки до Z0;
   2. Rough1..N — черновая продольными проходами: на каждом уровне радиуса резец
      идёт от торца вглубь, пока профиль детали не поднимется выше этого уровня,
      затем отвод по X и возврат. Уровни идут от радиуса заготовки к детали с
      шагом DEPTH_OF_CUT, с припуском ALLOWANCE на чистовую;
-  3. Finish    — чистовой проход ПО ПРОФИЛЮ (по всем точкам, к номиналу);
-  4. Partoff   — отрезка (опционально).
+  3. Finish    — чистовой проход по профилю (по всем точкам, к номиналу);
+  T2, канавочный резец:
+  4. Groove1..N — канавки и поднутрения врезаниями с перекрытием;
+  5. Partoff    — отрезка (опционально).
+
+Разделение работы между T1 и T2 — не украшение, а геометрия: проходной резец
+клин, и врезаясь вглубь он волочит вспомогательной кромкой по уже обточенной
+стенке позади (замерено в NX ISV). Что ему достижимо, считает `lathe_reach`;
+остальное уходит канавочному. Так же устроен и заводской техпроцесс.
+`--no-groove-tool` возвращает прежнее поведение: всё одним резцом.
 
 Выход — явные траектории G0/G1 в плоскости G18, а НЕ контурный цикл стойки
 (CYCLE95/G71): цикл переносит расчёт на стойку и даёт программу в 30 строк, но
@@ -229,6 +238,27 @@ def generate(prof_data, params):
     """Профиль + параметры → (строки G-кода, статистика)."""
     profile = [(z, r) for z, r in prof_data["profile"]]
     profile.sort(key=lambda p: -p[0])            # от торца (Z max) вглубь
+    part_profile = list(profile)                 # НОМИНАЛ детали, до огибающей
+
+    # Разделение работы между инструментами. Проходной резец — клин, и в канавку
+    # он не лезет: вспомогательная кромка волочит по уже обточенной стенке
+    # позади (замерено в NX ISV, см. lathe_reach). Поэтому профиль делится на
+    # достижимую огибающую (её берёт T1) и канавки (их берёт канавочный T2).
+    raw = prof_data.get("profile_raw")
+    grooves, blade, blade_tight = [], 0.0, False
+    if params.get("groove_tool", True):
+        from lathe import lathe_reach
+        env, grooves = lathe_reach.envelope(
+            raw or prof_data["profile"],
+            approach_deg=params.get("approach_angle", 107.5),
+            nose_deg=params.get("nose_angle", 55.0),
+            edge_len=params.get("insert_edge", 6.35))
+        if grooves:
+            blade, blade_tight = lathe_reach.fit_blade(
+                grooves, params.get("groove_width", 3.0),
+                params.get("groove_width_min", 1.0))
+            profile = _simplify(env, params.get("simplify_tol", 0.01))
+            raw = env                     # чистовой T1 идёт по огибающей
 
     r_stock = prof_data.get("stock_radius") or (prof_data["max_radius"] + 1.0)
     z_top = prof_data.get("stock_z_top", profile[0][0] + 1.0)
@@ -279,8 +309,13 @@ def generate(prof_data, params):
                  f"Z {z_top:.2f}..{z_end:.2f})")
     else:
         g.append(f"(Stock: bar D{2 * r_stock:.2f} mm, Z {z_top:.2f}..{z_end:.2f})")
-    g.append(f"(Tool: turning insert {params.get('insert', 'DCMT070204R')}, "
+    g.append(f"(Tool T{params.get('tool_number', 1)}: turning insert "
+             f"{params.get('insert', 'DCMT070204R')}, "
              f"nose R{params.get('nose_radius', 0.4)} mm)")
+    if blade:
+        g.append(f"(Tool T{params.get('groove_tool_number', 2)}: grooving blade "
+                 f"W{blade:.2f} mm - {len(grooves)} groove(s)"
+                 + (", partoff" if params.get("partoff", True) else "") + ")")
     g.append(f"(Profile points: {len(profile)})")
     g.append(f"(X in {'DIAMETER' if dia else 'RADIUS'} mode, feed in "
              f"{'mm/rev G95' if per_rev else 'mm/min G94'})")
@@ -344,7 +379,6 @@ def generate(prof_data, params):
     g.append(f"G0 {X(profile[0][1])} Z{profile[0][0] + clear:.3f}")
     g.append(f"G1 {X(profile[0][1])} Z{profile[0][0]:.3f} {fmt(feed_finish)}")
     n_arcs = 0
-    raw = prof_data.get("profile_raw")
     if params.get("arcs", True) and raw:
         # дуги ищем по СЫРОМУ профилю: упрощение уже спрямило скругления,
         # и по ломаной окружность не восстановить
@@ -372,10 +406,62 @@ def generate(prof_data, params):
     g.append(f"G0 {X(retract_r)} Z{z_end:.3f}")
     g.append("(Finish operation: Finish)")
 
-    # 4. отрезка
-    if params.get("partoff", True):
+    # 4. канавки и отрезка — КАНАВОЧНЫМ резцом T2
+    #
+    # Проходной резец сюда не лезет: он клин, и врезаясь вглубь волочит
+    # вспомогательной кромкой по уже обточенной стенке позади (замерено в NX
+    # ISV — так срезался шестигранник у 4-13A). Заводской техпроцесс делает
+    # ровно это: канавки и отрезка отдельным канавочным резцом.
+    n_groove = 0
+    t2 = params.get("groove_tool_number", 2)
+    want_partoff = params.get("partoff", True)
+    if grooves or (want_partoff and blade):
+        g.append(f"G0 {X(retract_r)} Z{z_top + clear:.3f}")
+        g.append("M5")            # смена инструмента — на остановленном шпинделе
+        g.append(f"T{t2}")
+        g.append("M6")
+        g.append(f"G97 S{params.get('groove_speed', rpm)} M3")
+        g.append(f"(Tool: grooving/parting blade W{blade:.2f} mm)")
+
+    def plunge(z_c, r_target):
+        """Врезание канавочным резцом в позиции z_c до радиуса r_target."""
+        g.append(f"G0 {X(retract_r)} Z{z_c:.3f}")
+        g.append(f"G1 {X(r_target)} Z{z_c:.3f} {fmt(feed_partoff)}")
+        g.append(f"G0 {X(retract_r)} Z{z_c:.3f}")
+
+    for gr in grooves:
+        z_hi, z_lo = gr["z_hi"], gr["z_lo"]
+        span = z_hi - z_lo
+        # позиции врезаний с перекрытием в половину пластины
+        if span <= blade:
+            zs_cut = [(z_hi + z_lo) / 2.0]
+        else:
+            n_cut = max(2, int((span - blade) / (blade * 0.5) + 0.999) + 1)
+            zs_cut = [z_hi - blade / 2.0
+                      - i * (span - blade) / (n_cut - 1) for i in range(n_cut)]
+        cuts = []
+        for z_c in zs_cut:
+            # глубина ограничена профилем под ВСЕЙ пластиной: так резец не
+            # срежет стенку канавки, даже если пластина шире дна
+            lo, hi = z_c - blade / 2.0, z_c + blade / 2.0
+            r_t = max(_max_r_between(part_profile, hi, lo),
+                      _r_at(part_profile, hi), _r_at(part_profile, lo))
+            if r_t < _r_at(profile, z_c) - 0.02:      # есть что снимать
+                cuts.append((z_c, r_t))
+        if not cuts:
+            continue
+        n_groove += 1
+        op(f"Groove{n_groove}")
+        for z_c, r_t in cuts:
+            plunge(z_c, r_t)
+        g.append(f"(Finish operation: Groove{n_groove})")
+
+    if want_partoff:
         op("Partoff")
-        z_cut = z_end - params.get("partoff_width", 3.0)
+        # рез ВПЛОТНУЮ к торцу детали: правая грань пластины в z_end, значит её
+        # середина — на полширины дальше. Прежний вариант (z_end − 3) резал
+        # заведомо мимо детали, то есть не отрезал ничего.
+        z_cut = z_end - (blade / 2.0 if blade else params.get("partoff_width", 3.0))
         g.append(f"G0 {X(retract_r)} Z{z_cut:.3f}")
         g.append(f"G1 X0.000 Z{z_cut:.3f} {fmt(feed_partoff)}")
         g.append(f"G0 {X(retract_r)} Z{z_cut:.3f}")
@@ -387,7 +473,9 @@ def generate(prof_data, params):
 
     stats = {"lines": len(g), "ops": ops, "rough_passes": n_rough,
              "stock_radius": r_stock, "profile_points": len(profile),
-             "arcs": n_arcs}
+             "arcs": n_arcs, "grooves": n_groove, "blade": blade,
+             "blade_tight": blade_tight,
+             "groove_volume_mm3": sum(gr["volume_mm3"] for gr in grooves)}
     return g, stats
 
 

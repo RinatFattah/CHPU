@@ -135,6 +135,20 @@ LATHE_NOSE_RADIUS       = 0.4     # радиус при вершине, мм (DC
 LATHE_NOSE_ANGLE        = 55.0    # угол при вершине, ° (DCMT: D = ромб 55°)
 LATHE_INSERT_SIZE       = 6.35    # размер пластины (вписанная окружность), мм — DCMT 07
 LATHE_ARC_TOL           = 0.005   # допуск подгонки дуг в чистовом проходе, мм
+# Угол в плане проходного резца, ° — под каким углом главная кромка идёт к оси.
+# Вместе с углом при вершине даёт вспомогательный угол φ₁ = 180 − φ − ε: именно
+# он решает, куда резец НЕ достанет, не подрезав стенку позади (см. lathe_reach).
+LATHE_APPROACH_ANGLE    = 107.5
+# ── Канавочный резец T2 ──
+# Проходной резец в канавку не лезет: врезаясь вглубь, он волочит вспомогательной
+# кромкой по уже обточенной стенке (замерено в NX ISV). Недостижимое ему отдаётся
+# канавочному резцу — так же устроен и заводской техпроцесс. False = всё одним
+# резцом, как было раньше (флаг --no-groove-tool).
+LATHE_GROOVE_TOOL       = True
+LATHE_GROOVE_WIDTH      = 3.0     # желаемая ширина пластины, мм; под узкую канавку
+                                  # подбирается автоматически, но не тоньше _MIN
+LATHE_GROOVE_WIDTH_MIN  = 1.0     # тоньше пластин в ходу не бывает
+LATHE_GROOVE_TOOL_NUMBER = 2      # номер канавочного резца в программе (T2)
 LATHE_STOCK_RADIAL      = 1.0     # припуск прутка по радиусу (только --no-standard-stock)
 LATHE_ALLOWANCE_PER_SIDE = 3.15   # припуск на обточку для подбора проката по ГОСТ, мм
 LATHE_PROFILE_STEP      = 0.1     # шаг сетки z при съёме профиля, мм
@@ -151,6 +165,8 @@ NX_LATHE_MACHINE        = "sim11_turn_2ax_sinumerik"  # токарный ста�
 #   OD_80_L  φ=5°   — левый, точит ОТ патрона: кромка идёт впереди хода
 NX_LATHE_TOOL_SUBTYPE   = "OD_55_R"
 NX_LATHE_ORIENT_ANGLE   = None    # ручной override угла в плане, ° (обычно не нужен)
+NX_LATHE_GROOVE_SUBTYPE = "OD_GROOVE_L"   # подтип канавочного резца в NX (T2)
+NX_LATHE_GROOVE_ORIENT_ANGLE = 90.0       # ориентация пластины канавочного, °
 NX_LATHE_TOOL_PARAMS    = {}      # произвольные свойства TurnToolBuilder, напр.
                                   # {"ThicknessBuilder": 3.18}
 NX_LATHE_ROTATE_TO_SPINDLE = True # сажать заготовку на физическую ось шпинделя
@@ -158,6 +174,8 @@ NX_LATHE_SPINDLE_ROT_AXIS = None  # ручной override оси поворот�
 NX_LATHE_SPINDLE_ROT_ANGLE = None # ручной override угла поворота, °
 NX_LATHE_POSITIONING    = "KeepAssemblyConstraints"  # способ постановки на станок
 NX_LATHE_STARTUP_GRACE  = 90      # сек — сколько ждать, пока стойка начнёт счёт
+NX_LATHE_SETTLE         = 45      # сек без роста машинного времени = конец
+                                  # программы (смена инструмента даёт паузу)
 
 # ── Вывод и система ──────────────────────────────────────────────────────────────
 POSTPROCESSOR   = "grbl"  # диалект G-Code: grbl / linuxcnc / fanuc / mach3_mach4 …
