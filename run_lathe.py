@@ -58,6 +58,13 @@ def main():
                          "уступом отдать канавочному (даёт гребёнку) ")
     ap.add_argument("--no-drill", action="store_true",
                     help="не сверлить и не растачивать осевое отверстие")
+    ap.add_argument("--no-center-drill", action="store_true",
+                    help="без центровки перед сверлением")
+    ap.add_argument("--contour-rough", action="store_true",
+                    help="снимать материал слоями по ЭКВИДИСТАНТЕ чистового "
+                         "пути (Rough1..N с припуском --allowance), а не одним "
+                         "проходом: за один проход глубина резания доходит до "
+                         "6 мм по радиусу, что на станке нереализуемо")
     ap.add_argument("--groove-contour", action="store_true",
                     help="ЭКСПЕРИМЕНТ: чистовой контур канавки углом пластины "
                          "после врезаний (чистит донья, но пока даёт зарез на "
@@ -127,6 +134,9 @@ def main():
             args.allowance if args.allowance is not None
             else getattr(config, "LATHE_ALLOWANCE", 0.2)),
         "finish_only": args.finish_only,
+        "contour_rough": (args.contour_rough
+                          and not args.finish_only
+                          and getattr(config, "LATHE_CONTOUR_ROUGH", True)),
         "groove_contour": args.groove_contour,
         # осевое отверстие: сверление + растачивание (сам контур
         # подставляется ниже, после съёма профиля)
@@ -135,6 +145,13 @@ def main():
         "bore_tool_number": getattr(config, "LATHE_BORE_TOOL_NUMBER", 5),
         "bore_allowance": getattr(config, "LATHE_BORE_ALLOWANCE", 0.75),
         "drill_peck": getattr(config, "LATHE_DRILL_PECK", 5.0),
+        "center_drill": (not args.no_center_drill
+                         and getattr(config, "LATHE_CENTER_DRILL", True)),
+        "center_drill_d": getattr(config, "LATHE_CENTER_DRILL_D", 3.15),
+        "center_drill_depth": getattr(config, "LATHE_CENTER_DRILL_DEPTH", 1.5),
+        "center_tool_number": getattr(config, "LATHE_CENTER_TOOL_NUMBER", 7),
+        "center_speed": getattr(config, "LATHE_CENTER_SPEED", 600),
+        "feed_per_rev_center": getattr(config, "LATHE_FEED_PER_REV_CENTER", 0.05),
         "drill_speed": getattr(config, "LATHE_DRILL_SPEED", 800),
         "bore_speed": getattr(config, "LATHE_BORE_SPEED", 1000),
         "feed_per_rev_drill": getattr(config, "LATHE_FEED_PER_REV_DRILL", 0.06),
@@ -150,6 +167,8 @@ def main():
         "feed_per_rev": (args.feed_rev if args.feed_rev is not None
                          else getattr(config, "LATHE_FEED_PER_REV", 0.15)),
         "feed_per_rev_finish": getattr(config, "LATHE_FEED_PER_REV_FINISH", 0.08),
+        "feed_per_rev_partoff": getattr(config, "LATHE_FEED_PER_REV_PARTOFF", 0.07),
+        "groove_speed": getattr(config, "LATHE_GROOVE_SPEED", 600),
         "spindle_speed": getattr(config, "LATHE_SPINDLE_SPEED", 1500),
         "scan_step": getattr(config, "LATHE_SCAN_STEP", 0.2),
         "diameter_mode": not args.radius_mode,

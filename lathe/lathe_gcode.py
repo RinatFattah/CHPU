@@ -465,16 +465,13 @@ def generate(prof_data, params):
         g.append(f"G0 {X(r_stock + clear)} Z{z:.3f}")
     g.append(f"(Finish operation: FaceOff)")
 
-    # ЧЕРНОВОЙ НЕТ. Убрана намеренно: проходы постоянного радиуса не знают ни
-    # компенсации радиуса при вершине, ни ограничения огибающей, и волочат
-    # кромкой на каждом уклоне — замерено, они давали зарез 0.29 мм на уступе
-    # 43° и 1.23 мм на уступе 75°, тогда как один чистовой проход даёт 0.04.
-    # Съём идёт за один проход на инструмент; для настоящего станка это надо
-    # будет вернуть, но уже с той же дисциплиной по огибающей, что у чистового.
-    n_rough = 0
+    # ЧЕРНОВОЙ ПРОХОДАМИ ПОСТОЯННОГО РАДИУСА НЕТ. Убран намеренно: такие проходы
+    # не знают ни компенсации радиуса при вершине, ни ограничения огибающей, и
+    # волочат кромкой на каждом уклоне — замерено, они давали зарез 0.29 мм на
+    # уступе 43° и 1.23 мм на уступе 75°, тогда как один чистовой даёт 0.04.
+    # Послойный съём вернулся ниже в другом виде — по эквидистанте (--contour-rough).
 
     # 3. чистовой проход по профилю — отрезками и ДУГАМИ
-    op("Finish")
     n_arcs = 0
     # ЭКВИДИСТАНТА: чистовой идёт не по профилю детали, а по траектории
     # ПРОГРАММНОЙ ТОЧКИ резца — иначе на каждом уклоне остаётся зарез r·tg(α).
@@ -505,6 +502,40 @@ def generate(prof_data, params):
         segs = [("line", z, r) for z, r in src[1:]]
     turn_profile = list(profile)  # что оставил T1 (огибающая) — нужно канавкам
     profile = src                # дальше по тексту чистовой идёт по этому пути
+
+    # 2. ЧЕРНОВЫЕ ПРОХОДЫ ПО ЭКВИДИСТАНТЕ (--contour-rough, по умолчанию ВЫКЛ)
+    #
+    # Одним чистовым проходом снять всё нельзя физически: на резьбовом участке
+    # 14-31A это Ø34 → Ø22, то есть 6 мм по радиусу за один проход при подаче
+    # 0.05 мм/об. Заводской T1 берёт то же место слоями (81 рабочий ход при 51
+    # у чистового). Поэтому съём раскладывается на слои — но НЕ так, как в
+    # убранной старой черновой: там проходы шли постоянным радиусом, ничего не
+    # знали ни о компенсации, ни об огибающей, и волочили кромкой на каждом
+    # уклоне (0.29 мм на уступе 43°, 1.23 мм на 75°). Здесь каждый слой — ТА ЖЕ
+    # чистовая траектория, отодвинутая по радиусу: и компенсация, и предел
+    # огибающей уже внутри неё, а материал позади слоя отодвинут ровно на
+    # столько же, так что зазор под вспомогательной кромкой сохраняется.
+    # Выше заготовки путь прижимается к её радиусу — там резец идёт по воздуху.
+    n_rough = 0
+    if params.get("contour_rough", False):
+        ap_r = max(0.05, ap)
+        allow = max(0.0, allowance)
+        deepest = max(r_stock - r for _, r in src)
+        n_rough = max(0, -(-int((deepest - allow) * 1000) // int(ap_r * 1000)))
+        for i in range(n_rough):
+            off = allow + (n_rough - 1 - i) * ap_r
+            pts = _simplify([(z, min(r + off, r_stock)) for z, r in src],
+                            params.get("line_tol", 0.01))
+            op(f"Rough{i + 1}")
+            g.append(f"G0 {X(retract_r)} Z{pts[0][0] + clear:.3f}")
+            g.append(f"G0 {X(pts[0][1])} Z{pts[0][0] + clear:.3f}")
+            g.append(f"G1 {X(pts[0][1])} Z{pts[0][0]:.3f} {fmt(feed)}")
+            for z, r in pts[1:]:
+                g.append(f"G1 {X(r)} Z{z:.3f} {fmt(feed)}")
+            g.append(f"G0 {X(retract_r)} Z{z_end:.3f}")
+            g.append(f"(Finish operation: Rough{i + 1})")
+
+    op("Finish")
     g.append(f"G0 {X(retract_r)} Z{src[0][0] + clear:.3f}")
     g.append(f"G0 {X(src[0][1])} Z{src[0][0] + clear:.3f}")
     g.append(f"G1 {X(src[0][1])} Z{src[0][0]:.3f} {fmt(feed_finish)}")
@@ -591,6 +622,26 @@ def generate(prof_data, params):
         f_dr = params.get("feed_per_rev_drill", 0.06)
         f_bo = params.get("feed_per_rev_bore", 0.05)
         peck = params.get("drill_peck", 5.0)
+
+        # ЦЕНТРОВКА: короткое жёсткое сверло намечает лунку, иначе длинное
+        # спиральное уводит с оси. У завода это T4 Ø3.15 на Z−1.5, F0.05, S600.
+        d_ctr = params.get("center_drill_d", 3.15)
+        if params.get("center_drill", True) and d_drill > d_ctr:
+            t7 = params.get("center_tool_number", 7)
+            z_ctr = z_top_b - params.get("center_drill_depth", 1.5)
+            g.append(f"G0 {X(retract_r)} Z{z_top + clear:.3f}")
+            g.append("M5")
+            g.append(f"T{t7}")
+            g.append("M6")
+            g.append(f"G97 S{params.get('center_speed', 600)} M3")
+            g.append(f"(Tool T{t7}: center drill D{d_ctr:.2f} mm)")
+            n_drill += 1
+            op("DrillCenter1")
+            g.append(f"G0 X0.000 Z{z_top_b + clear:.3f}")
+            g.append(f"G1 X0.000 Z{z_ctr:.3f} "
+                     f"{fmt(params.get('feed_per_rev_center', 0.05))}")
+            g.append(f"G0 X0.000 Z{z_top_b + clear:.3f}")
+            g.append("(Finish operation: DrillCenter1)")
 
         g.append(f"G0 {X(retract_r)} Z{z_top + clear:.3f}")
         g.append("M5")

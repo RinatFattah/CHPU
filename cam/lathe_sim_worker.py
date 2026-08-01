@@ -43,23 +43,36 @@ def parse_moves(path, diameter_mode, arc_step=0.05):
     ВНУТРЕННИЕ операции (Drill*, Bore*) собираются отдельно: они не обтачивают
     снаружи, а выбирают осевое отверстие, и в результате их надо ВЫЧЕСТЬ.
     Сверло к тому же режет своим диаметром, а не точкой, поэтому его диаметр
-    читается из шапки операции — `(Tool T4: twist drill D10.00 mm)`.
+    читается из шапки операции — `(Tool T4: twist drill D10.00 mm)`. Диаметр
+    держится ПОСВЕРЛЁННО: центровочное Ø3.15 идёт перед спиральным Ø10, и один
+    общий диаметр приписал бы центровке чужие 10 мм.
 
-    Возвращает (moves, inner, d_drill).
+    Возвращает (moves, inner, d_drill), где d_drill — наибольший (для лога).
     """
     import math
     moves, inner = [], []
     d_drill = 0.0
+    d_cur = 0.0
     op = ""
+
+    def push(z1, r1, z2, r2):
+        if op.startswith(("Drill", "Bore")):
+            # сверло идёт по оси и режет своим радиусом, а не точкой
+            inner.append((z1, d_cur / 2.0 if r1 < 1e-6 else r1,
+                          z2, d_cur / 2.0 if r2 < 1e-6 else r2))
+        else:
+            moves.append((z1, r1, z2, r2))
+
     x = z = None
     with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
             mo = re.search(r"\(Begin operation: (\S+?)\)", line)
             if mo:
                 op = mo.group(1)
-            md = re.search(r"twist drill D([\d.]+)", line)
+            md = re.search(r"(?:twist|center) drill D([\d.]+)", line)
             if md:
-                d_drill = float(md.group(1))
+                d_cur = float(md.group(1))
+                d_drill = max(d_drill, d_cur)
             line = re.sub(r"\(.*?\)", "", line).strip()
             if not line:
                 continue
@@ -96,21 +109,19 @@ def parse_moves(path, diameter_mode, arc_step=0.05):
                         a = a0 + da * s / steps
                         cz = zc + rad * math.cos(a)
                         cx = xc + rad * math.sin(a)
-                        (inner if op.startswith(("Drill", "Bore"))
-                         else moves).append((pz, px, cz, cx))
+                        push(pz, px, cz, cx)
                         pz, px = cz, cx
                 else:
-                    (inner if op.startswith(("Drill", "Bore"))
-                     else moves).append((z, x, nz, nx))
+                    push(z, x, nz, nx)
             x, z = nx, nz
     return moves, inner, d_drill
 
 
-def inner_envelope(moves, grid, d_drill):
+def inner_envelope(moves, grid):
     """Максимальный радиус, выбранный ВНУТРЕННИМИ операциями, по сетке z.
 
-    Сверло режет своим диаметром, а не точкой: движение по оси (X≈0) снимает
-    радиус d_drill/2. Расточной идёт кромкой, для него берётся сам радиус.
+    Радиус сверла уже подставлен в движения при разборе (parse_moves.push):
+    сверло режет своим диаметром, расточной идёт кромкой.
     """
     reached = [0.0] * len(grid)
     for z1, r1, z2, r2 in moves:
@@ -118,10 +129,7 @@ def inner_envelope(moves, grid, d_drill):
         for i, z in enumerate(grid):
             if lo - 1e-9 <= z <= hi + 1e-9:
                 t = 0.0 if abs(z2 - z1) < 1e-12 else (z - z1) / (z2 - z1)
-                r = r1 + (r2 - r1) * t
-                if r < 1e-6:                 # сверло: режет диаметром
-                    r = d_drill / 2.0
-                reached[i] = max(reached[i], r)
+                reached[i] = max(reached[i], r1 + (r2 - r1) * t)
     return reached
 
 
@@ -200,28 +208,45 @@ def main():
         f"объём {solid.Volume:.1f} мм³")
 
     # ВЫЧЕСТЬ осевое отверстие: сверление и растачивание убирают материал
-    # изнутри, наружная огибающая о них ничего не знает
+    # изнутри, наружная огибающая о них ничего не знает.
+    #
+    # Тело отверстия строится СТОПКОЙ ЦИЛИНДРОВ, а не вращением контура.
+    # Вращение давало у отверстия внутреннюю стенку радиусом r_eps — ровно
+    # такую же, как у наружного результата (он тоже клампится r_eps у оси).
+    # Две совпадающие цилиндрические грани на оси — вырожденный случай для
+    # булевой операции OCCT: `cut` возвращался БЕЗ ошибки и почти без съёма
+    # (на 22-13A вычиталось 1045 мм³ вместо 17000). У цельного цилиндра
+    # стенки на оси нет, и вырождение исчезает.
     if inner:
-        r_in = inner_envelope(inner, grid, d_drill)
-        seg = [(z, r) for z, r in zip(grid, r_in) if r > r_eps]
-        if len(seg) >= 2:
-            ipts = [App.Vector(max(r, r_eps), 0, z) for z, r in seg]
-            iclean = [ipts[0]]
-            for v in ipts[1:]:
-                if (v - iclean[-1]).Length > 1e-7:
-                    iclean.append(v)
-            iw = Part.makePolygon(iclean)
-            iback = Part.makePolygon([iclean[-1],
-                                      App.Vector(r_eps, 0, iclean[-1].z),
-                                      App.Vector(r_eps, 0, iclean[0].z),
-                                      iclean[0]])
+        r_in = inner_envelope(inner, grid)
+        # ступени постоянного радиуса: отверстие — это сверло Ø d и расточка Ø D,
+        # то есть единицы цилиндров, а не тысяча точек профиля
+        runs = []                                    # [z_low, z_high, r]
+        for z, r in zip(grid, r_in):
+            if r <= r_eps:
+                continue
+            rq = round(r / 0.01) * 0.01
+            if runs and abs(runs[-1][2] - rq) < 1e-9 and z - runs[-1][1] < 1.5 * step:
+                runs[-1][1] = z
+            else:
+                runs.append([z, z, rq])
+        if runs:
+            # сверло входит СВЕРХУ: всё, что выше самой верхней просверленной
+            # точки, оно уже прошло насквозь — верхнюю ступень продлеваем за торец
+            runs[-1][1] = max(runs[-1][1], z_hi) + 1.0
+            if runs[0][0] <= z_lo + step:            # сквозное — продлить и вниз
+                runs[0][0] -= 1.0
             try:
-                iface = Part.Face(Part.Wire(iw.Edges + iback.Edges))
-                bore_solid = iface.revolve(App.Vector(0, 0, 0),
-                                           App.Vector(0, 0, 1), 360)
+                bore_solid = None
+                for z0, z1, r in runs:
+                    h = (z1 - z0) + step             # перекрытие соседних ступеней
+                    cyl = Part.makeCylinder(r, h, App.Vector(0, 0, z0 - step / 2))
+                    bore_solid = cyl if bore_solid is None else bore_solid.fuse(cyl)
+                v0 = solid.Volume
                 solid = solid.cut(bore_solid)
-                log(f"осевое отверстие вычтено: Ø{2 * max(r for _, r in seg):.2f} "
-                    f"x {seg[0][0] - seg[-1][0]:.2f} мм, "
+                log(f"осевое отверстие вычтено: Ø{2 * max(r[2] for r in runs):.2f} "
+                    f"x {runs[-1][1] - runs[0][0]:.2f} мм, ступеней {len(runs)}, "
+                    f"снято {v0 - solid.Volume:.1f} мм³, "
                     f"объём стал {solid.Volume:.1f} мм³")
             except Exception as e:
                 log(f"warn: отверстие не вычлось: {e}")
