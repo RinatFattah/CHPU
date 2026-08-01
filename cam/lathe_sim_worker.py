@@ -35,16 +35,31 @@ def log(msg):
 
 
 def parse_moves(path, diameter_mode, arc_step=0.05):
-    """G-код → список рабочих движений [(z1, r1, z2, r2)] в РАДИУСАХ.
+    """G-код → рабочие движения [(z1, r1, z2, r2)] в РАДИУСАХ, наружные и внутренние.
 
     Дуги G2/G3 разбиваются на хорды длиной ~arc_step: иначе съём считался бы
     по хорде во всю дугу, и выигрыш от дуг в чистовом проходе был бы не виден.
+
+    ВНУТРЕННИЕ операции (Drill*, Bore*) собираются отдельно: они не обтачивают
+    снаружи, а выбирают осевое отверстие, и в результате их надо ВЫЧЕСТЬ.
+    Сверло к тому же режет своим диаметром, а не точкой, поэтому его диаметр
+    читается из шапки операции — `(Tool T4: twist drill D10.00 mm)`.
+
+    Возвращает (moves, inner, d_drill).
     """
     import math
-    moves = []
+    moves, inner = [], []
+    d_drill = 0.0
+    op = ""
     x = z = None
     with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
+            mo = re.search(r"\(Begin operation: (\S+?)\)", line)
+            if mo:
+                op = mo.group(1)
+            md = re.search(r"twist drill D([\d.]+)", line)
+            if md:
+                d_drill = float(md.group(1))
             line = re.sub(r"\(.*?\)", "", line).strip()
             if not line:
                 continue
@@ -81,12 +96,33 @@ def parse_moves(path, diameter_mode, arc_step=0.05):
                         a = a0 + da * s / steps
                         cz = zc + rad * math.cos(a)
                         cx = xc + rad * math.sin(a)
-                        moves.append((pz, px, cz, cx))
+                        (inner if op.startswith(("Drill", "Bore"))
+                         else moves).append((pz, px, cz, cx))
                         pz, px = cz, cx
                 else:
-                    moves.append((z, x, nz, nx))
+                    (inner if op.startswith(("Drill", "Bore"))
+                     else moves).append((z, x, nz, nx))
             x, z = nx, nz
-    return moves
+    return moves, inner, d_drill
+
+
+def inner_envelope(moves, grid, d_drill):
+    """Максимальный радиус, выбранный ВНУТРЕННИМИ операциями, по сетке z.
+
+    Сверло режет своим диаметром, а не точкой: движение по оси (X≈0) снимает
+    радиус d_drill/2. Расточной идёт кромкой, для него берётся сам радиус.
+    """
+    reached = [0.0] * len(grid)
+    for z1, r1, z2, r2 in moves:
+        lo, hi = (z1, z2) if z1 <= z2 else (z2, z1)
+        for i, z in enumerate(grid):
+            if lo - 1e-9 <= z <= hi + 1e-9:
+                t = 0.0 if abs(z2 - z1) < 1e-12 else (z - z1) / (z2 - z1)
+                r = r1 + (r2 - r1) * t
+                if r < 1e-6:                 # сверло: режет диаметром
+                    r = d_drill / 2.0
+                reached[i] = max(reached[i], r)
+    return reached
 
 
 def envelope(moves, z_lo, z_hi, step, r_stock):
@@ -122,8 +158,9 @@ def main():
     z_lo = p["stock_z_bottom"]
     step = p.get("step", 0.05)
 
-    moves = parse_moves(p["gcode"], p.get("diameter_mode", True))
-    log(f"рабочих движений (G1/G2/G3): {len(moves)}")
+    moves, inner, d_drill = parse_moves(p["gcode"], p.get("diameter_mode", True))
+    log(f"рабочих движений (G1/G2/G3): наружных {len(moves)}, "
+        f"внутренних {len(inner)}" + (f", сверло Ø{d_drill:g}" if d_drill else ""))
 
     grid, reached = envelope(moves, z_lo, z_hi, step, r_stock)
     cut = sum(1 for r in reached if r < r_stock - 1e-6)
@@ -161,6 +198,33 @@ def main():
     bb = solid.BoundBox
     log(f"результат: Ø{max(bb.XLength, bb.YLength):.2f} x {bb.ZLength:.2f} мм, "
         f"объём {solid.Volume:.1f} мм³")
+
+    # ВЫЧЕСТЬ осевое отверстие: сверление и растачивание убирают материал
+    # изнутри, наружная огибающая о них ничего не знает
+    if inner:
+        r_in = inner_envelope(inner, grid, d_drill)
+        seg = [(z, r) for z, r in zip(grid, r_in) if r > r_eps]
+        if len(seg) >= 2:
+            ipts = [App.Vector(max(r, r_eps), 0, z) for z, r in seg]
+            iclean = [ipts[0]]
+            for v in ipts[1:]:
+                if (v - iclean[-1]).Length > 1e-7:
+                    iclean.append(v)
+            iw = Part.makePolygon(iclean)
+            iback = Part.makePolygon([iclean[-1],
+                                      App.Vector(r_eps, 0, iclean[-1].z),
+                                      App.Vector(r_eps, 0, iclean[0].z),
+                                      iclean[0]])
+            try:
+                iface = Part.Face(Part.Wire(iw.Edges + iback.Edges))
+                bore_solid = iface.revolve(App.Vector(0, 0, 0),
+                                           App.Vector(0, 0, 1), 360)
+                solid = solid.cut(bore_solid)
+                log(f"осевое отверстие вычтено: Ø{2 * max(r for _, r in seg):.2f} "
+                    f"x {seg[0][0] - seg[-1][0]:.2f} мм, "
+                    f"объём стал {solid.Volume:.1f} мм³")
+            except Exception as e:
+                log(f"warn: отверстие не вычлось: {e}")
 
     solid.exportStep(p["out_step"])
     log(f"OK volume={solid.Volume:.1f} step={p['out_step']}")

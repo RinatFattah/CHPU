@@ -56,6 +56,8 @@ def main():
     ap.add_argument("--no-left-tool", action="store_true",
                     help="не использовать левый проходной резец T3 — участки за "
                          "уступом отдать канавочному (даёт гребёнку) ")
+    ap.add_argument("--no-drill", action="store_true",
+                    help="не сверлить и не растачивать осевое отверстие")
     ap.add_argument("--groove-contour", action="store_true",
                     help="ЭКСПЕРИМЕНТ: чистовой контур канавки углом пластины "
                          "после врезаний (чистит донья, но пока даёт зарез на "
@@ -126,6 +128,21 @@ def main():
             else getattr(config, "LATHE_ALLOWANCE", 0.2)),
         "finish_only": args.finish_only,
         "groove_contour": args.groove_contour,
+        # осевое отверстие: сверление + растачивание (сам контур
+        # подставляется ниже, после съёма профиля)
+        "drill": not args.no_drill and getattr(config, "LATHE_DRILL", True),
+        "drill_tool_number": getattr(config, "LATHE_DRILL_TOOL_NUMBER", 4),
+        "bore_tool_number": getattr(config, "LATHE_BORE_TOOL_NUMBER", 5),
+        "bore_allowance": getattr(config, "LATHE_BORE_ALLOWANCE", 0.75),
+        "drill_peck": getattr(config, "LATHE_DRILL_PECK", 5.0),
+        "drill_speed": getattr(config, "LATHE_DRILL_SPEED", 800),
+        "bore_speed": getattr(config, "LATHE_BORE_SPEED", 1000),
+        "feed_per_rev_drill": getattr(config, "LATHE_FEED_PER_REV_DRILL", 0.06),
+        "feed_per_rev_bore": getattr(config, "LATHE_FEED_PER_REV_BORE", 0.05),
+        # резьба: только по явно заданному обозначению (из модели не вывести)
+        "threads": getattr(config, "LATHE_THREADS", None) or [],
+        "thread_tool_number": getattr(config, "LATHE_THREAD_TOOL_NUMBER", 6),
+        "thread_speed": getattr(config, "LATHE_THREAD_SPEED", 600),
         "clearance": getattr(config, "LATHE_CLEARANCE", 2.0),
         "feed": getattr(config, "LATHE_FEED", 150.0),
         "feed_finish": getattr(config, "LATHE_FEED_FINISH", 80.0),
@@ -199,12 +216,20 @@ def main():
     print(f"✅ Профиль: {len(prof['profile'])} точек, "
           f"Ø{2 * prof['max_radius']:.2f} x {prof['length']:.2f} мм")
 
+    p["bore"] = prof.get("bore_raw") or []
     stats = lathe_gcode.write(prof, p, gcode)
     print(f"✅ Программа: {stats['lines']} строк → {gcode} "
           f"({os.path.getsize(gcode):,} байт)")
     print(f"   операции: {', '.join(stats['ops'][:8])}"
           + (f" … всего {len(stats['ops'])}" if len(stats['ops']) > 8 else "")
           + (f" | дуг в чистовом: {stats['arcs']}" if stats.get("arcs") else ""))
+    for th in stats.get("thread_candidates", []):
+        print(f"   ⓘ похоже на резьбу: Ø{th['d_model']:.2f} на z "
+              f"{th['z_hi']:.1f}..{th['z_lo']:.1f} ({th['length']:.1f} мм) — "
+              f"ряд ГОСТ 8724 даёт M{th['d']}; шаг из модели НЕ определить, "
+              f"задайте LATHE_THREADS")
+    if stats.get("threads"):
+        print(f"   T6 резьбовой: {stats['threads']} резьб(ы) нарезано")
     if stats.get("left_passes"):
         print(f"   T3 левый проходной: {stats['left_passes']} проход(а), "
               f"{stats['left_volume_mm3']:.0f} мм³ — правому резцу за уступ "

@@ -287,6 +287,56 @@ def compensate_nose(profile, nose_radius, tip=(1.0, -1.0)):
     return out
 
 
+# Ряд диаметров спиральных свёрл (ГОСТ 885), мм. Берём ближайшее МЕНЬШЕЕ —
+# отверстие потом доводится расточным резцом в размер.
+DRILL_SERIES = [2.0, 2.5, 3.0, 3.2, 3.5, 4.0, 4.2, 4.5, 5.0, 5.5, 6.0, 6.5,
+                7.0, 7.5, 8.0, 8.5, 9.0, 9.5, 10.0, 10.5, 11.0, 11.5, 12.0,
+                12.5, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 22.0,
+                24.0, 25.0, 26.0, 28.0, 30.0]
+
+
+# Ряд наружных диаметров метрической резьбы (ГОСТ 8724), мм
+METRIC_MAJOR = [6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 27, 30, 33, 36, 39, 42]
+
+
+def find_thread_candidates(profile, min_len=3.0, tol=0.3):
+    """Гладкие цилиндры, похожие на резьбовые участки.
+
+    РЕЗЬБЫ В МОДЕЛИ НЕТ: CAD несёт только наружный диаметр, а шаг знает лишь
+    чертёж (у 14-31A это Ø22 → M22×1.5, и определить «×1.5» из геометрии
+    нельзя — у M22 бывают шаги 2.5, 1.5 и 1.0). Поэтому здесь только КАНДИДАТЫ:
+    цилиндр длиной от min_len, чей диаметр попадает в ряд ГОСТ 8724. Нарезание
+    включается, только когда обозначение задано явно (LATHE_THREADS).
+
+    Возвращает [{"d", "z_hi", "z_lo", "length"}].
+    """
+    out = []
+    i = 0
+    pts = sorted(profile, key=lambda t: -t[0])
+    n = len(pts)
+    while i < n - 1:
+        j = i
+        while j + 1 < n and abs(pts[j + 1][1] - pts[i][1]) < 0.02:
+            j += 1
+        length = pts[i][0] - pts[j][0]
+        d = 2 * pts[i][1]
+        if length >= min_len:
+            near = [m for m in METRIC_MAJOR if abs(m - d) <= tol]
+            if near:
+                out.append({"d": near[0], "d_model": round(d, 3),
+                            "z_hi": pts[i][0], "z_lo": pts[j][0],
+                            "length": round(length, 2)})
+        i = max(j, i + 1)
+    return out
+
+
+def _pick_drill(d_max, series=None):
+    """Наибольшее сверло из ряда, не превышающее d_max."""
+    ser = series or DRILL_SERIES
+    fit = [d for d in ser if d <= d_max + 1e-9]
+    return max(fit) if fit else min(ser)
+
+
 def compensate_nose_left(profile_asc, nose_radius, tip=(1.0, -1.0)):
     """Эквидистанта для ЛЕВОГО резца (идёт в +Z). Профиль подаётся по
     возрастанию z. Считается зеркалированием по z и той же функцией, что для
@@ -517,6 +567,106 @@ def generate(prof_data, params):
         g.append(f"G0 {X(retract_r)} Z{path[-1][0]:.3f}")
         g.append(f"(Finish operation: LeftTurn{n_left})")
 
+
+    # 3c. ОСЕВОЕ ОТВЕРСТИЕ: сверление T4 + растачивание T5
+    #
+    # У этих деталей отверстие даёт больше половины съёма (14-31A: 2718 мм³ из
+    # 4990, 22-13A: 10007 из 17344), так что без него программа неполна. Схема
+    # заводская: сверлим с недоходом по диаметру, затем растачиваем в размер —
+    # у них на 14-31A это сверло Ø10 и расточной до Ø11.9.
+    n_drill = 0
+    bore = params.get("bore") or []
+    bore = [(z, r) for z, r in bore if r > 0.05]
+    if bore and params.get("drill", True):
+        z_top_b = max(z for z, _ in bore)
+        z_bot_b = min(z for z, _ in bore)
+        r_bore = min(r for _, r in bore)           # самое узкое место отверстия
+        d_bore = 2 * r_bore
+        allow = params.get("bore_allowance", 0.75)
+        d_drill = _pick_drill(d_bore - 2 * allow,
+                              params.get("drill_series"))
+        depth = z_bot_b - (0.3 * d_drill if z_bot_b <= z_end + 1e-6 else 0.0)
+        t4 = params.get("drill_tool_number", 4)
+        t5 = params.get("bore_tool_number", 5)
+        f_dr = params.get("feed_per_rev_drill", 0.06)
+        f_bo = params.get("feed_per_rev_bore", 0.05)
+        peck = params.get("drill_peck", 5.0)
+
+        g.append(f"G0 {X(retract_r)} Z{z_top + clear:.3f}")
+        g.append("M5")
+        g.append(f"T{t4}")
+        g.append("M6")
+        g.append(f"G97 S{params.get('drill_speed', 800)} M3")
+        g.append(f"(Tool T{t4}: twist drill D{d_drill:.2f} mm)")
+        n_drill += 1
+        op("Drill1")
+        g.append(f"G0 X0.000 Z{z_top_b + clear:.3f}")
+        z_cur = z_top_b
+        while z_cur > depth + 1e-6:
+            z_next = max(z_cur - peck, depth)
+            g.append(f"G1 X0.000 Z{z_next:.3f} {fmt(f_dr)}")
+            g.append(f"G0 X0.000 Z{z_top_b + clear:.3f}")   # вывод стружки
+            if z_next > depth + 1e-6:
+                g.append(f"G0 X0.000 Z{z_next + 0.5:.3f}")
+            z_cur = z_next
+        g.append("(Finish operation: Drill1)")
+
+        # растачивание в размер, если сверло меньше отверстия
+        if d_bore - d_drill > 0.05:
+            g.append(f"G0 {X(retract_r)} Z{z_top + clear:.3f}")
+            g.append("M5")
+            g.append(f"T{t5}")
+            g.append("M6")
+            g.append(f"G97 S{params.get('bore_speed', 1000)} M3")
+            g.append(f"(Tool T{t5}: boring bar, to D{d_bore:.2f} mm)")
+            op("Bore1")
+            d_safe = d_drill - 1.0
+            g.append(f"G0 {X(d_safe / 2)} Z{z_top_b + clear:.3f}")
+            g.append(f"G1 {X(d_bore / 2)} Z{z_top_b:.3f} {fmt(f_bo)}")
+            g.append(f"G1 {X(d_bore / 2)} Z{z_bot_b:.3f} {fmt(f_bo)}")
+            g.append(f"G0 {X(d_safe / 2)} Z{z_bot_b:.3f}")
+            g.append(f"G0 {X(d_safe / 2)} Z{z_top_b + clear:.3f}")
+            g.append("(Finish operation: Bore1)")
+
+
+    # 3d. НАРЕЗАНИЕ РЕЗЬБЫ T6 — только по явно заданному обозначению
+    #
+    # Из модели резьбу не вывести: CAD несёт гладкий цилиндр наружного диаметра,
+    # а шаг знает только чертёж. Поэтому участки лишь ДЕТЕКТИРУЮТСЯ и попадают
+    # в отчёт, а режутся, если обозначение задано (LATHE_THREADS).
+    n_thread = 0
+    for th in (params.get("threads") or []):
+        pitch = float(th["pitch"])
+        d_maj = float(th.get("d") or th["d_major"])
+        z_hi_t = float(th["z_from"])
+        z_lo_t = float(th["z_to"])
+        # глубина профиля метрической резьбы h = 0.6134·P (ГОСТ 24705)
+        h = th.get("depth") or 0.6134 * pitch
+        d_min_t = d_maj - 2 * h
+        stepd = th.get("step", 0.1)          # съём за проход по ДИАМЕТРУ
+        n_thread += 1
+        if n_thread == 1:
+            g.append(f"G0 {X(retract_r)} Z{z_top + clear:.3f}")
+            g.append("M5")
+            g.append(f"T{params.get('thread_tool_number', 6)}")
+            g.append("M6")
+            g.append(f"G97 S{params.get('thread_speed', 600)} M3")
+            g.append(f"(Tool T{params.get('thread_tool_number', 6)}: "
+                     f"threading insert)")
+        op(f"Thread{n_thread}")
+        g.append(f"(Thread M{d_maj:g}x{pitch:g}, depth {h:.3f} mm)")
+        d_cur = d_maj - stepd
+        while d_cur > d_min_t - 1e-9:
+            g.append(f"G0 X{d_cur:.3f} Z{z_hi_t + clear:.3f}"
+                     if dia else f"G0 X{d_cur / 2:.3f} Z{z_hi_t + clear:.3f}")
+            # G33 — нарезание с шагом F (мм/об), синхронно со шпинделем
+            g.append(f"G33 {'X%.3f' % d_cur if dia else 'X%.3f' % (d_cur / 2)} "
+                     f"Z{z_lo_t:.3f} F{pitch:.3f}")
+            g.append(f"G0 {X(retract_r)} Z{z_lo_t:.3f}")
+            g.append(f"G0 {X(retract_r)} Z{z_hi_t + clear:.3f}")
+            d_cur -= stepd
+        g.append(f"(Finish operation: Thread{n_thread})")
+
     # 4. канавки и отрезка — КАНАВОЧНЫМ резцом T2
     #
     # Проходной резец сюда не лезет: он клин, и врезаясь вглубь волочит
@@ -646,6 +796,8 @@ def generate(prof_data, params):
              "arcs": n_arcs, "grooves": n_groove, "blade": blade,
              "blade_tight": blade_tight,
              "groove_volume_mm3": sum(gr["volume_mm3"] for gr in grooves),
+             "drills": n_drill, "threads": n_thread,
+             "thread_candidates": find_thread_candidates(part_profile),
              "left_passes": n_left,
              "left_volume_mm3": sum(lz["volume_mm3"] for lz in doable),
              "second_setup": [(lz["z_hi"], lz["z_lo"], lz["volume_mm3"])
