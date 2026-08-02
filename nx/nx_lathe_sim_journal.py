@@ -176,7 +176,21 @@ def make_tool(setup, subtype, uname, props, used, report, pocket_no=None):
                 except Exception as e:
                     log(f"warn: {prop}={val} не применилось: "
                         f"{type(e).__name__}: {e}")
-        tb.Commit()
+        # Commit ОБЯЗАН быть под try. NX валидирует резец целиком и на неудачном
+        # сочетании подтипа и размеров бросает исключение с посторонним текстом
+        # (на OD_35_R + Size 6.35 это «диаметр спирали должен быть больше
+        # минимальной длины погружения» — сообщение от фрезы). Без перехвата
+        # падал ВЕСЬ журнал, то есть один неудачный инструмент отменял симуляцию.
+        try:
+            tb.Commit()
+        except Exception as e:
+            log(f"warn: {subtype} в {pname} не принят NX ({e}) — карман освобождаю")
+            try:
+                tb.Destroy()
+            except Exception:
+                pass
+            used.discard(pname)
+            return None
         tb.Destroy()
         check = []
         try:
@@ -352,7 +366,14 @@ def main():
         if len(used) == before and fsub != subtype:
             log(f"подтип {fsub} не создался — ставлю {subtype} (как у чернового); "
                 f"в ISV чистовой будет волочить сильнее настоящего, на G-код не влияет")
-            make_tool(setup, subtype, "TURN_OD_FIN", fprops, used,
+            # с подтипом чернового берём и его углы: чужой угол при вершине —
+            # ровно то, на чём валится валидация NX
+            make_tool(setup, subtype, "TURN_OD_FIN",
+                      [("NoseRadiusBuilder", float(p.get("nose_radius", 0.4))),
+                       ("TlNumberBuilder", ft),
+                       ("NoseAngleBuilder", float(p.get("nose_angle", 55.0))),
+                       ("SizeBuilder", float(p.get("insert_size", 6.35)))],
+                      used,
                       ("NoseAngleBuilder", "NoseRadiusBuilder", "SizeBuilder"),
                       pocket_no=ft)
 
