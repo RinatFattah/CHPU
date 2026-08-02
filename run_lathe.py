@@ -387,6 +387,10 @@ def main():
     if args.simulate:
         print("Симуляция на виртуальном токарном станке NX ISV "
               "(откроется окно NX, трогать не нужно)...")
+        if prof2 is not None:
+            print("   ⚠  в ISV идёт ТОЛЬКО программа первого установа: перехват "
+                  "детали и вторая заготовка там не автоматизированы. Полный "
+                  "результат двух установов даёт --simulate-own")
         from nx import nx_lathe_sim
         try:
             res = nx_lathe_sim.simulate(gcode, stem + "_stock.stp",
