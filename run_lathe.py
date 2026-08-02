@@ -265,7 +265,7 @@ def main():
     # уже обточенное и делает второй конец. Так же устроен заводской эталон.
     prof2 = p2 = gcode2 = None
     z_split = None
-    if args.two_setups:
+    if args.two_setups or getattr(config, "LATHE_TWO_SETUPS", False):
         from lathe import lathe_setups
         z_end = min(z for z, _ in prof["profile"])
         grip = (args.grip_length if args.grip_length is not None
