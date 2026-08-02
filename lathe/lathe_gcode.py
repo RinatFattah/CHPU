@@ -431,6 +431,10 @@ def generate(prof_data, params):
 
     g.append(f"(Lathe part: L{prof_data['length']:.2f} x "
              f"Dmax{2 * prof_data['max_radius']:.2f} mm)")
+    # Установ. Во втором деталь перевёрнута и НУЛЬ ДРУГОЙ — без этой строки
+    # программу невозможно поставить на станок правильно.
+    if params.get("setup_note"):
+        g.append(f"({params['setup_note']})")
     pick = prof_data.get("stock_pick")
     if pick and pick.get("kind") == "hex":
         g.append(f"(Stock: HEX bar S{pick['size']:g} [{pick['series']}], "
@@ -778,7 +782,17 @@ def generate(prof_data, params):
     groove_cuts = []
     t2 = params.get("groove_tool_number", 2)
     want_partoff = params.get("partoff", True)
-    if grooves or (want_partoff and blade):
+    t2_ready = []
+
+    def ensure_t2():
+        """Смена на канавочный — ЛЕНИВО, при первом настоящем использовании.
+
+        Канавка может оказаться пустой (проходной резец добрал её сам), и
+        эагерная смена оставляла в программе холостой блок T2 без единого хода.
+        """
+        if t2_ready:
+            return
+        t2_ready.append(True)
         g.append(f"G0 {X(retract_r)} Z{z_top + clear:.3f}")
         g.append("M5")            # смена инструмента — на остановленном шпинделе
         g.append(f"T{t2}")
@@ -835,6 +849,7 @@ def generate(prof_data, params):
         if not cuts:
             continue
         n_groove += 1
+        ensure_t2()
         op(f"Groove{n_groove}")
         for z_c, r_t in cuts:
             plunge(z_c, r_t)
@@ -866,11 +881,17 @@ def generate(prof_data, params):
         g.append(f"(Finish operation: Groove{n_groove})")
 
     if want_partoff:
+        ensure_t2()
         op("Partoff")
         # рез ВПЛОТНУЮ к торцу детали: правая грань пластины в z_end, значит её
         # середина — на полширины дальше. Прежний вариант (z_end − 3) резал
         # заведомо мимо детали, то есть не отрезал ничего.
-        z_cut = z_end - (blade / 2.0 if blade else params.get("partoff_width", 3.0))
+        # partoff_z_ref — где на самом деле торец детали. В первом установе из
+        # двух профиль обрезан по границе передачи работы, и z_end до торца не
+        # доходит: резать надо по настоящему торцу, иначе отрежем полдетали.
+        z_ref = params.get("partoff_z_ref")
+        z_ref = z_end if z_ref is None else float(z_ref)
+        z_cut = z_ref - (blade / 2.0 if blade else params.get("partoff_width", 3.0))
         g.append(f"G0 {X(retract_r)} Z{z_cut:.3f}")
         g.append(f"G1 X0.000 Z{z_cut:.3f} {fmt(feed_partoff)}")
         g.append(f"G0 {X(retract_r)} Z{z_cut:.3f}")

@@ -22,26 +22,44 @@ _WORKER = os.path.join(_ROOT, "cam", "lathe_sim_worker.py")
 
 
 def simulate(gcode_path, prof_data, out_step, step=0.05, diameter_mode=True,
-             verbose=True):
+             verbose=True, stock_profile=None, stock_bore=None, z_mirror=None):
+    """Съём материала по программе.
+
+    stock_profile / stock_bore — что осталось от ПРЕДЫДУЩЕГО установа (иначе
+    исходный пруток); z_mirror — программа написана в СК перевёрнутой детали
+    (второй установ), считать её надо в исходной: z' = z_mirror − z.
+
+    Возвращает {"step", "volume", "profile", "bore"} — профили результата, их и
+    передают следующему установу.
+    """
     fc = freecad_cam.find_freecadcmd()
     if not fc:
         raise RuntimeError("freecadcmd не найден")
 
+    # ASCII-путь для OCCT + PID в имени: без него два прогона (пакетный и
+    # ручной) пишут в одни и те же файлы и молча портят друг другу результат.
     tdir = tempfile.gettempdir()
-    tmp_g = os.path.join(tdir, "lathe_sim.gcode")     # OCCT/py — ASCII-путь
-    tmp_step = os.path.join(tdir, "lathe_sim_out.stp")
+    pid = os.getpid()
+    tmp_g = os.path.join(tdir, f"lathe_sim_{pid}.gcode")
+    tmp_step = os.path.join(tdir, f"lathe_sim_out_{pid}.stp")
+    tmp_json = os.path.join(tdir, f"lathe_sim_out_{pid}.json")
     shutil.copyfile(gcode_path, tmp_g)
-    if os.path.exists(tmp_step):
-        os.unlink(tmp_step)
+    for f_old in (tmp_step, tmp_json):
+        if os.path.exists(f_old):
+            os.unlink(f_old)
 
     params = {
         "gcode": tmp_g,
         "out_step": tmp_step,
+        "out_json": tmp_json,
         "stock_radius": prof_data["stock_radius"],
         "stock_z_top": prof_data["stock_z_top"],
         "stock_z_bottom": prof_data["stock_z_bottom"],
         "step": step,
         "diameter_mode": diameter_mode,
+        "stock_profile": stock_profile,
+        "stock_bore": stock_bore,
+        "z_mirror": z_mirror,
     }
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
                                      encoding="utf-8") as t:
@@ -79,4 +97,9 @@ def simulate(gcode_path, prof_data, out_step, step=0.05, diameter_mode=True,
 
     shutil.move(tmp_step, out_step)
     vol = float(ok.split("volume=")[1].split()[0])
-    return {"step": out_step, "volume": vol}
+    res = {"step": out_step, "volume": vol}
+    if os.path.exists(tmp_json):
+        with open(tmp_json, encoding="utf-8") as f:
+            res.update(json.load(f))
+        os.unlink(tmp_json)
+    return res

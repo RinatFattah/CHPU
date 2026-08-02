@@ -60,6 +60,17 @@ def main():
                     help="не сверлить и не растачивать осевое отверстие")
     ap.add_argument("--no-center-drill", action="store_true",
                     help="без центровки перед сверлением")
+    ap.add_argument("--two-setups", action="store_true",
+                    help="разбить работу на ДВА УСТАНОВА (перехват), как на "
+                         "заводе: первый точит конец детали, сверлит насквозь и "
+                         "отрезает, второй берётся за обточенное и делает "
+                         "второй конец. Вторая программа — <gcode>_2.gcode")
+    ap.add_argument("--grip-length", type=float, metavar="MM",
+                    help="сколько длины закрывают кулачки патрона, мм "
+                         "(дефолт 15) — короче этого обточенный поясок не даёт "
+                         "перехватить деталь")
+    ap.add_argument("--split-z", type=float, metavar="Z",
+                    help="вручную задать z передачи работы второму установу")
     ap.add_argument("--no-finish-tool", action="store_true",
                     help="чистовую вести тем же резцом, что и черновую (без "
                          "отдельного 35°-ромба T8): в уступы точение зайдёт "
@@ -247,6 +258,48 @@ def main():
           f"Ø{2 * prof['max_radius']:.2f} x {prof['length']:.2f} мм")
 
     p["bore"] = prof.get("bore_raw") or []
+
+    # ── ДВА УСТАНОВА (перехват) ──
+    # Обточить то, за что держишь, нельзя, поэтому работа делится на два зажима:
+    # первый точит конец детали, сверлит насквозь и отрезает; второй берётся за
+    # уже обточенное и делает второй конец. Так же устроен заводской эталон.
+    prof2 = p2 = gcode2 = None
+    z_split = None
+    if args.two_setups:
+        from lathe import lathe_setups
+        z_end = min(z for z, _ in prof["profile"])
+        grip = (args.grip_length if args.grip_length is not None
+                else getattr(config, "LATHE_GRIP_LENGTH", 15.0))
+        face_allow = getattr(config, "LATHE_SECOND_FACE_ALLOWANCE", 2.0)
+        z_split = lathe_setups.choose_split(
+            prof["profile"], z_end, grip,
+            override=(args.split_z if args.split_z is not None
+                      else getattr(config, "LATHE_SPLIT_Z", None)))
+        overlap = getattr(config, "LATHE_SETUP_OVERLAP", 2.0)
+        prof1, prof2 = lathe_setups.split(prof, z_split, face_allow, overlap)
+        th1, th2, th_over = lathe_setups.split_threads(p.get("threads"),
+                                                       z_split, z_end)
+        p2 = dict(p)
+        p2.update(threads=th2, drill=False, partoff=False, bore=[],
+                  setup_note=(f"SETUP 2 of 2: part re-gripped and FLIPPED, "
+                              f"Z0 = far face (was Z{z_end:.2f} in setup 1), "
+                              f"stock = result of setup 1"))
+        p.update(threads=th1, partoff_z_ref=z_end - face_allow,
+                 setup_note=(f"SETUP 1 of 2: from bar, Z0 = right face, "
+                             f"turns Z 0..{z_split:.2f}, drills through, "
+                             f"parts off at Z{z_end - face_allow:.2f}"))
+        prof = prof1
+        gcode2 = os.path.splitext(gcode)[0] + "_2" + os.path.splitext(gcode)[1]
+        print(f"Два установа: передача работы на z {z_split:.1f} "
+              f"(зажим {grip:g} мм, припуск на подрезку {face_allow:g} мм)")
+        print(f"   установ 1: z {0.0:.1f}..{z_split:.1f} + отверстие насквозь + "
+              f"отрезка на z {z_end - face_allow:.1f}")
+        print(f"   установ 2: z {z_end:.1f}..{z_split:.1f} после перехвата "
+              f"(в своей СК z' 0.0..{z_end - z_split:.1f})")
+        for th in th_over:
+            print(f"   ⚠  резьба Ø{th['d']} на z {th['z_from']}..{th['z_to']} "
+                  f"пересекает границу установов — оставлена первому целиком")
+
     stats = lathe_gcode.write(prof, p, gcode)
     print(f"✅ Программа: {stats['lines']} строк → {gcode} "
           f"({os.path.getsize(gcode):,} байт)")
@@ -287,12 +340,34 @@ def main():
         print("   T2 отключён (--no-groove-tool): канавки режет проходной резец, "
               "он подрежет стенку позади")
 
+    if prof2 is not None:
+        stats2 = lathe_gcode.write(prof2, p2, gcode2)
+        print(f"✅ Программа установа 2: {stats2['lines']} строк → {gcode2} "
+              f"({os.path.getsize(gcode2):,} байт)")
+        print(f"   операции: {', '.join(stats2['ops'][:8])}"
+              + (f" … всего {len(stats2['ops'])}" if len(stats2['ops']) > 8 else ""))
+
     if args.simulate_own:
         print("Съём материала по программе...")
         from lathe import lathe_sim
         try:
-            res = lathe_sim.simulate(gcode, prof, stem + "_sim.step",
-                                     diameter_mode=p["diameter_mode"])
+            res = lathe_sim.simulate(
+                gcode, prof,
+                stem + ("_sim1.step" if prof2 is not None else "_sim.step"),
+                diameter_mode=p["diameter_mode"])
+            if prof2 is not None:
+                print(f"   установ 1 → {res['step']} (объём {res['volume']:.1f} мм³)")
+                # Второй установ начинает НЕ с целого прутка, а с того, что
+                # осталось от первого; его программа написана в СК перевёрнутой
+                # детали, поэтому разворачиваем её обратно (z' = z_end − z) —
+                # тогда обе половины считаются в одной раме и результат прямо
+                # сравним с моделью. Правый торец детали в z0, значит z_end = −L.
+                res = lathe_sim.simulate(
+                    gcode2, prof, stem + "_sim.step",
+                    diameter_mode=p["diameter_mode"],
+                    stock_profile=res.get("profile"),
+                    stock_bore=res.get("bore"),
+                    z_mirror=-float(prof["length"]))
         except Exception as e:
             print(f"⚠  Симуляция не удалась: {e}")
             sys.exit(2)

@@ -42,8 +42,9 @@ def diff(part_path: str, result_path: str, json_path: str | None = None,
     # «.step» обрезает расширение в «.STE», и OCCT не узнаёт формат
     import shutil
     tdir = tempfile.gettempdir()
-    part_tmp = os.path.join(tdir, "step_diff_part.stp")
-    result_tmp = os.path.join(tdir, "step_diff_result.stp")
+    pid = os.getpid()          # иначе параллельные прогоны портят файлы друг другу
+    part_tmp = os.path.join(tdir, f"step_diff_part_{pid}.stp")
+    result_tmp = os.path.join(tdir, f"step_diff_result_{pid}.stp")
     shutil.copyfile(part_path, part_tmp)
     shutil.copyfile(result_path, result_tmp)
 

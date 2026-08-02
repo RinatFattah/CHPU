@@ -133,11 +133,41 @@ def inner_envelope(moves, grid):
     return reached
 
 
-def envelope(moves, z_lo, z_hi, step, r_stock):
-    """Минимальный радиус, достигнутый резцом, по сетке z."""
-    n = int(round((z_hi - z_lo) / step)) + 1
-    grid = [z_lo + i * step for i in range(n)]
-    reached = [r_stock] * n
+def sample(profile, grid, default):
+    """Профиль [(z, r)] → значения по возрастающей сетке z.
+
+    Вне профиля — `default`. Для заготовки следующего установа это НЕ радиус
+    прутка, а «материала нет»: профиль предыдущего установа кончается там, где
+    его отрезали и подрезали, и за этими границами тела уже не существует.
+    """
+    pts = sorted((float(z), float(r)) for z, r in profile)
+    if not pts:
+        return [default] * len(grid)
+    out, k = [], 0
+    for z in grid:
+        if z < pts[0][0] - 1e-9 or z > pts[-1][0] + 1e-9:
+            out.append(default)
+            continue
+        while k + 1 < len(pts) and pts[k + 1][0] < z:
+            k += 1
+        z1, r1 = pts[k]
+        z2, r2 = pts[min(k + 1, len(pts) - 1)]
+        t = 0.0 if abs(z2 - z1) < 1e-12 else (z - z1) / (z2 - z1)
+        out.append(r1 + (r2 - r1) * max(0.0, min(1.0, t)))
+    return out
+
+
+def envelope(moves, grid, seed):
+    """Минимальный радиус, достигнутый резцом, по сетке z.
+
+    seed — с чего начинаем: у первого установа это радиус прутка по всей длине,
+    у второго — профиль, оставшийся от первого (склейка установов честная, а не
+    «второй режет по целому прутку»).
+    """
+    n = len(grid)
+    z_lo = grid[0]
+    step = (grid[-1] - grid[0]) / (n - 1) if n > 1 else 1.0
+    reached = list(seed)
 
     for z1, r1, z2, r2 in moves:
         lo, hi = min(z1, z2), max(z1, z2)
@@ -154,7 +184,7 @@ def envelope(moves, z_lo, z_hi, step, r_stock):
                 r = r1 + t * (r2 - r1)
             if r < reached[i]:
                 reached[i] = r
-    return grid, reached
+    return reached
 
 
 def main():
@@ -170,14 +200,58 @@ def main():
     log(f"рабочих движений (G1/G2/G3): наружных {len(moves)}, "
         f"внутренних {len(inner)}" + (f", сверло Ø{d_drill:g}" if d_drill else ""))
 
-    grid, reached = envelope(moves, z_lo, z_hi, step, r_stock)
-    cut = sum(1 for r in reached if r < r_stock - 1e-6)
+    # ВТОРОЙ УСТАНОВ: программа написана в своей СК (деталь перевёрнута), а
+    # считаем мы всё в исходной — иначе результат не наложить ни на первый
+    # установ, ни на модель. z' = z_mirror − z, и это ровно та же формула, что
+    # в lathe_setups.mirror, только в обратную сторону.
+    if p.get("z_mirror") is not None:
+        m = float(p["z_mirror"])
+        moves = [(m - z1, r1, m - z2, r2) for z1, r1, z2, r2 in moves]
+        inner = [(m - z1, r1, m - z2, r2) for z1, r1, z2, r2 in inner]
+        log(f"программа второго установа развёрнута в исходную СК (z' = {m:g} − z)")
+
+    r_eps = p.get("min_radius", 0.05)
+    n_grid = int(round((z_hi - z_lo) / step)) + 1
+    grid = [z_lo + i * step for i in range(n_grid)]
+    # Заготовка второго установа — то, что осталось от первого; ЗА пределами
+    # его профиля материала нет (отрезано), поэтому вне диапазона r_eps.
+    seed = (sample(p["stock_profile"], grid, r_eps) if p.get("stock_profile")
+            else [r_stock] * n_grid)
+    reached = envelope(moves, grid, seed)
+    cut = sum(1 for r, s in zip(reached, seed) if r < s - 1e-6)
     log(f"сетка {len(grid)} точек шагом {step} мм, резец коснулся {cut} из них")
+    # ОТРЕЗКА И ПОДРЕЗКА РАЗБИВАЮТ ТЕЛО. Там, где резец дошёл до оси, материала
+    # больше нет: ниже отрезного реза остаётся хвост прутка, выше подрезки —
+    # ничего. Самый длинный сплошной кусок — это и есть деталь.
+    #
+    # Обрезать по нему САМО ТЕЛО нельзя. У краёв куска радиус лишь чуть больше
+    # r_eps, торцевая грань выходит слиэром в сотую миллиметра, и тесселяция
+    # такого тела врёт у оси: воксельная сверка показывала фантомный зарез
+    # 163 мм³ там, где по профилям съёма нет вовсе (сам профиль результата в той
+    # зоне ВЫШЕ номинала — проверено поточечно). Поэтому тело строится по всей
+    # сетке, как раньше, а кусок нужен только для профиля, который получит
+    # СЛЕДУЮЩИЙ установ: иначе он унаследовал бы отрезанный хвост прутка как
+    # заготовку и точил бы по воздуху.
+    runs_solid, i = [], 0
+    while i < len(grid):
+        if reached[i] <= r_eps + 1e-6:
+            i += 1
+            continue
+        j = i
+        while j < len(grid) and reached[j] > r_eps + 1e-6:
+            j += 1
+        runs_solid.append((i, j))
+        i = j
+    if not runs_solid:
+        raise RuntimeError("после программы не осталось материала")
+    i0, i1 = max(runs_solid, key=lambda s: s[1] - s[0])
+    if len(runs_solid) > 1:
+        log(f"тело разрезано на {len(runs_solid)} части (отрезка/подрезка) — "
+            f"деталь: z {grid[i0]:.2f}..{grid[i1 - 1]:.2f}")
 
     # Профиль результата → замкнутый контур в плоскости XZ → вращение вокруг Z.
     # Радиус зажимаем снизу: контур, КАСАЮЩИЙСЯ оси (после отрезки резец доходит
     # до X0), при вращении даёт самопересечение и невалидное тело.
-    r_eps = p.get("min_radius", 0.05)
     pts = [App.Vector(max(r, r_eps), 0, z) for z, r in zip(grid, reached)]
     clean = [pts[0]]
     for v in pts[1:]:
@@ -217,8 +291,11 @@ def main():
     # булевой операции OCCT: `cut` возвращался БЕЗ ошибки и почти без съёма
     # (на 22-13A вычиталось 1045 мм³ вместо 17000). У цельного цилиндра
     # стенки на оси нет, и вырождение исчезает.
-    if inner:
-        r_in = inner_envelope(inner, grid)
+    r_in = inner_envelope(inner, grid)
+    if p.get("stock_bore"):        # отверстие, доставшееся от прошлого установа
+        prev_in = sample(p["stock_bore"], grid, 0.0)
+        r_in = [max(a, b) for a, b in zip(r_in, prev_in)]
+    if any(r > r_eps for r in r_in):
         # ступени постоянного радиуса: отверстие — это сверло Ø d и расточка Ø D,
         # то есть единицы цилиндров, а не тысяча точек профиля
         runs = []                                    # [z_low, z_high, r]
@@ -252,6 +329,14 @@ def main():
                 log(f"warn: отверстие не вычлось: {e}")
 
     solid.exportStep(p["out_step"])
+    # Профили результата — чтобы следующий установ начинал с того, что реально
+    # осталось, а не с целого прутка.
+    if p.get("out_json"):
+        with open(p["out_json"], "w", encoding="utf-8") as f:
+            json.dump({"profile": [[z, r] for z, r
+                                   in zip(grid[i0:i1], reached[i0:i1])],
+                       "bore": [[z, r] for z, r in zip(grid[i0:i1], r_in[i0:i1])],
+                       "volume": solid.Volume}, f)
     log(f"OK volume={solid.Volume:.1f} step={p['out_step']}")
 
 
