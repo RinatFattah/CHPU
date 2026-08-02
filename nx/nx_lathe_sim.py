@@ -223,54 +223,135 @@ def gcode_to_mpf(gcode_path, mpf_path, tool_number=1):
     return len(out)
 
 
+def tools_from_gcode(path, nose_radius=0.4,
+                     insert_position=INSERT_POSITION_OD_RIGHT):
+    """Список инструментов, вычитанный ИЗ САМОЙ ПРОГРАММЫ.
+
+    В таблице стойки обязан быть КАЖДЫЙ номер T, встречающийся в коде: смена
+    инструмента виснет, если ToolChange.SPF читает $TC_TP1 несуществующего
+    номера. Собирать таблицу из аргументов — значит каждый раз забывать про
+    новый инструмент (так в неё не попали сверло, расточной и резьбовой, когда
+    их добавили в генератор). Здесь она не может разойтись с программой по
+    построению: номера берутся из строк `T<n>`, назначение — из комментария
+    `(Tool T<n>: ...)`, который генератор пишет рядом.
+
+    Типы инструментов Sinumerik: 200 спиральное сверло, 220 центровочное,
+    500 черновой резец, 510 чистовой, 520 канавочный/отрезной, 540 резьбовой.
+    """
+    tools, cur = {}, None
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for raw in f:
+            l = raw.strip()
+            m = re.match(r"^T(\d+)\s*$", l)
+            if m:
+                cur = int(m.group(1))
+                tools.setdefault(cur, {"n": cur, "name": "TURN_OD", "type": 500,
+                                       "pos": insert_position,
+                                       "nose": nose_radius})
+                continue
+            m = re.match(r"\(Tool(?:\s+T\d+)?\s*:\s*(.+?)\)\s*$", l)
+            if not m or cur is None:
+                continue
+            desc = m.group(1)
+            t = tools[cur]
+            d = re.search(r"\bD([\d.]+)", desc)
+            w = re.search(r"\bW([\d.]+)", desc)
+            r = re.search(r"nose R([\d.]+)", desc)
+            low = desc.lower()
+            if "center drill" in low:
+                t.update(name="CENTER_DRILL", type=220, nose=0.0)
+            elif "drill" in low:
+                t.update(name="DRILL", type=200, nose=0.0)
+            elif "grooving" in low or "parting" in low:
+                t.update(name="GROOVE", type=520, nose=0.0)
+            elif "threading" in low:
+                t.update(name="THREAD", type=540, nose=0.0)
+            elif "boring" in low:
+                t.update(name="BORE", type=500, nose=0.0)
+            elif "left-hand" in low:
+                # у левого другая Schneidenlage — стойка иначе считает вершину
+                t.update(name="TURN_OD_L", pos=4)
+            elif "finishing" in low:
+                t.update(name="TURN_OD_FIN", type=510)
+            if r:
+                t["nose"] = float(r.group(1))
+            if d and t["type"] in (200, 220):
+                t["nose"] = float(d.group(1))       # у сверла $TC_DP6 — диаметр
+            if w:
+                t["width"] = float(w.group(1))
+    return [tools[k] for k in sorted(tools)]
+
+
 def write_to_ini(machine_dir, nose_radius, tool_number=1,
                  insert_position=INSERT_POSITION_OD_RIGHT,
                  length_x=0.0, length_z=0.0,
                  groove_width=0.0, groove_tool_number=2,
-                 left_tool_number=0):
-    """TO_INI.SPF для ТОКАРНЫХ резцов (проходной T1 + канавочный T2).
+                 left_tool_number=0, extra_tools=None, tools=None):
+    """TO_INI.SPF для ТОКАРНЫХ резцов.
 
     Отличия от фрезы (см. nx_sim.write_to_ini): $TC_DP1 = 500 — тип «токарный
     инструмент» вместо 120 («концевая фреза»); $TC_DP2 — положение режущей
     кромки, для точения это не формальность, а то, с какой стороны стойка
     считает вершину; $TC_DP6 — радиус ПРИ ВЕРШИНЕ (у фрезы там радиус фрезы).
 
-    Канавочный идёт типом 520 («отрезной/канавочный»), его ширина — $TC_DP7:
-    без записи T2 в таблицу смена инструмента виснет, потому что ToolChange.SPF
-    читает $TC_TP1 несуществующего номера.
+    Канавочный идёт типом 520 («отрезной/канавочный»), его ширина — $TC_DP7.
+
+    **В таблице обязан быть КАЖДЫЙ номер T, который встречается в программе.**
+    Без записи смена инструмента виснет: ToolChange.SPF читает $TC_TP1
+    несуществующего номера. Поэтому таблица собирается СПИСКОМ, а не тремя
+    фиксированными блоками — добавить четвёртый резец теперь значит добавить
+    элемент списка, а не ещё одну ветку.
+
+    `extra_tools` — [{"n": номер, "name": "...", "type": 500, "pos": 3,
+                      "nose": 0.4, "width": 0.0}] — дописываются как есть.
     """
     sub = os.path.join(machine_dir, "cse_driver", "sinumerik", "subprog")
     nl = "\n"
-    content = (
-        f'$TC_TP1[{tool_number}]={tool_number}{nl}'
-        f'$TC_TP2[{tool_number}]="TURN_OD"{nl}'
-        f'$TC_DP1[{tool_number},1]=500{nl}'
-        f'$TC_DP2[{tool_number},1]={insert_position}{nl}'
-        f'$TC_DP3[{tool_number},1]={length_x:g}{nl}'
-        f'$TC_DP4[{tool_number},1]={length_z:g}{nl}'
-        f'$TC_DP6[{tool_number},1]={nose_radius:g}{nl}'
-    )
+
+    if tools:                       # готовый список (обычно из tools_from_gcode)
+        tools = [dict(t) for t in tools]
+        for t in (extra_tools or []):
+            if t and t.get("n"):
+                tools.append(dict(t))
+        return _write_to_ini_file(sub, tools, nl)
+
+    tools = [{"n": int(tool_number), "name": "TURN_OD", "type": 500,
+              "pos": insert_position, "nose": nose_radius,
+              "lx": length_x, "lz": length_z}]
     if groove_width:
-        content += (
-            f'$TC_TP1[{groove_tool_number}]={groove_tool_number}{nl}'
-            f'$TC_TP2[{groove_tool_number}]="GROOVE"{nl}'
-            f'$TC_DP1[{groove_tool_number},1]=520{nl}'
-            f'$TC_DP2[{groove_tool_number},1]={insert_position}{nl}'
-            f'$TC_DP3[{groove_tool_number},1]=0{nl}'
-            f'$TC_DP4[{groove_tool_number},1]=0{nl}'
-            f'$TC_DP6[{groove_tool_number},1]=0{nl}'
-            f'$TC_DP7[{groove_tool_number},1]={groove_width:g}{nl}'
-        )
+        tools.append({"n": int(groove_tool_number), "name": "GROOVE",
+                      "type": 520, "pos": insert_position, "nose": 0.0,
+                      "width": groove_width})
     if left_tool_number:
+        # левый резец: другая Schneidenlage — стойка иначе считает вершину
+        tools.append({"n": int(left_tool_number), "name": "TURN_OD_L",
+                      "type": 500, "pos": 4, "nose": nose_radius})
+    for t in (extra_tools or []):
+        if t and t.get("n"):
+            tools.append(dict(t))
+    return _write_to_ini_file(sub, tools, nl)
+
+
+def _write_to_ini_file(sub, tools, nl="\n"):
+    """Пишет TO_INI.SPF по списку инструментов [{n, name, type, pos, nose, ...}]."""
+    content = ""
+    seen = set()
+    for t in tools:
+        n = int(t["n"])
+        if n in seen:                      # один номер — одна запись
+            continue
+        seen.add(n)
         content += (
-            f'$TC_TP1[{left_tool_number}]={left_tool_number}{nl}'
-            f'$TC_TP2[{left_tool_number}]="TURN_OD_L"{nl}'
-            f'$TC_DP1[{left_tool_number},1]=500{nl}'
-            f'$TC_DP2[{left_tool_number},1]=4{nl}'   # левый: другая Schneidenlage
-            f'$TC_DP3[{left_tool_number},1]=0{nl}'
-            f'$TC_DP4[{left_tool_number},1]=0{nl}'
-            f'$TC_DP6[{left_tool_number},1]={nose_radius:g}{nl}'
+            f'$TC_TP1[{n}]={n}{nl}'
+            f'$TC_TP2[{n}]="{t.get("name", "TURN_OD")}"{nl}'
+            f'$TC_DP1[{n},1]={int(t.get("type", 500))}{nl}'
+            f'$TC_DP2[{n},1]={int(t.get("pos", INSERT_POSITION_OD_RIGHT))}{nl}'
+            f'$TC_DP3[{n},1]={t.get("lx", 0.0):g}{nl}'
+            f'$TC_DP4[{n},1]={t.get("lz", 0.0):g}{nl}'
+            f'$TC_DP6[{n},1]={t.get("nose", 0.0):g}{nl}'
         )
+        if t.get("width"):
+            content += f'$TC_DP7[{n},1]={t["width"]:g}{nl}'
     content += "M17" + nl
     path = os.path.join(sub, "TO_INI.SPF")
     try:
@@ -281,10 +362,10 @@ def write_to_ini(machine_dir, nose_radius, tool_number=1,
         os.makedirs(sub, exist_ok=True)
         with open(path, "w", encoding="ascii", newline="\r\n") as f:
             f.write(content)
-        extra = (f" + T{groove_tool_number} канавочный {groove_width:g} мм"
-                 if groove_width else "")
-        _log(f"TO_INI.SPF записан (T{tool_number} резец, вершина "
-             f"R{nose_radius:g}, кромка {insert_position}{extra})")
+        _log("TO_INI.SPF записан: "
+             + ", ".join(f"T{t['n']} {t.get('name', '')}"
+                         + (f" {t['width']:g} мм" if t.get("width") else "")
+                         for t in tools))
     except PermissionError:
         _log(f"warn: нет прав записи в {path} — таблица инструментов стойки "
              f"могла устареть. Дайте себе права на папку станка "
@@ -296,7 +377,8 @@ def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
              machine=None, nose_angle=None, insert_size=None,
              relief_angle=None, tool_params=None, groove_width=0.0,
              groove_tool_number=2, groove_params=None,
-             left_tool_number=0):
+             left_tool_number=0, finish_tool_number=0, finish_nose_angle=35.0,
+             finish_nose_radius=0.4, finish_insert_size=6.35):
     """Прогоняет токарный G-Code на виртуальном станке NX ISV.
 
     Результат возвращается в раме ДЕТАЛИ (ось Z): заготовку сажают на ось
@@ -318,9 +400,16 @@ def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
     if not os.path.exists(stock_step_path):
         raise RuntimeError(f"файл заготовки не найден: {stock_step_path}")
 
+    # Таблица стойки собирается ИЗ САМОЙ ПРОГРАММЫ: в ней обязан быть каждый
+    # номер T, иначе смена инструмента виснет на несуществующем $TC_TP1.
+    # Раньше список строился из аргументов, и при добавлении сверла, расточного
+    # и резьбового они в таблицу просто не попали.
+    tool_list = tools_from_gcode(gcode_path, nose_radius=nose_radius)
+    _log("инструменты программы: "
+         + ", ".join(f"T{t['n']}({t['name']})" for t in tool_list))
     write_to_ini(mdir, nose_radius, groove_width=groove_width,
                  groove_tool_number=groove_tool_number,
-                 left_tool_number=left_tool_number)
+                 left_tool_number=left_tool_number, tools=tool_list)
 
     if out_stem is None:
         out_stem = os.path.splitext(os.path.abspath(gcode_path))[0]
@@ -417,6 +506,12 @@ def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
         # левый проходной T3 — зеркальный подтип того же класса
         "left_tool_number": int(left_tool_number or 0),
         "left_subtype": getattr(config, "NX_LATHE_LEFT_SUBTYPE", "OD_55_L"),
+        # чистовой T8 — 35°-ромб, острее чернового и глубже заходит в уступы
+        "finish_tool_number": int(finish_tool_number or 0),
+        "finish_subtype": getattr(config, "NX_LATHE_FINISH_SUBTYPE", "OD_35_R"),
+        "finish_nose_angle": float(finish_nose_angle),
+        "finish_nose_radius": float(finish_nose_radius),
+        "finish_insert_size": float(finish_insert_size),
         "groove_geometry": getattr(config, "NX_LATHE_GROOVE_GEOMETRY", True),
         "groove_params": dict(getattr(config, "NX_LATHE_GROOVE_PARAMS", None)
                               or {}, **(groove_params or {})),

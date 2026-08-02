@@ -60,6 +60,10 @@ def main():
                     help="не сверлить и не растачивать осевое отверстие")
     ap.add_argument("--no-center-drill", action="store_true",
                     help="без центровки перед сверлением")
+    ap.add_argument("--no-finish-tool", action="store_true",
+                    help="чистовую вести тем же резцом, что и черновую (без "
+                         "отдельного 35°-ромба T8): в уступы точение зайдёт "
+                         "мельче, больше уйдёт канавочному")
     ap.add_argument("--contour-rough", action="store_true",
                     help="снимать материал слоями по ЭКВИДИСТАНТЕ чистового "
                          "пути (Rough1..N с припуском --allowance), а не одним "
@@ -179,6 +183,13 @@ def main():
         "arcs": not args.no_arcs,
         "arc_tol": getattr(config, "LATHE_ARC_TOL", 0.005),
         # проходной резец: чем он достаёт, считает lathe_reach
+        # отдельный чистовой резец (35°-ромб) — достижимость считается по нему
+        "finish_tool": (not args.no_finish_tool
+                        and getattr(config, "LATHE_FINISH_TOOL", True)),
+        "finish_tool_number": getattr(config, "LATHE_FINISH_TOOL_NUMBER", 8),
+        "finish_insert": getattr(config, "LATHE_FINISH_INSERT", "VCMT110304"),
+        "finish_nose_angle": getattr(config, "LATHE_FINISH_NOSE_ANGLE", 35.0),
+        "finish_insert_edge": getattr(config, "LATHE_FINISH_INSERT_SIZE", 6.35),
         "nose_angle": getattr(config, "LATHE_NOSE_ANGLE", 55.0),
         "approach_angle": getattr(config, "LATHE_APPROACH_ANGLE", 107.5),
         "insert_edge": getattr(config, "LATHE_INSERT_SIZE", 6.35),
@@ -249,6 +260,11 @@ def main():
               f"задайте LATHE_THREADS")
     if stats.get("threads"):
         print(f"   T6 резьбовой: {stats['threads']} резьб(ы) нарезано")
+    if stats.get("finish_tool"):
+        print(f"   T{stats['finish_tool']} чистовой: {p['finish_insert']} "
+              f"({p['finish_nose_angle']:g}°-ромб) — им же считается "
+              f"достижимость; в уступах снимает до "
+              f"{stats['finish_max_depth']:.2f} мм по радиусу")
     if stats.get("left_passes"):
         print(f"   T3 левый проходной: {stats['left_passes']} проход(а), "
               f"{stats['left_volume_mm3']:.0f} мм³ — правому резцу за уступ "
@@ -306,7 +322,12 @@ def main():
                                         groove_tool_number=p["groove_tool_number"],
                                         left_tool_number=(p["left_tool_number"]
                                                           if stats.get("left_passes")
-                                                          else 0))
+                                                          else 0),
+                                        finish_tool_number=stats.get("finish_tool") or 0,
+                                        finish_nose_angle=p["finish_nose_angle"],
+                                        finish_nose_radius=getattr(
+                                            config, "LATHE_FINISH_NOSE_RADIUS", 0.4),
+                                        finish_insert_size=p["finish_insert_edge"])
         except Exception as e:
             print(f"⚠  NX-симуляция не удалась: {e}")
             sys.exit(2)

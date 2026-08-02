@@ -143,7 +143,11 @@ def make_tool(setup, subtype, uname, props, used, report, pocket_no=None):
     перечитать ПОСЛЕ Commit новым билдером и напечатать: только так видно, что
     реально сохранилось в резце, а что осталось унаследованным от кармана.
     """
-    order = ([f"POCKET_{pocket_no:02d}"] if pocket_no else []) + POCKETS
+    # Карман задан — берём ТОЛЬКО его, без запасных. Уехать в соседний карман
+    # хуже, чем не создать резец вовсе: стойка поворачивает револьвер по номеру
+    # T, и в чужом кармане команда возьмёт не тот инструмент (именно так отрезка
+    # однажды пошла полноразмерной пластиной).
+    order = [f"POCKET_{pocket_no:02d}"] if pocket_no else list(POCKETS)
     for pname in order:
         if pname in used:
             continue
@@ -328,6 +332,29 @@ def main():
                   used,
                   ("OrientAngleBuilder", "NoseAngleBuilder", "NoseRadiusBuilder",
                    "SizeBuilder"), pocket_no=lt)
+
+    # Чистовой проходной T8 — 35°-ромб. Острее чернового, поэтому глубже заходит
+    # в уступы; в программе он ведёт операцию Finish. Тип токарный, как у T1 и T3,
+    # так что ISV проводит его штатно. Подтип берётся из конфига: если в станке
+    # нет OD_35_R, ISV откажет — тогда ставим тот же подтип, что у чернового,
+    # и говорим об этом в лог (на G-код это не влияет, только на симуляцию).
+    ft = int(p.get("finish_tool_number") or 0)
+    if ft:
+        fprops = [("NoseRadiusBuilder", float(p.get("finish_nose_radius", 0.4))),
+                  ("TlNumberBuilder", ft),
+                  ("NoseAngleBuilder", float(p.get("finish_nose_angle", 35.0))),
+                  ("SizeBuilder", float(p.get("finish_insert_size", 6.35)))]
+        fsub = p.get("finish_subtype", "OD_35_R")
+        before = len(used)
+        make_tool(setup, fsub, "TURN_OD_FIN", fprops, used,
+                  ("NoseAngleBuilder", "NoseRadiusBuilder", "SizeBuilder"),
+                  pocket_no=ft)
+        if len(used) == before and fsub != subtype:
+            log(f"подтип {fsub} не создался — ставлю {subtype} (как у чернового); "
+                f"в ISV чистовой будет волочить сильнее настоящего, на G-код не влияет")
+            make_tool(setup, subtype, "TURN_OD_FIN", fprops, used,
+                      ("NoseAngleBuilder", "NoseRadiusBuilder", "SizeBuilder"),
+                      pocket_no=ft)
 
     # Канавочный резец T2. Программа отдаёт ему канавки и отрезку — то, куда
     # проходной физически не лезет. Если его не создать, стойка на T2 возьмёт

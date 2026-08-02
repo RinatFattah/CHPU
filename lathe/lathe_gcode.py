@@ -361,13 +361,28 @@ def generate(prof_data, params):
     # достижимую огибающую (её берёт T1) и канавки (их берёт канавочный T2).
     raw = prof_data.get("profile_raw")
     from lathe import lathe_reach
+
+    # Геометрия ДВУХ проходных резцов. Достижимость считается по ЧИСТОВОМУ: он
+    # оставляет окончательную поверхность, и именно его вспомогательный угол
+    # решает, куда точение вообще заходит. Черновые слои ограничиваются
+    # огибающей ЧЕРНОВОГО — он тупее и в уступ не лезет. Без --finish-tool обе
+    # геометрии совпадают, и поведение ровно прежнее.
+    fin_tool = params.get("finish_tool", False)
+    geo_rough = (params.get("approach_angle", 107.5),
+                 params.get("nose_angle", 55.0),
+                 params.get("insert_edge", 6.35))
+    geo_finish = ((geo_rough[0],
+                   params.get("finish_nose_angle", 35.0),
+                   params.get("finish_insert_edge", 6.35))
+                  if fin_tool else geo_rough)
+
     grooves, left_zones, blade, blade_tight = [], [], 0.0, False
     if params.get("groove_tool", True):
         env, left_zones, grooves = lathe_reach.split_by_hand(
             raw or prof_data["profile"],
-            approach_deg=params.get("approach_angle", 107.5),
-            nose_deg=params.get("nose_angle", 55.0),
-            edge_len=params.get("insert_edge", 6.35))
+            approach_deg=geo_finish[0],
+            nose_deg=geo_finish[1],
+            edge_len=geo_finish[2])
         if not params.get("left_tool", True):
             left_zones = []          # без левого резца — всё как раньше
         if grooves or left_zones:
@@ -490,9 +505,17 @@ def generate(prof_data, params):
         # шла на 0.107 мм ниже предела по всей длине.
         if params.get("groove_tool", True):
             src, _ = lathe_reach.envelope(
-                src, approach_deg=params.get("approach_angle", 107.5),
-                nose_deg=params.get("nose_angle", 55.0),
-                edge_len=params.get("insert_edge", 6.35))
+                src, approach_deg=geo_finish[0], nose_deg=geo_finish[1],
+                edge_len=geo_finish[2])
+    # Предел ЧЕРНОВОГО резца — своя огибающая поверх той же эквидистанты. Он
+    # тупее чистового, и в уступы, куда чистовой заходит, ему нельзя: подрежет
+    # стенку позади. Разница между двумя пределами и есть то, что чистовой
+    # снимает сверх припуска.
+    src_rough = src
+    if fin_tool and params.get("groove_tool", True) and nose_r:
+        src_rough, _ = lathe_reach.envelope(
+            src, approach_deg=geo_rough[0], nose_deg=geo_rough[1],
+            edge_len=geo_rough[2])
     if params.get("arcs", True):
         # дуги ищем по СЫРОМУ (неупрощённому) пути: упрощение уже спрямило
         # скругления, и по ломаной окружность не восстановить
@@ -521,7 +544,7 @@ def generate(prof_data, params):
     if params.get("contour_rough", False):
         ap_r = max(0.05, ap)
         allow = max(0.0, allowance)
-        deepest = max(r_stock - r for _, r in src)
+        deepest = max(r_stock - r for _, r in src_rough)
         n_rough = max(0, -(-int((deepest - allow) * 1000) // int(ap_r * 1000)))
         # Упрощаем ОДИН раз, ДО сдвига. Если упрощать каждый слой отдельно,
         # Дуглас-Пекер выбирает у них РАЗНЫЕ вершины, слои перестают быть
@@ -529,7 +552,7 @@ def generate(prof_data, params):
         # 14-31A замерено 1.456 мм при ap = 1.0. С общими вершинами разница
         # между соседними слоями ровно ap в каждой точке (клиппинг по радиусу
         # заготовки её только уменьшает).
-        base = _simplify(src, params.get("line_tol", 0.01))
+        base = _simplify(src_rough, params.get("line_tol", 0.01))
         for i in range(n_rough):
             off = allow + (n_rough - 1 - i) * ap_r
             pts = [(z, min(r + off, r_stock)) for z, r in base]
@@ -549,6 +572,18 @@ def generate(prof_data, params):
                 g.append(f"G1 {X(r)} Z{z:.3f} {fmt(feed)}")
             g.append(f"G0 {X(retract_r)} Z{z_end:.3f}")
             g.append(f"(Finish operation: Rough{i + 1})")
+
+    # ЧИСТОВОЙ РЕЗЕЦ T8 — отдельным инструментом, как на заводе
+    t_fin = params.get("finish_tool_number", 8)
+    if fin_tool:
+        g.append(f"G0 {X(retract_r)} Z{z_top + clear:.3f}")
+        g.append("M5")
+        g.append(f"T{t_fin}")
+        g.append("M6")
+        g.append(f"G97 S{rpm} M3")
+        g.append(f"(Tool T{t_fin}: finishing insert "
+                 f"{params.get('finish_insert', 'VCMT110304')}, "
+                 f"nose R{nose_r:g} mm, {geo_finish[1]:g}° rhombic)")
 
     op("Finish")
     g.append(f"G0 {X(retract_r)} Z{src[0][0] + clear:.3f}")
@@ -868,6 +903,12 @@ def generate(prof_data, params):
              "left_volume_mm3": sum(lz["volume_mm3"] for lz in doable),
              "second_setup": [(lz["z_hi"], lz["z_lo"], lz["volume_mm3"])
                               for lz in second_setup],
+             "finish_tool": t_fin if fin_tool else 0,
+             # насколько глубже припуска чистовому приходится резать в уступах,
+             # куда черновой не заходит
+             "finish_max_depth": (max((rr - r for (_, rr), (_, r)
+                                       in zip(src_rough, src)), default=0.0)
+                                  + allowance) if fin_tool else 0.0,
              "uncut_mm3": uncut}
     return g, stats
 
