@@ -37,10 +37,13 @@ def extract(model_path, out_json=None, part_out=None, stock_out=None,
 
     tdir = tempfile.gettempdir()
     out_json = out_json or os.path.join(tdir, "lathe_profile.json")
-    # OCCT пишет STEP только по ASCII-пути: работаем во временной папке
-    tmp_part = os.path.join(tdir, "lathe_part.stp") if part_out else ""
-    tmp_stock = os.path.join(tdir, "lathe_stock.stp") if stock_out else ""
-    tmp_json = os.path.join(tdir, "lathe_profile_out.json")
+    # OCCT пишет STEP только по ASCII-пути: работаем во временной папке.
+    # Имена с PID: без него два прогона (пакетный + ручной) пишут в одни и те же
+    # файлы и молча портят друг другу результат.
+    pid = os.getpid()
+    tmp_part = os.path.join(tdir, f"lathe_part_{pid}.stp") if part_out else ""
+    tmp_stock = os.path.join(tdir, f"lathe_stock_{pid}.stp") if stock_out else ""
+    tmp_json = os.path.join(tdir, f"lathe_profile_out_{pid}.json")
     for f in (tmp_part, tmp_stock, tmp_json):
         if f and os.path.exists(f):
             os.unlink(f)

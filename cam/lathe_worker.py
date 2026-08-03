@@ -140,7 +140,15 @@ def align_to_z(shape, axis, centre):
 
 
 def profile_from_section(shape, step, simplify_tol):
-    """Осевое сечение → профиль [(z, r)] численно: max радиус на каждом z."""
+    """Осевое сечение → НАРУЖНЫЙ и ВНУТРЕННИЙ профили [(z, r)].
+
+    Наружный — максимальный радиус на каждом z, внутренний — минимальный.
+    Считается по ПРАВОЙ ПОЛОВИНЕ сечения (x >= 0): тогда там, где деталь
+    сплошная, в границу входит сама ось, и минимальный радиус честно равен
+    нулю; а где есть осевое отверстие — минимальным окажется его стенка.
+    Отверстие у этих деталей даёт больше половины объёма съёма (у 14-31A —
+    2718 мм³ из 4990), поэтому без него программа заведомо неполна.
+    """
     bb = shape.BoundBox
     L = max(bb.XLength, bb.YLength, bb.ZLength) * 4 + 10
     plane = Part.makePlane(L, L, App.Vector(-L / 2, 0, bb.ZMin - 5),
@@ -151,9 +159,12 @@ def profile_from_section(shape, step, simplify_tol):
     log(f"осевое сечение: {len(sec.Faces)} граней, {len(sec.Edges)} рёбер, "
         f"площадь {sec.Area:.1f} мм²")
 
-    # облако точек контура; берём половину X >= 0 (вторая — зеркало)
+    # правая половина сечения — см. docstring
+    half = Part.makeBox(L, L, L + 10, App.Vector(0, -L / 2, bb.ZMin - 5))
+    sec_h = sec.common(half)
+    src = sec_h if sec_h.Edges else sec
     pts = []
-    for e in sec.Edges:
+    for e in src.Edges:
         n = max(2, int(e.Length / 0.05))
         for p in e.discretize(Number=min(n, 4000)):
             if p.x >= -1e-6:
@@ -165,20 +176,29 @@ def profile_from_section(shape, step, simplify_tol):
     zmax = max(p[0] for p in pts)
     n = max(2, int(round((zmax - zmin) / step)) + 1)
     grid = [zmax - i * (zmax - zmin) / (n - 1) for i in range(n)]  # от торца вглубь
-    prof = []
+    prof, bore = [], []
     for z in grid:
         near = [r for (pz, r) in pts if abs(pz - z) <= step * 0.75]
         if near:
             prof.append((z, max(near)))
+            bore.append((z, min(near)))
     if len(prof) < 2:
         raise RuntimeError("профиль вырожден")
+    if max(r for _, r in bore) > 0.05:
+        d_in = [2 * r for _, r in bore if r > 0.05]
+        z_in = [z for z, r in bore if r > 0.05]
+        log(f"осевое отверстие: Ø{min(d_in):.2f}..{max(d_in):.2f}, "
+            f"z {max(z_in):.2f}..{min(z_in):.2f} "
+            f"(глубина {max(z_in) - min(z_in):.2f} мм)")
+    else:
+        log("осевого отверстия нет")
 
     log(f"профиль снят: {len(prof)} точек, шаг {step} мм, "
         f"Ø{2 * max(r for _, r in prof):.2f} макс")
     # СЫРОЙ профиль отдаётся вместе с упрощённым: упрощение спрямляет
     # скругления в ломаную, и восстановить по ней дуги уже нельзя — их надо
     # искать до потери точек (см. lathe_gcode.fit_arcs)
-    return simplify(prof, simplify_tol), prof
+    return simplify(prof, simplify_tol), prof, bore
 
 
 def simplify(pts, tol):
@@ -218,8 +238,8 @@ def main():
     log(f"после выравнивания по Z: Ø{max(bb.XLength, bb.YLength):.2f} x "
         f"{bb.ZLength:.2f} мм, Z {bb.ZMin:.2f}..{bb.ZMax:.2f}")
 
-    prof, prof_raw = profile_from_section(aligned, p.get("profile_step", 0.1),
-                                          p.get("simplify_tol", 0.01))
+    prof, prof_raw, bore_raw = profile_from_section(
+        aligned, p.get("profile_step", 0.1), p.get("simplify_tol", 0.01))
     log(f"после упрощения: {len(prof)} точек (сырых {len(prof_raw)})")
 
     hex_s = find_wrench_flats(aligned)
@@ -232,6 +252,8 @@ def main():
         "z_range": [round(bb.ZMin, 4), round(bb.ZMax, 4)],
         "hex_across_flats": hex_s,
         "profile_raw": [[round(z, 4), round(r, 4)] for z, r in prof_raw],
+        # внутренний контур: радиус осевого отверстия на каждом z (0 — сплошное)
+        "bore_raw": [[round(z, 4), round(r, 4)] for z, r in bore_raw],
     }
     with open(p["out_json"], "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=1)
