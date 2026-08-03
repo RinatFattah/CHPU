@@ -59,7 +59,14 @@ def convert(src, dst, drills=None, bores=(), skips=(), encoding="cp1251"):
     bores = {t.upper() for t in bores}
     skips = {t.upper() for t in skips}
 
-    out = ["(Imported from %s)" % os.path.basename(src)]
+    # Преамбула стойки. Нашему симулятору она безразлична — он читает только
+    # G0/G1/G2/G3, — но на настоящем контроллере без неё программа не поедет:
+    # без DIAMON X читается радиусом (координаты вдвое, отказ по лимитам осей),
+    # без G95 у G01 нет режима подачи. В исходнике эти команды есть, но идут
+    # строками без координат, и ранняя версия конвертера их отбрасывала — из-за
+    # чего прогон в NX ISV вставал на первых секундах.
+    out = ["(Imported from %s)" % os.path.basename(src),
+           "G18 G90", "G54", "DIAMON", "G95"]
     tool = None
     op_no = 0
     modal = None
@@ -76,10 +83,20 @@ def convert(src, dst, drills=None, bores=(), skips=(), encoding="cp1251"):
             op_no += 1
             name = m.group(2) or tool
             out.append("")
-            out.append(tool)
             if tool in skips:
+                # Пропущенный инструмент НЕ вызываем вовсе: строка «T<n>» без
+                # созданного в станке инструмента останавливает стойку на
+                # пустой станции револьвера, и прогон в NX ISV обрывается.
                 out.append(f"(Tool {tool}: {name} — SKIPPED by import)")
-            elif tool in drills:
+                stats["tools"].append(tool)
+                modal = None
+                continue
+            out.append(tool)
+            # M6 обязателен: на стойке Sinumerik «T<n>» без M6 инструмент в
+            # шпиндель не ставит (проверено перебором преамбул). Нашему
+            # симулятору эта строка безразлична, а для прогона в NX ISV нужна.
+            out.append("M6")
+            if tool in drills:
                 kind = ("center drill" if drills[tool] < 4.0 else "twist drill")
                 out.append(f"(Tool {tool}: {kind} D{drills[tool]:.2f} mm)")
                 out.append(f"(Begin operation: Drill{op_no})")
@@ -104,6 +121,18 @@ def convert(src, dst, drills=None, bores=(), skips=(), encoding="cp1251"):
                 modal = code
         has_xz = re.search(r"[XZ]-?\d", line)
         if not has_xz:
+            # Строки без координат — не движение, но среди них ОБОРОТЫ и РЕЖИМ
+            # ПОДАЧИ (`G97 S2000 M04`, `G95 F.15`). Их надо пронести: без них
+            # шпиндель стоит и у рабочих ходов нет подачи. Всё остальное
+            # (G14 возврат в точку смены, M15/M108/M109 — команды CNC PILOT,
+            # которых Sinumerik не знает) отбрасываем.
+            if tool in skips:
+                continue
+            keep = re.match(r"G9[4567]\b", line) or re.search(r"\b[SF][\d.]", line)
+            if keep:
+                kept = " ".join(w for w in line.split()
+                                if not re.match(r"M(?!0?[345]\b)\d+$", w))
+                out.append(kept)
             continue
         if tool in skips:
             stats["skipped"] += 1
@@ -112,7 +141,10 @@ def convert(src, dst, drills=None, bores=(), skips=(), encoding="cp1251"):
             continue
         # G-слово печатаем ЯВНО на каждой строке с координатой
         body = re.sub(r"^G\d+\s*", "", line)
-        body = re.sub(r"\bM\d+\b", "", body).strip()
+        body = re.sub(r"\bM\d+\b", "", body)
+        # Ось Y. Заводская программа её пишет (`G00 X100. Y0`), у 2-осевого
+        # токарного станка её нет, и стойка на такой строке встаёт.
+        body = re.sub(r"\bY-?[\d.]+", "", body).strip()
         out.append(f"G{int(modal):02d} {body}".strip())
         stats["motion"] += 1
 
