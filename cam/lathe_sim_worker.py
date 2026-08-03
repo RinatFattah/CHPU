@@ -250,32 +250,45 @@ def main():
             f"деталь: z {grid[i0]:.2f}..{grid[i1 - 1]:.2f}")
 
     # Профиль результата → замкнутый контур в плоскости XZ → вращение вокруг Z.
-    # Радиус зажимаем снизу: контур, КАСАЮЩИЙСЯ оси (после отрезки резец доходит
-    # до X0), при вращении даёт самопересечение и невалидное тело.
-    pts = [App.Vector(max(r, r_eps), 0, z) for z, r in zip(grid, reached)]
-    clean = [pts[0]]
-    for v in pts[1:]:
-        if (v - clean[-1]).Length > 1e-7:
-            clean.append(v)
-    if len(clean) < 2:
-        raise RuntimeError("профиль результата вырожден")
-
-    # обход: профиль снизу вверх → к оси → вниз по оси → замыкание
-    outline = clean
-    wire = Part.makePolygon(outline)
-    axis_back = Part.makePolygon([outline[-1], App.Vector(r_eps, 0, outline[0].z),
-                                  outline[0]])
-    try:
+    #
+    # Тело строится ПО КУСКАМ, отдельным телом на каждый сплошной участок, и
+    # куски объединяются. Один контур на всю сетку не годится: там, где резец
+    # доходит до оси, радиус зажимается снизу r_eps, и если таких мест несколько
+    # подряд (заводская программа подрезает торец СЛОЯМИ, каждый слой — рез до
+    # X−0.8), контур ложится на линию замыкания целыми отрезками. Грань выходит
+    # самопересекающейся, вращение даёт вывернутое тело — объём был −18200 мм³.
+    # У куска ось встречается только на двух его концах, и вырождения нет.
+    def revolve_run(a, b):
+        pts = [App.Vector(max(r, r_eps), 0, z)
+               for z, r in zip(grid[a:b], reached[a:b])]
+        clean = [pts[0]]
+        for v in pts[1:]:
+            if (v - clean[-1]).Length > 1e-7:
+                clean.append(v)
+        if len(clean) < 2:
+            return None
+        wire = Part.makePolygon(clean)
+        axis_back = Part.makePolygon([clean[-1], App.Vector(r_eps, 0, clean[-1].z),
+                                      App.Vector(r_eps, 0, clean[0].z), clean[0]])
         face = Part.Face(Part.Wire(wire.Edges + axis_back.Edges))
-    except Exception as e:
-        raise RuntimeError(f"контур результата не замкнулся в грань: {e}")
-    solid = face.revolve(App.Vector(0, 0, 0), App.Vector(0, 0, 1), 360)
+        return face.revolve(App.Vector(0, 0, 0), App.Vector(0, 0, 1), 360)
+
+    solid = None
+    for a, b in runs_solid:
+        try:
+            piece = revolve_run(a, b)
+        except Exception as e:
+            log(f"warn: кусок z {grid[a]:.2f}..{grid[b - 1]:.2f} не построился: {e}")
+            continue
+        if piece is None or piece.Volume <= 0:
+            continue
+        solid = piece if solid is None else solid.fuse(piece)
+    if solid is None:
+        raise RuntimeError("профиль результата вырожден")
     try:
         solid = solid.removeSplitter()
     except Exception:
         pass
-    if not solid.isValid():
-        solid = solid.removeSplitter()
 
     bb = solid.BoundBox
     log(f"результат: Ø{max(bb.XLength, bb.YLength):.2f} x {bb.ZLength:.2f} мм, "
