@@ -75,11 +75,13 @@ def main():
                     help="чистовую вести тем же резцом, что и черновую (без "
                          "отдельного 35°-ромба T8): в уступы точение зайдёт "
                          "мельче, больше уйдёт канавочному")
+    ap.add_argument("--no-contour-rough", action="store_true",
+                    help="ОТЛАДКА: снимать всё одним чистовым проходом, без "
+                         "черновых слоёв. Геометрия та же, но глубина резания "
+                         "доходит до 10.7 мм по радиусу — на станке такая "
+                         "программа неисполнима")
     ap.add_argument("--contour-rough", action="store_true",
-                    help="снимать материал слоями по ЭКВИДИСТАНТЕ чистового "
-                         "пути (Rough1..N с припуском --allowance), а не одним "
-                         "проходом: за один проход глубина резания доходит до "
-                         "6 мм по радиусу, что на станке нереализуемо")
+                    help=argparse.SUPPRESS)   # устаревший: слои и так включены
     ap.add_argument("--groove-contour", action="store_true",
                     help="ЭКСПЕРИМЕНТ: чистовой контур канавки углом пластины "
                          "после врезаний (чистит донья, но пока даёт зарез на "
@@ -149,7 +151,7 @@ def main():
             args.allowance if args.allowance is not None
             else getattr(config, "LATHE_ALLOWANCE", 0.2)),
         "finish_only": args.finish_only,
-        "contour_rough": (args.contour_rough
+        "contour_rough": (not args.no_contour_rough
                           and not args.finish_only
                           and getattr(config, "LATHE_CONTOUR_ROUGH", True)),
         "groove_contour": args.groove_contour,
