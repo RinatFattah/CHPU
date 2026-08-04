@@ -262,7 +262,9 @@ def tools_from_gcode(path, nose_radius=0.4,
                 t.update(name="CENTER_DRILL", type=220, nose=0.0)
             elif "drill" in low:
                 t.update(name="DRILL", type=200, nose=0.0)
-            elif "grooving" in low or "parting" in low:
+            elif "grooving" in low or "parting" in low or "groove" in low:
+                # «groove» — ради ЧУЖИХ программ: заводской резец назван
+                # T05_OD_GROOVE_L_..., наши операции пишут «grooving/parting»
                 t.update(name="GROOVE", type=520, nose=0.0)
             elif "threading" in low:
                 t.update(name="THREAD", type=540, nose=0.0)
