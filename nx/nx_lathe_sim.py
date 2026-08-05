@@ -413,6 +413,22 @@ def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
                  groove_tool_number=groove_tool_number,
                  left_tool_number=left_tool_number, tools=tool_list)
 
+    # Свёрла и расточной — ИЗ ТОЙ ЖЕ разметки программы. Раньше журнал их не
+    # создавал вовсе, и полная программа установа вставала на первой смене на
+    # сверлильный инструмент: станция револьвера пуста. Типы Sinumerik:
+    # 200 спиральное сверло, 220 центровочное; у сверла в списке диаметр лежит
+    # в поле nose (так его пишет tools_from_gcode).
+    flute = float(getattr(config, "NX_LATHE_DRILL_FLUTE", 60.0))
+    drills = [{"n": t["n"], "diameter": t.get("nose") or 0.0, "flute": flute}
+              for t in tool_list if t.get("type") in (200, 220)]
+    bore_tool_number = next((t["n"] for t in tool_list
+                             if t.get("name") == "BORE"), 0)
+    if drills:
+        _log("свёрла программы: "
+             + ", ".join(f"T{d['n']} Ø{d['diameter']:g}" for d in drills))
+    if bore_tool_number:
+        _log(f"расточной программы: T{bore_tool_number}")
+
     if out_stem is None:
         out_stem = os.path.splitext(os.path.abspath(gcode_path))[0]
     out_step = out_stem + "_nxsim.stp"
@@ -505,6 +521,11 @@ def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
                                   "OD_GROOVE_L"),
         "groove_orient_angle": getattr(config, "NX_LATHE_GROOVE_ORIENT_ANGLE",
                                        None),
+        # свёрла (шаблон hole_making) и расточной (внутренний токарный)
+        "drills": drills,
+        "bore_tool_number": int(bore_tool_number or 0),
+        "bore_subtype": getattr(config, "NX_LATHE_BORE_SUBTYPE", "ID_55_L"),
+        "bore_insert_size": float(getattr(config, "NX_LATHE_BORE_SIZE", 6.35)),
         # левый проходной T3 — зеркальный подтип того же класса
         "left_tool_number": int(left_tool_number or 0),
         "left_subtype": getattr(config, "NX_LATHE_LEFT_SUBTYPE", "OD_55_L"),

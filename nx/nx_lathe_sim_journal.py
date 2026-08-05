@@ -130,6 +130,49 @@ def first_existing(collection, names):
 POCKETS = [f"POCKET_{i:02d}" for i in range(1, 13)] + ["GENERIC_MACHINE"]
 
 
+def make_drill(setup, pocket_no, diameter, used, flute=60.0):
+    """Сверло в кармане револьвера pocket_no (номер кармана = номер T).
+
+    Токарный шаблон сверла не содержит — берём его из шаблона hole_making,
+    единственного, который проходит и создание, и Commit. Диаметр обязателен:
+    без него NX отказывает по длине погружения.
+    """
+    pname = f"POCKET_{pocket_no:02d}"
+    if pname in used or diameter <= 0:
+        log(f"warn: сверло T{pocket_no} пропущено (карман занят или Ø={diameter})")
+        return
+    try:
+        parent = setup.CAMGroupCollection.FindObject(pname)
+    except Exception as e:
+        log(f"warn: карман {pname} не найден ({e})")
+        return
+    uname = f"DRILL_{pocket_no}"
+    try:
+        tool = setup.CAMGroupCollection.CreateToolWithUserName(
+            parent, "hole_making", "STD_DRILL",
+            NXOpen.CAM.NCGroupCollection.UseDefaultName.TrueValue, uname, uname)
+        tb = setup.CAMGroupCollection.CreateMillToolBuilder(tool)
+    except Exception as e:
+        log(f"warn: сверло Ø{diameter} в {pname} не создалось "
+            f"({type(e).__name__}: {e})")
+        return
+    for prop, val in (("TlDiameterBuilder", diameter),
+                      ("TlFluteLnBuilder", flute),
+                      ("TlNumberBuilder", pocket_no)):
+        try:
+            getattr(tb, prop).Value = val
+        except Exception as e:
+            log(f"warn: {prop}={val} не применилось: {type(e).__name__}")
+    try:
+        tb.Commit()
+        used.add(pname)
+        log(f"сверло Ø{diameter:g} в {pname} (билдер {type(tb).__name__})")
+    except Exception as e:
+        log(f"warn: сверло Ø{diameter} в {pname}: commit FAIL "
+            f"({type(e).__name__}: {e})")
+    tb.Destroy()
+
+
 def make_tool(setup, subtype, uname, props, used, report, pocket_no=None):
     """Резец подтипа `subtype` в кармане револьвера с номером pocket_no.
 
@@ -417,6 +460,25 @@ def main():
                   report=
                   ("InsertWidthBuilder", "SizeBuilder", "RadiusBuilder",
                    "NoseRadiusBuilder", "ThicknessBuilder", "OrientAngleBuilder"))
+
+    # Свёрла и расточной. Токарный шаблон сверло НЕ отдаёт: подтипы
+    # drill/STD_DRILL и turning/STD_DRILL либо не находят шаблон, либо не
+    # проходят Commit («Helical Diameter must be greater than Min Ramp Length»).
+    # Работает hole_making/STD_DRILL — билдер DrillStdToolBuilder, диаметр в
+    # TlDiameterBuilder (замерено зондом nx/research/drill_tool_probe_journal.py).
+    # Без них полная программа установа встаёт на первой же смене на T7/T4/T5:
+    # станция револьвера пуста.
+    for d in (p.get("drills") or []):
+        make_drill(setup, int(d["n"]), float(d.get("diameter") or 0.0), used,
+                   flute=float(d.get("flute") or 60.0))
+
+    bt = int(p.get("bore_tool_number") or 0)
+    if bt:
+        make_tool(setup, p.get("bore_subtype", "ID_55_L"), "TURN_ID",
+                  [("NoseRadiusBuilder", float(p.get("bore_nose_radius", 0.4))),
+                   ("TlNumberBuilder", bt),
+                   ("SizeBuilder", float(p.get("bore_insert_size", 6.35)))],
+                  used, ("NoseRadiusBuilder", "SizeBuilder"), pocket_no=bt)
 
     # ── 6. K-компоненты PART/BLANK ──
     kin = work_part.KinematicConfigurator
