@@ -594,7 +594,8 @@ def make_surface_rough(doc, job, tc, name, model_obj, face_idx, p,
     (drop cutter — фреза опускается сверху до поверхности) в режиме Multi-pass:
     слоями StepDown, с вертикальным смещением DepthOffset = припуск, зона —
     только эта грань модели (BoundBox=BaseBoundBox). Плоская фреза оставляет
-    на наклоне ступеньки высотой до StepDown — их снимает чистовой проход."""
+    на наклоне ступеньки высотой до StepDown (чистовой обработки нет —
+    остаются как есть)."""
     final_z = max(final_z, p.get("_floor_limit", final_z))  # не ниже стола
     import Path.Op.Surface as Surface
     op = Surface.Create(name, parentJob=job)
@@ -604,10 +605,8 @@ def make_surface_rough(doc, job, tc, name, model_obj, face_idx, p,
     set_prop(op, "ScanType", "Planar")
     set_prop(op, "LayerMode", "Multi-pass")
     set_prop(op, "CutMode", "Climb")
-    # грань обычно УЖЕ фрезы (радиус гиба, скос): рисунок Offset отступил бы
-    # от границы на радиус и не оставил ничего. ZigZag + расширение границы
-    # на радиус фрезы дают полное покрытие; по высоте фрезу всё равно ведёт
-    # поверхность модели (+DepthOffset), зарезаться в соседей она не может.
+    # Грань бывает УЖЕ фрезы (радиус гиба, скос), поэтому рисунок ZigZag, а не
+    # Offset (тот отступает от границы на радиус и оставляет пусто).
     set_prop(op, "CutPattern", "ZigZag")
     # строчки вдоль ДЛИННОЙ стороны грани (меньше проходов и врезаний):
     # CutPatternAngle 0° = строчки вдоль X, 90° = вдоль Y
@@ -621,9 +620,20 @@ def make_surface_rough(doc, job, tc, name, model_obj, face_idx, p,
         tool_r = float(tc.Tool.Diameter.Value) / 2.0
     except Exception:
         tool_r = float(p["tool_diameter"]) / 2.0
-    set_prop(op, "BoundaryAdjustment", FreeCAD.Units.Quantity(f"{tool_r} mm"))
-    set_prop(op, "BoundaryEnforcement", False)
-    set_prop(op, "StepOver", int(p["rough_stepover"]))
+    # Граница обработки. Расширение на радиус (keep_in=False) даёт полное
+    # покрытие узкой грани, НО 3D-проход видит только свою грань — выйдя за её
+    # край, фреза опускается и боком срезает соседнюю вертикальную стенку
+    # (замеряли зарез 0.2 мм на торцах). keep_in=True запирает фрезу внутри
+    # грани: зареза нет, зато вдоль края остаётся полоска в радиус фрезы —
+    # поэтому вызывающий перебирает фрезы от крупной к мелкой.
+    keep_in = bool(p.get("surface_keep_inside", False))
+    set_prop(op, "BoundaryAdjustment",
+             FreeCAD.Units.Quantity(f"{0.0 if keep_in else tool_r} mm"))
+    set_prop(op, "BoundaryEnforcement", keep_in)
+    # шаг строчек на наклоне — свой, мельче: гребешки между строчками остаются
+    # на самой поверхности детали (чистовой обработки нет)
+    set_prop(op, "StepOver", int(p.get("rough_stepover_slope",
+                                       p["rough_stepover"])))
     set_prop(op, "SampleInterval",
              FreeCAD.Units.Quantity(f"{max(float(p['rough_tolerance']), 0.2)} mm"))
     set_prop(op, "DepthOffset", FreeCAD.Units.Quantity(f"{allowance} mm"))
@@ -756,6 +766,44 @@ def make_roughing_ops(doc, job, tc, shape, p):
             log(f"warn: локальный верх зоны не посчитался ({e}) — беру верх заготовки")
             return sb.ZMax
 
+    def concave_radius(f):
+        """Радиус ВОГНУТОГО скругления грани (гиб, галтель у стенки) или None.
+        Вогнутое = тело снаружи цилиндра: пробуем точку на 0.1 мм в сторону оси —
+        если там пусто, материал с другой стороны, значит угол вогнутый и фреза
+        радиусом больше R в него не войдёт."""
+        if surf_name(f) != "Cylinder":
+            return None
+        try:
+            u0, u1, v0, v1 = f.ParameterRange
+            mid = f.valueAt((u0 + u1) / 2, (v0 + v1) / 2)
+            ax, base = f.Surface.Axis, f.Surface.Center
+            axis_pt = base + ax * (mid - base).dot(ax)   # проекция точки на ось
+            d = axis_pt - mid
+            if d.Length < 1e-9:
+                return None
+            d.normalize()
+            if shape.isInside(mid + d * 0.1, 1e-6, True):
+                return None            # материал со стороны оси = выпуклый угол
+            return float(f.Surface.Radius)
+        except Exception:
+            return None
+
+    def surface_ladder(name, face_idx, top, final_z, width, alw):
+        """3D-проход по грани с перебором фрез от крупной к мелкой. Нужен из-за
+        запрета выхода за границу грани: фреза шире грани даёт пустой путь,
+        мелкая — нормальный. Возврат: (операция или None, диаметр)."""
+        first, dx0 = choose_tc(name, width)
+        tries = [(first, dx0)] + [(pool[d], d) for d in diams
+                                  if d < dx0 and name not in overrides]
+        for tcx, dx in tries:
+            op = make_surface_rough(doc, job, tcx, name, jm, face_idx, p,
+                                    top, final_z, alw)
+            if op:
+                return op, dx
+            if dx != tries[-1][1]:
+                log(f"{name}: фреза Ø{dx:g} не дала траектории — пробую мельче")
+        return None, dx0
+
     # ── 1) сквозные вырезы любой формы, ПЕРВЫМИ (деталь ещё жёстко в заготовке) ──
     if sil is None:
         log("warn: силуэт не построился — вырезы и внешний контур пропущены")
@@ -773,17 +821,32 @@ def make_roughing_ops(doc, job, tc, shape, p):
             continue
         # сквозной вырез режем до дна ДЕТАЛИ (bb.ZMin), а НЕ до floor_z
         # (дно + припуск): у сквозного отверстия нет дна, чтобы оставлять там
-        # припуск под чистовую — иначе на дне стоит кожура (видно без FINISH).
+        # припуск — иначе на дне стоит кожура.
         # Припуск по стенкам (StockToLeave) при этом сохраняется.
-        tcx, dx = choose_tc(f"RoughHole{i}", min(rb.XLength, rb.YLength))
-        op = make_adaptive(doc, job, tcx, f"RoughHole{i}", region, p,
-                           hole_top, bb.ZMin, alw_xy)
-        if not op and min(rb.XLength, rb.YLength) > dx + 0.2:
-            # узкий паз: адаптивной негде сделать винтовой заход, но фреза в паз
-            # проходит — контурный обход ИЗНУТРИ (вход вертикальным врезанием)
-            log(f"RoughHole{i}: узкий вырез — перехожу на контурный проход изнутри")
-            op = make_profile(doc, job, tcx, f"RoughHole{i}", region, p,
-                              hole_top, bb.ZMin, alw_xy, side="Inside")
+        # Перебор фрез по убыванию: «самая крупная, что влезает по ширине» —
+        # только первая попытка. Фреза ровно в размер выреза (Ø1 в вырез 1×1)
+        # даёт пустую траекторию: винтовому заходу нужно ~2 Ø, контурному —
+        # запас на радиус. Раньше на этом сдавались и вырез оставался целым;
+        # теперь берём следующую по убыванию, пока путь не появится.
+        width = min(rb.XLength, rb.YLength)
+        name = f"RoughHole{i}"
+        first, dx0 = choose_tc(name, width)
+        tries = [(first, dx0)] + [(pool[d], d) for d in diams
+                                  if d < dx0 and name not in overrides]
+        op = None
+        for tcx, dx in tries:
+            op = make_adaptive(doc, job, tcx, name, region, p,
+                               hole_top, bb.ZMin, alw_xy)
+            if not op and width > dx + 0.2:
+                # узкий паз: винтового захода нет, но фреза в паз проходит —
+                # контурный обход ИЗНУТРИ (вход вертикальным врезанием)
+                log(f"{name}: узкий вырез — перехожу на контурный проход изнутри")
+                op = make_profile(doc, job, tcx, name, region, p,
+                                  hole_top, bb.ZMin, alw_xy, side="Inside")
+            if op:
+                break
+            if dx != tries[-1][1]:
+                log(f"{name}: фреза Ø{dx:g} не дала траектории — пробую мельче")
         if op:
             ops.append(op)
             write_partial(job, ops, p, f"готов вырез {i} (Ø{dx:g}, "
@@ -878,15 +941,15 @@ def make_roughing_ops(doc, job, tc, shape, p):
             if skip(name):
                 continue
             rfb = fc["region"].BoundBox
-            tcx, dx = choose_tc(name, min(rfb.XLength, rfb.YLength))
-            op = make_adaptive(doc, job, tcx, name, fc["region"], p,
-                               top, fc["final"], alw_xy)
+            # плоские грани снимаем 3D-проходом по поверхности (террасы), как и
+            # наклонные — по требованию оператора вместо Adaptive-выборки
+            op, dx = surface_ladder(name, fc["idx"], top, fc["final"],
+                                    min(rfb.XLength, rfb.YLength), alw_z)
             if not op:
-                # узкая полка — адаптивной выборке негде развернуться; снимаем
-                # террасами по поверхности, как криволинейные грани
-                log(f"{name}: узкая грань — перехожу на террасы по поверхности")
-                op = make_surface_rough(doc, job, tcx, name, jm, fc["idx"], p,
-                                        top, fc["final"], alw_z)
+                log(f"{name}: 3D-проход пуст на всех фрезах — Adaptive-выборкой")
+                tcx, dx = choose_tc(name, min(rfb.XLength, rfb.YLength))
+                op = make_adaptive(doc, job, tcx, name, fc["region"], p,
+                                   top, fc["final"], alw_xy)
             note = f"готова грань {face_n} (Ø{dx:g}, Z={fc['z']:.1f}, {fc['area']:.0f} мм²)"
         else:
             top = local_start(fc["rect"])
@@ -899,9 +962,18 @@ def make_roughing_ops(doc, job, tc, shape, p):
             if skip(name):
                 continue
             rb2 = fc["rect"].BoundBox
-            tcx, dx = choose_tc(name, min(rb2.XLength, rb2.YLength))
-            op = make_surface_rough(doc, job, tcx, name, jm, fc["idx"], p,
-                                    top, fc["final"], alw_z)
+            width = min(rb2.XLength, rb2.YLength)
+            # ВОГНУТЫЙ радиус (гиб, галтель у стенки) ограничивает фрезу сверху:
+            # плоская фреза радиусом больше R в такой угол не входит — её ось не
+            # подойдёт к стенке ближе своего радиуса, и вся дуга остаётся целой.
+            # Ø ≤ 2R. Выпуклые скругления (внешний угол) не ограничивают.
+            rcap = concave_radius(jm.Shape.Faces[fc["idx"] - 1])
+            if rcap is not None:
+                width = min(width, 2.0 * rcap)
+                log(f"{name}: вогнутый радиус R{rcap:.1f} — фреза не крупнее "
+                    f"Ø{2.0 * rcap:.1f}")
+            op, dx = surface_ladder(name, fc["idx"], top, fc["final"],
+                                    width, alw_z)
             note = f"готова криволинейная грань {slope_n} (Ø{dx:g}, {fc['area']:.0f} мм²)"
         if op:
             ops.append(op)
@@ -967,9 +1039,25 @@ def make_roughing_ops(doc, job, tc, shape, p):
             # внешний контур режем до дна ДЕТАЛИ (bb.ZMin, снизу клампится полом):
             # периметр отделяет деталь от рамки заготовки. Припуск по стенке
             # (OffsetExtra) при этом сохраняется.
+            # Верх обвода жёстко задан по ВЕРХУ НИЖНЕЙ ПОЛКИ детали — самой
+            # большой горизонтальной грани, смотрящей вверх (у уголка это плита,
+            # у плоской детали — её верх). Выше полки силуэт сжимается до стенки,
+            # и обвод по силуэту шёл бы там по воздуху. Это единственное
+            # упрощение — только высота, без подбора полос по сечениям.
+            peri_top = min(sb.ZMax, bb.ZMax)
+            shelf_a, shelf_z = 0.0, None
+            for f in shape.Faces:
+                if surf_name(f) != "Plane" or f.normalAt(0, 0).z < 0.999:
+                    continue
+                if f.Area > shelf_a:
+                    shelf_a, shelf_z = f.Area, f.BoundBox.ZMax
+            if shelf_z is not None:
+                peri_top = min(peri_top, max(shelf_z, bb.ZMin + 0.1))
+                log(f"RoughPerimeter: верх обвода по полке Z={peri_top:.2f} "
+                    f"(верх детали {bb.ZMax:.2f})")
             tcx, _ = choose_tc("RoughPerimeter", None)
             op = make_profile(doc, job, tcx, "RoughPerimeter", filled, p,
-                              start_z, bb.ZMin, alw_xy)
+                              peri_top, bb.ZMin, alw_xy)
             if op:
                 ops.append(op)
                 write_partial(job, ops, p, "готов внешний контур детали")
@@ -1142,8 +1230,8 @@ def make_layered_ops(doc, job, tc, shape, p):
 
 
 def mill(doc, feat, p, stock_solid=None):
-    """Последовательная обработка: черновая по этапам (контур → отверстия →
-    остальное) и, если включена, чистовая по поверхности. → текст G-Code.
+    """Последовательная обработка: черновая по этапам (отверстия → грани →
+    периметр). → текст G-Code.
     stock_solid — произвольная заготовка из файла (уже в координатах детали);
     None — заготовка = габаритный бокс детали + поля."""
     bb = feat.Shape.BoundBox
@@ -1262,34 +1350,6 @@ def mill(doc, feat, p, stock_solid=None):
             ops.extend(make_roughing_ops(doc, job, tc, feat.Shape, p))
     else:
         log("черновая отключена (ROUGH_ALLOWANCE=0)")
-
-    if p.get("finish", False):
-        import Path.Op.Surface as Surface
-        surf = Surface.Create("Finish", parentJob=job)
-        surf.ToolController = tc
-        set_prop(surf, "CutPattern", p["cut_pattern"])
-        set_prop(surf, "CutMode", "Climb")
-        set_prop(surf, "LayerMode", "Single-pass")
-        set_prop(surf, "ScanType", "Planar")
-        set_prop(surf, "BoundBox", "BaseBoundBox")  # границы обработки = модель
-        set_prop(surf, "StepOver", int(p["stepover"]))
-        set_prop(surf, "SampleInterval",
-                 FreeCAD.Units.Quantity(f"{p['sample_interval']} mm"))
-        # setExpression(None) снимает привязку к SetupSheet — иначе recompute вернёт дефолт
-        surf.setExpression("StartDepth", None)
-        surf.StartDepth = bb.ZMax
-        surf.setExpression("FinalDepth", None)
-        surf.FinalDepth = p["_floor_limit"]   # чистовая тоже не ниже стола
-        surf.ClearanceHeight.Value = bb.ZMax + p["safe_height"]
-        surf.SafeHeight.Value = bb.ZMax + 3.0
-        doc.recompute()
-        n = len(surf.Path.Commands) if surf.Path else 0
-        log(f"Finish (surface): {n} команд")
-        if n == 0:
-            raise RuntimeError("Surface не дала траекторию (проверьте модель и параметры)")
-        ops.append(surf)
-    else:
-        log("чистовая отключена (FINISH=false)")
 
     if not ops:
         raise RuntimeError("ни одной операции с траекторией — проверьте параметры")

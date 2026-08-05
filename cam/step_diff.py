@@ -32,8 +32,15 @@ _WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 
 def diff(part_path: str, result_path: str, json_path: str | None = None,
-         min_volume: float = 2.0) -> dict:
-    """Возвращает dict: недорезы/зарезы с объёмами и координатами."""
+         min_volume: float | None = None, pitch: float | None = None) -> dict:
+    """Возвращает dict: недорезы/зарезы с объёмами и координатами.
+    min_volume — порог отсечки шума фасетизации (мм³), pitch — шаг воксельной
+    сетки (мм; 0/None = из конфига, там 0 = авто). Оба задают СТРОГОСТЬ
+    проверки: дефект тоньше шага сетки не виден в принципе."""
+    if min_volume is None:
+        min_volume = float(getattr(config, "DIFF_MIN_VOLUME", 2.0))
+    if pitch is None:
+        pitch = float(getattr(config, "DIFF_PITCH", 0.0))
     fc = freecad_cam.find_freecadcmd()
     if not fc:
         raise RuntimeError("freecadcmd не найден (укажите FREECAD_CMD в конфиге)")
@@ -56,6 +63,8 @@ def diff(part_path: str, result_path: str, json_path: str | None = None,
             + os.path.basename(out_json),
         "floor_clearance": float(getattr(config, "FLOOR_CLEARANCE", 0.5)),
         "min_volume": min_volume,
+        "pitch": pitch,
+        "min_thickness": float(getattr(config, "DIFF_MIN_THICKNESS", 0.0)),
     }
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
                                      encoding="utf-8") as tmp:

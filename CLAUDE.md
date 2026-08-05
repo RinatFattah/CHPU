@@ -16,7 +16,11 @@ DepthOffset=allowance; the face is usually NARROWER than the tool, so CutPattern
 + BoundaryAdjustment=tool radius + BoundaryEnforcement=False are REQUIRED — the default
 Offset pattern insets by the tool radius and yields an empty path) → RoughPerimeter
 LAST: a single Path Profile pass (Side=Outside, offset radius+allowance) around the
-part's FILLED silhouette (outer wires only, via Part::FaceMakerBullseye). The outer
+part's FILLED silhouette (outer wires only, via Part::FaceMakerBullseye). Its
+StartDepth is hardcoded to the top of the part's LOWER SHELF (the largest upward-facing
+planar face; clamped to `min(stock.ZMax, part.ZMax)`), not the stock top — above the
+shelf the silhouette shrinks to the standing wall, so profiling the full silhouette
+there is pure air. The outer
 contour is cut last so the part stays rigid in the stock frame during all internal
 work; ONLY the part perimeter is cut — leftover stock in the corners that does not
 touch the part is intentionally LEFT (this mode does NOT bulk-clear the whole margin,
@@ -28,12 +32,12 @@ OffsetExtra, floors via FinalDepth — EXCEPT through-holes (RoughHole) and the 
 contour (RoughPerimeter),
 cut to the PART bottom (bb.ZMin, no floor allowance): a through-hole has no floor to
 finish and the perimeter must part the piece from the frame, so leaving allowance there
-strands a skin at the bottom (visible with FINISH off). Down/side-facing or covered faces are skipped (warned, second setup);
+strands a skin at the bottom. Down/side-facing or covered faces are skipped (warned, second setup);
 material unreachable from above (overhangs) is skipped —
 that's a second setup, not something to cut through. Silhouette sections MUST be
 built with `Part.makeFace(wires, "Part::FaceMakerBullseye")` — making a Face per
-wire fills cutouts and the union loses the holes. A Path Surface finishing
-pass is OFF by default (`--finish` / `FINISH: true` enables it). Stock = part
+wire fills cutouts and the union loses the holes. There is NO finishing pass —
+roughing (staged) is the only output; scallops on slopes/radii are left as-is. Stock = part
 bbox + margins (`STOCK_MARGIN`, default 12 = 2 tool Ø) OR an arbitrary solid from a
 file (`STOCK_FILE` / `--stock`): the stock file must be in the SAME coordinate
 system as the model — the worker records the part's orient/origin transforms in a
@@ -100,11 +104,34 @@ and direct runs like `python cam/step_diff.py a.step b.stp` work.
 
 - `run_cam.py` - CLI entry point: `python run_cam.py model.step|model.prt [out.gcode] [--config config.yaml]`
 - `auto_fix.py` - autonomous LLM loop: generate → NX-simulate → boolean diff
-  (`cam/step_diff.py` + `cam/freecad_diff_worker.py`) → ask `claude -p` (headless CLI; found
-  via PATH / CLAUDE_CLI env / VSCode extension native-binary) → parse STRICT-JSON
+  (`cam/step_diff.py` + `cam/freecad_diff_worker.py`) → ask an LLM → parse STRICT-JSON
   actions (set_param whitelist with bounds; extra_zone = forced clearing rect for
   undercuts, Adaptive with Profile-inside fallback, floor-clamped; skip_op = drop a
-  named op, validated against op-name pattern; dead_zone XY boxes) → regenerate.
+  named op, validated against op-name pattern; set_op_tool per op; dead_zone XY
+  boxes). EVERY action is reversible — enable_op, remove_dead_zone /
+  remove_extra_zone (by 1-based index, zones are numbered in the prompt),
+  reset_op_tool, reset_param, reset_all (back to PARAM_INITIAL, snapshotted at
+  run start); set_op_tool on a skipped op re-enables it. Without rollback a bad
+  first-iteration action compounded to the end of the loop (part 025: overcut
+  148.6, undercut 2220.7 mm³).
+  Three interchangeable LLM backends via `--llm` (`ask_llm` dispatch, same prompt
+  and parser): `claude` (default) = `claude -p` headless CLI, no API key, binary
+  found via CLAUDE_CLI env / PATH / VSCode extension native-binary; `gigachat` =
+  Sber SDK, key in `.gigachat_key` or GIGACHAT_CREDENTIALS, `verify_ssl_certs=False`
+  (НУЦ Минцифры chain), 30-min token handled by the SDK; `openrouter` = plain
+  stdlib HTTP to the OpenAI-compatible endpoint, key in `.openrouter_key` or
+  OPENROUTER_API_KEY, model from `--llm-model`/OPENROUTER_MODEL, default
+  `moonshotai/kimi-k3`. Both key files are gitignored. OpenRouter needs defensive
+  parsing: it prepends `: OPENROUTER PROCESSING` keepalive lines to a slow response
+  (so the body is taken from the first `{`), and long reasoning answers sometimes
+  die provider-side with `finish_reason=error` and empty content — hence 3 retries.
+  Measured on the 11-part batch (5-iteration limit): Claude 25 iterations /
+  1.60M tokens, GigaChat 49 / 243k, Kimi K3 20 / 408k; 10/11 parts fully clean for
+  all three (025 is a genuine second-setup part). The prompt
+  carries a `gcode_report` of the last toolpath (per op: tool Ø actually used,
+  frame counts, XY/Z extents) plus hard requirements (overcut MUST be 0,
+  undercut < 1 mm³) and a fixed remedy ladder: smaller tool → dead zone →
+  skip op → regenerate.
   Op names for the prompt are parsed from `(Begin|Finish operation: X)` G-code
   comments. The diff is VOXEL RAY-CASTING, not booleans: OCCT booleans (and even
   isInside, which is also ~ms/probe) against the NX faceted sim body are
@@ -117,13 +144,22 @@ and direct runs like `python cam/step_diff.py a.step b.stp` work.
   Feeding a CAM-project .prt (e.g. `*-CAM-DMC-635.prt`, 12 bodies) to the
   pipeline machines the largest body = the fixture PLATE — garbage; only real
   part files belong in batches.
-  Journal at `<gcode>_autofix.json`. Key safety: `FLOOR_CLEARANCE` (default 0.5 mm)
-  clamps FinalDepth of EVERY op (incl. through-holes/perimeter/finish) to part
+  Journal at `<gcode>_autofix.json`; each iteration also writes `<gcode>_diff.json`,
+  and after the loop a `<gcode>_compare.prt` (part + cut result as NX layers, via
+  `nx_compare.compare_many`; `--no-compare` skips it). Key safety: `FLOOR_CLEARANCE` (default 0.5 mm)
+  clamps FinalDepth of EVERY op (incl. through-holes/perimeter) to part
   bottom + clearance — the part lies on the machine table; `DEAD_ZONES` (XY boxes,
   program coords) are subtracted from hole/face regions, slopes with center inside
   are skipped (perimeter Profile is NOT affected). Diff counts undercut only inside
   the part-silhouette prism (stock frame is intentional), bottom skin ≤ floor limit
-  reported separately as floor_skin, faceting noise filtered by min_volume.
+  reported separately as floor_skin. Strictness knobs (config): `DIFF_PITCH`
+  (grid step, default 0.1 mm — the hard resolution limit), `DIFF_MIN_VOLUME`
+  (0.2 mm³) and `DIFF_MIN_THICKNESS` (0.2 mm). The thickness filter drops
+  differing runs shorter than the tolerance INSIDE each column (`thick_runs`) —
+  without it a fine grid reports hundreds of mm³ of phantom overcut as a
+  one-cell sheet over a whole shelf (the NX result is a facet body; its chord
+  error offsets every machined surface by ~0.1 mm). Loop stop thresholds:
+  `DIFF_OK_UNDERCUT_MM3` (1), `DIFF_OK_OVERCUT_MM3` (0 — overcut is unfixable).
 - `nx/nx_export.py` - Siemens NX bridge: `.prt` → STEP via NX's CLI translator (headless).
 - `cam/freecad_cam.py` - host side: locates `freecadcmd`, passes params via temp JSON
   (env var `FREECAD_WORKER_PARAMS`), parses `[worker]` output markers.
@@ -224,5 +260,5 @@ good test for ORIGIN normalization); its L-shaped stock:
 - Generated `.stl`/`.gcode` are gitignored; keep them out of commits.
 - `config.yaml` may contain operator-specific settings and is gitignored;
   the committed template is `config.example.yaml`.
-- Don't describe the output as full CAM: 3-axis, single tool, no roughing/finishing
-  split, no collision control — README's "Ограничения" section is the honest contract.
+- Don't describe the output as full CAM: 3-axis, roughing only (NO finishing pass),
+  no collision control — README's "Ограничения" section is the honest contract.

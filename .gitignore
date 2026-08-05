@@ -48,3 +48,7 @@ runs/
 
 # logs
 *.log
+
+# Ключи доступа: НИКОГДА не коммитить
+.gigachat_key
+.openrouter_key

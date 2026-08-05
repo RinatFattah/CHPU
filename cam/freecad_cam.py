@@ -132,11 +132,10 @@ def generate_gcode_freecad(model_path: str, gcode_path: str) -> int:
         "rough_allowance_mode": config.ROUGH_ALLOWANCE_MODE,
         "rough_stepdown": config.ROUGH_STEPDOWN,
         "rough_stepover": config.ROUGH_STEPOVER,
+        "rough_stepover_slope": getattr(config, "ROUGH_STEPOVER_SLOPE",
+                                        config.ROUGH_STEPOVER),
         "rough_tolerance": config.ROUGH_TOLERANCE,
-        "finish": config.FINISH,
-        "cut_pattern": config.SURFACE_CUT_PATTERN,
-        "stepover": config.SURFACE_STEPOVER,
-        "sample_interval": config.SURFACE_SAMPLE_INTERVAL,
+        "surface_keep_inside": getattr(config, "SURFACE_KEEP_INSIDE", True),
         "postprocessor": config.POSTPROCESSOR,
         "nx_export": config.NX_EXPORT,   # экспорт STEP деталь/заготовка в СК G-кода (для NX)
     }
