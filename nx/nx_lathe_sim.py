@@ -418,11 +418,23 @@ def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
     # сверлильный инструмент: станция револьвера пуста. Типы Sinumerik:
     # 200 спиральное сверло, 220 центровочное; у сверла в списке диаметр лежит
     # в поле nose (так его пишет tools_from_gcode).
-    flute = float(getattr(config, "NX_LATHE_DRILL_FLUTE", 60.0))
+    # Длина рабочей части сверла: шаблонные 60 мм в ISV выметают деталь
+    # целиком (IPW пустой), 3 мм дают нормальный результат. Причина не
+    # найдена — тело сверла снимает материал там, где не должно.
+    flute = float(getattr(config, "NX_LATHE_DRILL_FLUTE", 3.0))
     drills = [{"n": t["n"], "diameter": t.get("nose") or 0.0, "flute": flute}
               for t in tool_list if t.get("type") in (200, 220)]
     bore_tool_number = next((t["n"] for t in tool_list
                              if t.get("name") == "BORE"), 0)
+    # Размер пластины расточного. Шаблонные 6.35 в отверстие Ø11.5 не лезут:
+    # ISV режет им деталь пополам. Замерено на 14-31A (зарез к модели, мм³):
+    #   6.35 → обточенный конец ОТРЕЗАН      1.15 → 424
+    #   2.00 → отверстие r 7.03 вместо 5.75  1.00 → 223, отверстие r 5.82 ✔
+    #   0.96 → ДЕТАЛЬ УНИЧТОЖЕНА (11005)
+    # Зависимость НЕМОНОТОННАЯ — соседние значения дают то норму, то развал,
+    # поэтому формулы по диаметру отверстия здесь нет: стоит единственное
+    # проверенное 1.0, менять только замером (NX_LATHE_BORE_SIZE).
+    bore_size = float(getattr(config, "NX_LATHE_BORE_SIZE", None) or 1.0)
     if drills:
         _log("свёрла программы: "
              + ", ".join(f"T{d['n']} Ø{d['diameter']:g}" for d in drills))
@@ -525,7 +537,7 @@ def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
         "drills": drills,
         "bore_tool_number": int(bore_tool_number or 0),
         "bore_subtype": getattr(config, "NX_LATHE_BORE_SUBTYPE", "ID_55_L"),
-        "bore_insert_size": float(getattr(config, "NX_LATHE_BORE_SIZE", 6.35)),
+        "bore_insert_size": float(bore_size),
         # левый проходной T3 — зеркальный подтип того же класса
         "left_tool_number": int(left_tool_number or 0),
         "left_subtype": getattr(config, "NX_LATHE_LEFT_SUBTYPE", "OD_55_L"),

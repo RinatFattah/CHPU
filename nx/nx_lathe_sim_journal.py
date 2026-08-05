@@ -474,11 +474,23 @@ def main():
 
     bt = int(p.get("bore_tool_number") or 0)
     if bt:
+        # ДЕРЖАВКУ У РАСТОЧНОГО НАДО ГАСИТЬ. У шаблона ID_55_L она включена и
+        # заведомо не лезет в отверстие: HolderShankWidth 35, HolderWidth 42,
+        # HolderLength 300, да ещё адаптер Ø100. В ISV это тело едет вместе с
+        # резцом и разносит отверстие: с державкой обточенный конец детали
+        # отрезало целиком, без неё остаётся только погрешность самой пластины.
         make_tool(setup, p.get("bore_subtype", "ID_55_L"), "TURN_ID",
                   [("NoseRadiusBuilder", float(p.get("bore_nose_radius", 0.4))),
                    ("TlNumberBuilder", bt),
-                   ("SizeBuilder", float(p.get("bore_insert_size", 6.35)))],
-                  used, ("NoseRadiusBuilder", "SizeBuilder"), pocket_no=bt)
+                   ("SizeBuilder", float(p.get("bore_insert_size", 6.35))),
+                   ("HolderUse", False),
+                   ("AdapterUse", False),
+                   ("HolderShankWidthBuilder",
+                    float(p.get("bore_shank_width", 6.0))),
+                   ("HolderWidthBuilder",
+                    float(p.get("bore_shank_width", 6.0)))],
+                  used, ("NoseRadiusBuilder", "SizeBuilder",
+                         "HolderShankWidthBuilder"), pocket_no=bt)
 
     # ── 6. K-компоненты PART/BLANK ──
     kin = work_part.KinematicConfigurator
