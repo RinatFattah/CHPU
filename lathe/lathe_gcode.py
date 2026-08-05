@@ -671,6 +671,18 @@ def generate(prof_data, params):
         d_drill = _pick_drill(d_bore - 2 * allow,
                               params.get("drill_series"))
         depth = z_bot_b - (0.3 * d_drill if z_bot_b <= z_end + 1e-6 else 0.0)
+        # ОТВЕРСТИЕ С ДВУХ СТОРОН. Сверлить и растачивать на всю длину из одного
+        # установа — это вылет сверла Ø10 на 49 мм (L/D 4.9) и борштанги на 46
+        # (L/D ≈ 4, жёсткость падает как куб вылета). Завод делает половину с
+        # каждой стороны: на 14-31A сверло идёт до z −28.95, расточной до −25.50
+        # при длине детали 46. hole_depth_* — предел ЭТОГО установа; None =
+        # прежнее поведение, насквозь.
+        z_lim_d = params.get("hole_depth_drill")
+        if z_lim_d is not None:
+            depth = max(depth, float(z_lim_d))
+        z_lim_b = params.get("hole_depth_bore")
+        z_bore_bot = (z_bot_b if z_lim_b is None
+                      else max(z_bot_b, float(z_lim_b)))
         t4 = params.get("drill_tool_number", 4)
         t5 = params.get("bore_tool_number", 5)
         f_dr = params.get("feed_per_rev_drill", 0.06)
@@ -728,8 +740,8 @@ def generate(prof_data, params):
             d_safe = d_drill - 1.0
             g.append(f"G0 {X(d_safe / 2)} Z{z_top_b + clear:.3f}")
             g.append(f"G1 {X(d_bore / 2)} Z{z_top_b:.3f} {fmt(f_bo)}")
-            g.append(f"G1 {X(d_bore / 2)} Z{z_bot_b:.3f} {fmt(f_bo)}")
-            g.append(f"G0 {X(d_safe / 2)} Z{z_bot_b:.3f}")
+            g.append(f"G1 {X(d_bore / 2)} Z{z_bore_bot:.3f} {fmt(f_bo)}")
+            g.append(f"G0 {X(d_safe / 2)} Z{z_bore_bot:.3f}")
             g.append(f"G0 {X(d_safe / 2)} Z{z_top_b + clear:.3f}")
             g.append("(Finish operation: Bore1)")
 

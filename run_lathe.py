@@ -281,21 +281,33 @@ def main():
         prof1, prof2 = lathe_setups.split(prof, z_split, face_allow, overlap)
         th1, th2, th_over = lathe_setups.split_threads(p.get("threads"),
                                                        z_split, z_end)
+        # Отверстие — с двух сторон, по заводской схеме. Каждый установ идёт
+        # чуть за середину детали: сверло глубже, расточной мельче (на 14-31A
+        # завод даёт −28.95 и −25.50 при длине 46). Так вылет сверла падает с
+        # L/D 4.9 до 2.9, а борштанги — с 4 до 2.2.
+        mid = z_end / 2.0
+        z_hd = mid - getattr(config, "LATHE_HOLE_OVERLAP_DRILL", 6.0)
+        z_hb = mid - getattr(config, "LATHE_HOLE_OVERLAP_BORE", 2.5)
         p2 = dict(p)
-        p2.update(threads=th2, drill=False, partoff=False, bore=[],
+        p2.update(threads=th2, partoff=False,
+                  bore=(prof2.get("bore_raw") or []),
+                  hole_depth_drill=z_hd, hole_depth_bore=z_hb,
                   setup_note=(f"SETUP 2 of 2: part re-gripped and FLIPPED, "
                               f"Z0 = far face (was Z{z_end:.2f} in setup 1), "
                               f"stock = result of setup 1"))
         p.update(threads=th1, partoff_z_ref=z_end - face_allow,
+                 hole_depth_drill=z_hd, hole_depth_bore=z_hb,
                  setup_note=(f"SETUP 1 of 2: from bar, Z0 = right face, "
-                             f"turns Z 0..{z_split:.2f}, drills through, "
+                             f"turns Z 0..{z_split:.2f}, drills to Z{z_hd:.2f}, "
+                             f"bores to Z{z_hb:.2f}, "
                              f"parts off at Z{z_end - face_allow:.2f}"))
         prof = prof1
         gcode2 = os.path.splitext(gcode)[0] + "_2" + os.path.splitext(gcode)[1]
         print(f"Два установа: передача работы на z {z_split:.1f} "
               f"(зажим {grip:g} мм, припуск на подрезку {face_allow:g} мм)")
-        print(f"   установ 1: z {0.0:.1f}..{z_split:.1f} + отверстие насквозь + "
-              f"отрезка на z {z_end - face_allow:.1f}")
+        print(f"   установ 1: z {0.0:.1f}..{z_split:.1f} + отверстие до z "
+              f"{z_hd:.1f} (расточка {z_hb:.1f}) + отрезка на z "
+              f"{z_end - face_allow:.1f}")
         print(f"   установ 2: z {z_end:.1f}..{z_split:.1f} после перехвата "
               f"(в своей СК z' 0.0..{z_end - z_split:.1f})")
         for th in th_over:

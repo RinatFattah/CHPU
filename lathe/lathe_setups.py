@@ -119,7 +119,11 @@ def split(prof, z_split, face_allowance=2.0, overlap=2.0):
     prof2 = dict(prof)
     prof2["profile"] = truncate(mirror(prof["profile"], z_end), z_lim2)
     prof2["profile_raw"] = truncate(mirror(raw, z_end), z_lim2)
-    prof2["bore_raw"] = []                    # отверстие сделал первый установ
+    # Отверстие делается С ДВУХ СТОРОН, как на заводе: каждый установ берёт свою
+    # половину, глубину ограничивает hole_depth_* (см. lathe_gcode). Раньше всё
+    # отверстие шло первым установом, и сверло Ø10 уходило на 49 мм — вылет
+    # L/D 4.9 против заводских 2.9.
+    prof2["bore_raw"] = mirror(prof.get("bore_raw") or [], z_end)
     prof2["stock_z_top"] = float(face_allowance)
     prof2["stock_z_bottom"] = z_end
     return prof1, prof2
