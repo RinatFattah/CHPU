@@ -82,6 +82,10 @@ def main():
                          "программа неисполнима")
     ap.add_argument("--contour-rough", action="store_true",
                     help=argparse.SUPPRESS)   # устаревший: слои и так включены
+    ap.add_argument("--no-pre-finish", action="store_true",
+                    help="не выбирать уступы чистовым резцом заранее (тогда в "
+                         "них чистовой снимет припуск + то, что черновой не "
+                         "достал)")
     ap.add_argument("--no-semi-finish", action="store_true",
                     help="не печатать получистовой проход (тогда после уровней "
                          "чистовой встретит переменный припуск: 0.2 мм на "
@@ -167,6 +171,8 @@ def main():
                        else getattr(config, "LATHE_ROUGH_MODE", "contour")),
         "semi_finish": (not args.no_semi_finish
                         and getattr(config, "LATHE_SEMI_FINISH", True)),
+        "pre_finish": (not args.no_pre_finish
+                       and getattr(config, "LATHE_PRE_FINISH", True)),
         "groove_contour": args.groove_contour,
         # осевое отверстие: сверление + растачивание (сам контур
         # подставляется ниже, после съёма профиля)
@@ -345,10 +351,16 @@ def main():
     if stats.get("threads"):
         print(f"   T6 резьбовой: {stats['threads']} резьб(ы) нарезано")
     if stats.get("finish_tool"):
+        deep = (f"{stats['finish_max_depth']:.2f} мм по радиусу"
+                if not stats.get("pre_finish")
+                else f"{p['allowance']:g} мм — уступы выбраны заранее "
+                     f"({stats['pre_finish']} проход(а) PreFinish)")
         print(f"   T{stats['finish_tool']} чистовой: {p['finish_insert']} "
               f"({p['finish_nose_angle']:g}°-ромб) — им же считается "
-              f"достижимость; в уступах снимает до "
-              f"{stats['finish_max_depth']:.2f} мм по радиусу")
+              f"достижимость; снимает {deep}")
+        for z in stats.get("pre_finish_zones", []):
+            print(f"      уступ z {z['z_hi']:.2f}..{z['z_lo']:.2f}: черновой "
+                  f"оставлял бы {z['max_extra'] + p['allowance']:.2f} мм")
     if stats.get("left_passes"):
         print(f"   T3 левый проходной: {stats['left_passes']} проход(а), "
               f"{stats['left_volume_mm3']:.0f} мм³ — правому резцу за уступ "
