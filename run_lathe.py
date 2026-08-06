@@ -82,6 +82,11 @@ def main():
                          "программа неисполнима")
     ap.add_argument("--contour-rough", action="store_true",
                     help=argparse.SUPPRESS)   # устаревший: слои и так включены
+    ap.add_argument("--rough-mode", choices=("contour", "levels"),
+                    help="форма черновых слоёв: contour — эквидистанта чистового "
+                         "пути (по умолчанию), levels — продольные проходы "
+                         "ПОСТОЯННОГО ДИАМЕТРА, как у завода (каждый обрывается "
+                         "на контуре)")
     ap.add_argument("--groove-contour", action="store_true",
                     help="ЭКСПЕРИМЕНТ: чистовой контур канавки углом пластины "
                          "после врезаний (чистит донья, но пока даёт зарез на "
@@ -154,6 +159,8 @@ def main():
         "contour_rough": (not args.no_contour_rough
                           and not args.finish_only
                           and getattr(config, "LATHE_CONTOUR_ROUGH", True)),
+        "rough_mode": (args.rough_mode if args.rough_mode
+                       else getattr(config, "LATHE_ROUGH_MODE", "contour")),
         "groove_contour": args.groove_contour,
         # осевое отверстие: сверление + растачивание (сам контур
         # подставляется ниже, после съёма профиля)
