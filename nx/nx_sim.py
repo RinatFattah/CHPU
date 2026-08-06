@@ -70,20 +70,48 @@ def _strip_comments(line: str) -> str:
     return "".join(out).strip()
 
 
-def gcode_to_mpf(gcode_path: str, mpf_path: str, tool_number: int = 1) -> int:
-    """Адаптирует grbl/linuxcnc G-Code под виртуальную стойку Sinumerik (CSE).
-    Возвращает число строк .mpf. Правила — из guide.md (часть 4):
-      - комментарии в скобках (в т.ч. вся строка) → удаляются (Parse error);
-      - G21 (метрическая система) → удаляется (Sinumerik не знает);
-      - смена инструмента: `T<n>` строкой ПЕРЕД `M6` (обратный порядок —
-        «Tool not defined»); grbl пишет её комментарием `( M6 T1 )` — после
-        чистки комментариев вставляем настоящую пару перед первым M3;
-      - M2 → M30."""
-    out = []
-    tool_inserted = False
+_M6_RE = re.compile(r"\(\s*M0?6\s+T(\d+)\s*\)", re.IGNORECASE)   # ( M6 T2 )
+_TC_RE = re.compile(r"Endmill\s+D([\d.]+)\s*mm", re.IGNORECASE)  # TC: Endmill D6mm
+
+
+def parse_tools(gcode_path: str) -> dict:
+    """{номер инструмента: диаметр, мм} из комментариев FreeCAD: пара
+    `(Begin operation: TC: Endmill D<d>mm)` → следующий `( M6 T<n> )`."""
+    tools, pending = {}, None
     with open(gcode_path, encoding="utf-8", errors="replace") as f:
         for raw in f:
-            line = _strip_comments(raw)  # комментарии (...), с учётом вложенности
+            mt = _TC_RE.search(raw)
+            if mt and "TC:" in raw:
+                pending = float(mt.group(1))
+            mm = _M6_RE.search(raw)
+            if mm:
+                if pending is not None:
+                    tools[int(mm.group(1))] = pending
+                pending = None
+    return tools
+
+
+def gcode_to_mpf(gcode_path: str, mpf_path: str, default_tool: int = 1) -> int:
+    """Адаптирует grbl/linuxcnc G-Code под виртуальную стойку Sinumerik (CSE).
+    Возвращает число строк .mpf. Правила — из guide.md (часть 4):
+      - комментарии в скобках → удаляются (Parse error);
+      - G21 → удаляется (Sinumerik не знает);
+      - смена инструмента: grbl пишет `( M6 T<n> )` комментарием на КАЖДОЙ смене
+        (в т.ч. многоинструментальная программа) — превращаем каждую в реальную
+        пару `T<n>` ↵ `M6` (порядок важен: T перед M6);
+      - если смен нет вообще — вставляем default_tool перед первым M3;
+      - M2 → M30."""
+    out = []
+    seen_tool = False
+    with open(gcode_path, encoding="utf-8", errors="replace") as f:
+        for raw in f:
+            mm = _M6_RE.search(raw)
+            if mm:                       # смена инструмента (комментарий grbl)
+                out.append(f"T{int(mm.group(1))}")
+                out.append("M6")
+                seen_tool = True
+                continue
+            line = _strip_comments(raw)  # прочие комментарии (...), с вложенностью
             if not line:
                 continue
             words = line.upper().split()
@@ -93,10 +121,10 @@ def gcode_to_mpf(gcode_path: str, mpf_path: str, tool_number: int = 1) -> int:
                     continue
             if words == ["M2"] or words == ["M02"]:
                 line = "M30"
-            if not tool_inserted and re.match(r"M0?3\b", line, re.IGNORECASE):
-                out.append(f"T{tool_number}")
+            if not seen_tool and re.match(r"M0?3\b", line, re.IGNORECASE):
+                out.append(f"T{default_tool}")
                 out.append("M6")
-                tool_inserted = True
+                seen_tool = True
             out.append(line)
     if out and out[-1].upper() != "M30":
         out.append("M30")
@@ -119,23 +147,25 @@ def find_machine_dir(machine: str) -> str | None:
     return os.path.dirname(hits[0]) if hits else None
 
 
-def write_to_ini(machine_dir: str, tool_diameter: float, tool_number: int = 1,
-                 tool_length: float = 75.0) -> None:
-    """Пишет TO_INI.SPF — таблицу инструментов виртуальной стойки Sinumerik.
-    Без неё: «Program name 'TO_INI' not found», «Tool 1 not defined», нулевой
-    вылет (корпус шпинделя «лижет» деталь) и невидимый инструмент. Значения:
-    DP1=120 — тип «концевая фреза», DP3 — длина, DP6 — РАДИУС."""
+def write_to_ini(machine_dir: str, tools: dict, tool_length: float = 75.0) -> None:
+    """Пишет TO_INI.SPF — таблицу инструментов стойки Sinumerik на ВСЕ фрезы
+    программы. tools: {номер: диаметр, мм}. Без неё: «Tool N not defined»,
+    нулевой вылет, невидимый инструмент. DP1=120 — тип «концевая фреза»,
+    DP3 — длина, DP6 — РАДИУС."""
     sub = os.path.join(machine_dir, "cse_driver", "sinumerik", "subprog")
-    content = (
-        f'$TC_TP1[{tool_number}]={tool_number}\n'
-        f'$TC_TP2[{tool_number}]="MILL_D{tool_diameter:g}"\n'
-        f'$TC_DP1[{tool_number},1]=120\n'
-        f'$TC_DP2[{tool_number},1]=1\n'
-        f'$TC_DP3[{tool_number},1]={tool_length:g}\n'
-        f'$TC_DP6[{tool_number},1]={tool_diameter / 2.0:g}\n'
-        f'M17\n'
-    )
+    blocks = []
+    for n in sorted(tools):
+        d = float(tools[n])
+        blocks.append(
+            f'$TC_TP1[{n}]={n}\n'
+            f'$TC_TP2[{n}]="MILL_D{d:g}"\n'
+            f'$TC_DP1[{n},1]=120\n'
+            f'$TC_DP2[{n},1]=1\n'
+            f'$TC_DP3[{n},1]={tool_length:g}\n'
+            f'$TC_DP6[{n},1]={d / 2.0:g}\n')
+    content = "".join(blocks) + "M17\n"
     path = os.path.join(sub, "TO_INI.SPF")
+    desc = ", ".join(f"T{n} Ø{tools[n]:g}" for n in sorted(tools))
     try:
         if os.path.exists(path):
             with open(path, encoding="ascii", errors="replace") as f:
@@ -143,11 +173,11 @@ def write_to_ini(machine_dir: str, tool_diameter: float, tool_number: int = 1,
                     return  # уже актуален
         with open(path, "w", encoding="ascii", newline="\r\n") as f:
             f.write(content)
-        _log(f"TO_INI.SPF обновлён (T{tool_number} Ø{tool_diameter:g})")
+        _log(f"TO_INI.SPF обновлён ({desc})")
     except PermissionError:
         _log(f"warn: нет прав записи в {path} — таблица инструментов стойки "
-             f"могла устареть (нужен Ø{tool_diameter:g}). Запустите один раз "
-             f"от администратора или дайте себе права на папку станка.")
+             f"могла устареть (нужны {desc}). Запустите один раз от "
+             f"администратора или дайте себе права на папку станка.")
 
 
 # ── 3-4. Запуск журнала симуляции и экспорт результата ────────────────────────────
@@ -177,8 +207,11 @@ def simulate(gcode_path: str, stock_step_path: str, out_stem: str | None = None)
         raise RuntimeError(f"файл заготовки не найден: {stock_step_path} "
                            f"(его пишет генерация G-Code)")
 
+    tools = parse_tools(gcode_path) or {1: float(config.TOOL_DIAMETER)}
     tool_d = float(config.TOOL_DIAMETER)
-    write_to_ini(mdir, tool_d)
+    write_to_ini(mdir, tools)
+    _log(f"инструментов в программе: {len(tools)} "
+         f"({', '.join(f'T{n} Ø{tools[n]:g}' for n in sorted(tools))})")
 
     if out_stem is None:
         out_stem = os.path.splitext(os.path.abspath(gcode_path))[0]
@@ -195,7 +228,7 @@ def simulate(gcode_path: str, stock_step_path: str, out_stem: str | None = None)
         if os.path.exists(f):
             os.unlink(f)
 
-    n = gcode_to_mpf(gcode_path, mpf_path, tool_number=1)
+    n = gcode_to_mpf(gcode_path, mpf_path, default_tool=min(tools))
     _log(f"программа для стойки: {n} строк → {os.path.basename(mpf_path)}")
 
     from cam.freecad_cam import _ascii_safe
@@ -208,6 +241,7 @@ def simulate(gcode_path: str, stock_step_path: str, out_stem: str | None = None)
         "machine": machine,
         "tool_diameter": tool_d,
         "tool_number": 1,
+        "tools": {str(n): tools[n] for n in tools},  # {номер: диаметр} все фрезы
         "work_prt": work_prt,
         "log_path": log_path,
         # журналу — запас на ожидание конца прогона (сек), меньше общего таймаута

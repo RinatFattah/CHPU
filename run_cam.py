@@ -76,10 +76,6 @@ def main():
     ap.add_argument("--rough-mode", choices=["stages", "layers"],
                     help="черновая: stages = по типам фич (дефолт), "
                          "layers = послойно, как Cavity Mill (эксперимент)")
-    ap.add_argument("--finish", action="store_true",
-                    help="включить чистовой проход (по умолчанию выключен)")
-    ap.add_argument("--no-finish", action="store_true",
-                    help="без чистового прохода (только черновая; дефолт)")
     ap.add_argument("--stock-margin", type=float, metavar="MM",
                     help="поля заготовки вокруг детали по X/Y, мм (дефолт из конфига)")
     ap.add_argument("--stock", metavar="FILE",
@@ -120,10 +116,6 @@ def main():
         config.ROUGH_ALLOWANCE_MODE = "all"
     if args.rough_mode:
         config.ROUGH_MODE = args.rough_mode
-    if args.finish:
-        config.FINISH = True
-    if args.no_finish:
-        config.FINISH = False
     if args.stock_margin is not None:
         config.STOCK_MARGIN = args.stock_margin
     if args.stock:
@@ -179,10 +171,6 @@ def main():
              f"шаг {config.ROUGH_STEPOVER}% Ø ({mode})"
              if config.ROUGH_ALLOWANCE > 0 else "выключена")
     print(f"Черновая: {rough}")
-    finish = (f"шаг {config.SURFACE_STEPOVER}% Ø | сэмплинг {config.SURFACE_SAMPLE_INTERVAL}мм | "
-              f"рисунок {config.SURFACE_CUT_PATTERN}"
-              if config.FINISH else "выключена (включить: --finish или FINISH: true)")
-    print(f"Чистовая: {finish}")
     print(f"Ноль:     {config.ORIGIN}")
     print(f"Пост:     {config.POSTPROCESSOR}")
     print("Обработка...")

@@ -107,6 +107,22 @@ class ZCaster:
         return (np.searchsorted(zs, zc) % 2) == 1
 
 
+def thick_runs(mask, min_len):
+    """Оставить в столбце только отрезки подряд идущих ячеек длиной ≥ min_len.
+    Отрезок в 1–2 ячейки = поверхность результата отличается от модели на доли
+    ячейки: это хорда фасетизации тела симуляции (и совпадение плоскости детали
+    с плоскостью выборки), а не оставшийся металл. Без этого фильтра мелкий шаг
+    сетки даёт «зарез» в сотни мм³ ровным слоем по всей полке."""
+    if min_len <= 1 or not mask.any():
+        return mask
+    out = np.zeros_like(mask)
+    idx = np.flatnonzero(mask)
+    for run in np.split(idx, np.flatnonzero(np.diff(idx) != 1) + 1):
+        if run.size >= min_len:
+            out[run] = True
+    return out
+
+
 def clusters(cells):
     """Связные компоненты множества ячеек (ix,iy,iz), 6-соседность."""
     todo = set(cells)
@@ -156,6 +172,7 @@ def main():
     with open(os.environ["FREECAD_DIFF_PARAMS"], encoding="utf-8") as f:
         p = json.load(f)
     min_vol = float(p.get("min_volume", 2.0))
+    min_thick = float(p.get("min_thickness", 0.0))
     clearance = float(p.get("floor_clearance", 0.5))
 
     part = load_solid(p["part"])
@@ -171,16 +188,29 @@ def main():
     # шаг сетки: ~110 ячеек по большой стороне, в пределах 0.5..1.5 мм
     pitch = float(p.get("pitch", 0)) or min(
         1.5, max(0.5, max(pb.XLength, pb.YLength, pb.ZLength) / 110.0))
+    # Зона проверки — призма СИЛУЭТА детали, поднятая ДО ВЕРХА РЕЗУЛЬТАТА: всё,
+    # что стоит над деталью (недоснятый борт заготовки, столбик над полкой),
+    # обязано попасть в счёт. Раньше сетка кончалась на верхе детали, и такой
+    # остаток был проверке не виден вовсе. Колонки вне силуэта (рамка заготовки
+    # рядом с деталью) отбрасываются ниже — по признаку «в колонке нет детали».
+    z_top = max(pb.ZMax, result.BoundBox.ZMax)
     nx = max(1, int(math.ceil(pb.XLength / pitch)))
     ny = max(1, int(math.ceil(pb.YLength / pitch)))
-    nz = max(1, int(math.ceil(pb.ZLength / pitch)))
+    nz = max(1, int(math.ceil((z_top - pb.ZMin) / pitch)))
     origin = (pb.XMin, pb.YMin, pb.ZMin)
     cell_vol = pitch ** 3
-    log(f"сетка {nx}x{ny}x{nz} (шаг {pitch:.2f} мм, {nx * ny * nz} ячеек)")
+    log(f"сетка {nx}x{ny}x{nz} (шаг {pitch:.2f} мм, {nx * ny * nz} ячеек), "
+        f"Z {pb.ZMin:.1f}..{z_top:.1f} (верх детали {pb.ZMax:.1f})")
+
+    # отрезок короче допуска по толщине не считается дефектом (см. thick_runs)
+    run_len = max(1, int(math.ceil(min_thick / pitch - 1e-9)))
+    if run_len > 1:
+        log(f"порог толщины дефекта {min_thick} мм = {run_len} ячеек подряд")
 
     zc = pb.ZMin + (np.arange(nz) + 0.5) * pitch
     iz_all = np.arange(nz)
     floor_mask = zc <= floor_z
+    below_top = zc <= pb.ZMax        # высота детали: выше — рамка заготовки
     under_cells, over_cells, floor_cells = set(), set(), 0
     # микросдвиг колонок от узлов сетки — меньше попаданий луча точно в кромку
     jx, jy = 0.5 + 1.7e-3, 0.5 + 2.3e-3
@@ -190,8 +220,15 @@ def main():
             x = pb.XMin + (ix + jx) * pitch
             in_p = cast_p.inside(x, y, zc)
             in_r = cast_r.inside(x, y, zc)
-            under = in_r & ~in_p
-            over = in_p & ~in_r
+            if not in_p.any():
+                # В колонке нет тела детали. Это либо СКВОЗНОЕ отверстие (его
+                # обязаны считать: непрорезанная дыра — недорез), либо рамка
+                # заготовки рядом с деталью (её считать не надо). Отличить по
+                # XY нельзя, поэтому режем по высоте: ниже верха детали считаем
+                # (там дыра), выше — нет (там рамка/борт заготовки).
+                in_r = in_r & below_top
+            under = thick_runs(in_r & ~in_p, run_len)
+            over = thick_runs(in_p & ~in_r, run_len)
             if under.any():
                 fl = under & floor_mask
                 floor_cells += int(fl.sum())
@@ -201,13 +238,35 @@ def main():
                 for iz in iz_all[over]:
                     over_cells.add((ix, iy, int(iz)))
 
-    undercuts, overcuts = [], []
+    # Плёнка толщиной в ОДНУ ячейку — не металл, а артефакт сетки: когда плоскость
+    # детали приходится ровно на плоскость выборки, чётность луча для фасетного
+    # тела симуляции переворачивается разом на всю плиту (видели «зарез» 490 мм³
+    # слоем в 0.2 мм). Настоящий дефект имеет толщину: зона тоньше min_thick
+    # хотя бы по одной оси не в счёт. min_thick — это допуск в мм.
+    def thick_enough(comp):
+        if min_thick <= 0:
+            return True
+        for ax in (0, 1, 2):
+            v = [c[ax] for c in comp]
+            if (max(v) - min(v) + 1) * pitch < min_thick - 1e-9:
+                return False
+        return True
+
+    undercuts, overcuts, thin = [], [], 0.0
     for comp in clusters(under_cells):
-        if len(comp) * cell_vol >= min_vol:
-            undercuts.append(zone_entry(comp, origin, pitch, cell_vol))
+        if len(comp) * cell_vol < min_vol:
+            continue
+        if not thick_enough(comp):
+            thin += len(comp) * cell_vol
+            continue
+        undercuts.append(zone_entry(comp, origin, pitch, cell_vol))
     for comp in clusters(over_cells):
-        if len(comp) * cell_vol >= min_vol:
-            overcuts.append(zone_entry(comp, origin, pitch, cell_vol))
+        if len(comp) * cell_vol < min_vol:
+            continue
+        if not thick_enough(comp):
+            thin += len(comp) * cell_vol
+            continue
+        overcuts.append(zone_entry(comp, origin, pitch, cell_vol))
     undercuts.sort(key=lambda z: -z["volume_mm3"])
     overcuts.sort(key=lambda z: -z["volume_mm3"])
     floor_skin = floor_cells * cell_vol
@@ -215,6 +274,9 @@ def main():
     data = {
         "method": f"voxel ray-casting, шаг {pitch:.2f} мм (объёмы ± ячейка)",
         "part_volume_mm3": round(abs(part.Volume), 1),
+        "min_volume_mm3": min_vol,
+        "min_thickness_mm": min_thick,
+        "thin_film_mm3": round(thin, 1),
         "floor_clearance_mm": clearance,
         "floor_skin_mm3": round(floor_skin, 1),
         "undercut_total_mm3": round(sum(z["volume_mm3"] for z in undercuts), 1),
@@ -224,7 +286,8 @@ def main():
         "note": "недорез — материал, оставшийся в границах детали сверх модели; "
                 "зарез — снятое, что должно было остаться. floor_skin — намеренная "
                 "плёнка у дна (зазор от стола), НЕ дефект. Рамка заготовки вне "
-                "габарита детали не учитывается.",
+                "габарита детали не учитывается. thin_film — отброшенные зоны "
+                "тоньше min_thickness (артефакт совпадения плоскости с сеткой).",
     }
     with open(p["json_path"], "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=1)
