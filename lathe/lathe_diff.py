@@ -43,6 +43,7 @@ _RE_BORE_D = re.compile(r"boring bar, to D\s*(\d+(?:\.\d+)?)")
 _RE_DRILL_D = re.compile(r"twist drill D\s*(\d+(?:\.\d+)?)")
 _RE_OP = re.compile(r"\(Begin operation:\s*([A-Za-z0-9_]+)\)")
 _RE_XZ = re.compile(r"([XZ])(-?\d+(?:\.\d+)?)")
+_RE_G = re.compile(r"^G(\d+)")
 
 
 def limits_from_moves(text):
@@ -67,14 +68,19 @@ def limits_from_moves(text):
         if m:
             op = m.group(1).lower()
             continue
-        if not (s.startswith("G0") or s.startswith("G1")):
+        mg = _RE_G.match(s)
+        if not mg:
             continue
+        code = int(mg.group(1))                    # G0/G00, G1/G01, G2/G02…
+        if code > 3:
+            continue                               # G18, G54, G95, G97 — не ход
+        z_prev = z
         for axis, val in _RE_XZ.findall(s):        # координаты модальные
             if axis == "X":
                 x = float(val)
             else:
                 z = float(val)
-        if z is None or not s.startswith("G1"):
+        if z is None or code == 0:
             continue
         if "partoff" in op:
             continue
@@ -85,7 +91,12 @@ def limits_from_moves(text):
         elif "drill" in op:
             if "center" not in op:
                 drill = z if drill is None else min(drill, z)
-        else:
+        elif z_prev is not None and abs(z - z_prev) > 1e-6:
+            # ПРОДОЛЬНЫЙ ход, и только он. Врезание на одном z (отрезка, канавка,
+            # подрезка торца) осевую границу зоны не задаёт: отрезной уходит за
+            # торец детали (у завода на z −51) и утащил бы границу за собой.
+            # В чужой программе на имя операции полагаться нельзя — импортёр
+            # метит отрезку тем же `Turn`, что и точение.
             outer = z if outer is None else min(outer, z)
     return outer, (bore if bore is not None else drill), r_bore
 
