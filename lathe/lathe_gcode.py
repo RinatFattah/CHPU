@@ -638,6 +638,44 @@ def generate(prof_data, params):
             g.append(f"G0 {X(retract_r)} Z{z_end:.3f}")
             g.append(f"(Finish operation: Rough{i + 1})")
 
+    # 2b. ПОЛУЧИСТОВОЙ ПРОХОД — граница между стадиями, по контуру, с припуском
+    #
+    # Зачем он нужен именно при черновой УРОВНЯМИ. Проходы постоянного диаметра
+    # не следуют форме, и на каждом уклоне остаётся лестница высотой в шаг: на
+    # 14-31A при ap 0.465 чистовой резец шёл бы то по 0.2 мм припуска, то по
+    # 0.2 + 0.465 = 0.665. Переменный припуск — это переменная сила резания,
+    # переменное отжатие и след на поверхности ровно там, где припуск менялся.
+    # Получистовой проход срезает лестницу и оставляет припуск РОВНЫМ.
+    #
+    # В режиме "contour" он не нужен и не печатается: последний контурный слой
+    # там уже идёт со смещением ровно `allowance`, то есть сам является этой
+    # стадией (off = allow при i = n_rough−1).
+    #
+    # Идёт ЧЕРНОВЫМ резцом: это ещё съём, а не окончательная поверхность, и
+    # предел у него свой — `src_rough`. Там, где чистовой резец заходит глубже
+    # (острее ромб, больше φ₁), припуск останется больше; величина считается и
+    # печатается в отчёт как «в уступах снимает до N мм».
+    n_semi = 0
+    if (params.get("contour_rough", False) and params.get("semi_finish", True)
+            and params.get("rough_mode") == "levels" and allowance > 0):
+        pts = [(z, min(r + allowance, r_stock)) for z, r in
+               _simplify(src_rough, params.get("line_tol", 0.01))]
+        pts = [pt for j, pt in enumerate(pts)
+               if not (0 < j < len(pts) - 1
+                       and pt[1] >= r_stock - 1e-9
+                       and pts[j - 1][1] >= r_stock - 1e-9
+                       and pts[j + 1][1] >= r_stock - 1e-9)]
+        if len(pts) > 1:
+            n_semi = 1
+            op("SemiFinish")
+            g.append(f"G0 {X(retract_r)} Z{pts[0][0] + clear:.3f}")
+            g.append(f"G0 {X(pts[0][1])} Z{pts[0][0] + clear:.3f}")
+            g.append(f"G1 {X(pts[0][1])} Z{pts[0][0]:.3f} {fmt(feed)}")
+            for z, r in pts[1:]:
+                g.append(f"G1 {X(r)} Z{z:.3f} {fmt(feed)}")
+            g.append(f"G0 {X(retract_r)} Z{z_end:.3f}")
+            g.append("(Finish operation: SemiFinish)")
+
     # ЧИСТОВОЙ РЕЗЕЦ T8 — отдельным инструментом, как на заводе
     t_fin = params.get("finish_tool_number", 8)
     if fin_tool:

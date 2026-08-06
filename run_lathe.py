@@ -82,6 +82,10 @@ def main():
                          "программа неисполнима")
     ap.add_argument("--contour-rough", action="store_true",
                     help=argparse.SUPPRESS)   # устаревший: слои и так включены
+    ap.add_argument("--no-semi-finish", action="store_true",
+                    help="не печатать получистовой проход (тогда после уровней "
+                         "чистовой встретит переменный припуск: 0.2 мм на "
+                         "цилиндрах и до 0.2 + шаг на уклонах)")
     ap.add_argument("--rough-mode", choices=("contour", "levels"),
                     help="форма черновых слоёв: contour — эквидистанта чистового "
                          "пути (по умолчанию), levels — продольные проходы "
@@ -161,6 +165,8 @@ def main():
                           and getattr(config, "LATHE_CONTOUR_ROUGH", True)),
         "rough_mode": (args.rough_mode if args.rough_mode
                        else getattr(config, "LATHE_ROUGH_MODE", "contour")),
+        "semi_finish": (not args.no_semi_finish
+                        and getattr(config, "LATHE_SEMI_FINISH", True)),
         "groove_contour": args.groove_contour,
         # осевое отверстие: сверление + растачивание (сам контур
         # подставляется ниже, после съёма профиля)
