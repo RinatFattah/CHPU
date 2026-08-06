@@ -41,6 +41,53 @@ _RE_BORES = re.compile(rf"bores to Z\s*{_NUM}")
 _RE_DRILLS = re.compile(rf"drills to Z\s*{_NUM}")
 _RE_BORE_D = re.compile(r"boring bar, to D\s*(\d+(?:\.\d+)?)")
 _RE_DRILL_D = re.compile(r"twist drill D\s*(\d+(?:\.\d+)?)")
+_RE_OP = re.compile(r"\(Begin operation:\s*([A-Za-z0-9_]+)\)")
+_RE_XZ = re.compile(r"([XZ])(-?\d+(?:\.\d+)?)")
+
+
+def limits_from_moves(text):
+    """Докуда установ РЕАЛЬНО режет — по рабочим ходам программы.
+
+    Шапка пишет `turns Z 0..-20.30` — это z_split, ПРОЕКТНАЯ граница передачи
+    работы. Резец идёт дальше неё на величину перекрытия (`LATHE_SETUP_OVERLAP`):
+    на 14-31A чистовой проход доходит до −21.90, то есть срезает верхние 1.9 мм
+    шестигранника. Если резать проверку по шапке, эта работа выпадает из счёта
+    — установ её сделал, а его за неё не спрашивают.
+
+    Отрезка исключается: её ход уходит за торец детали (−49.5) и границей быть
+    не может. Сверло и расточной дают ВНУТРЕННЮЮ границу; ниже неё отверстие
+    намеренно оставлено в размере сверла для следующего установа.
+    """
+    op, x, z = "", None, None
+    outer = bore = drill = None
+    r_bore = 0.0
+    for raw in text.splitlines():
+        s = raw.strip()
+        m = _RE_OP.match(s)
+        if m:
+            op = m.group(1).lower()
+            continue
+        if not (s.startswith("G0") or s.startswith("G1")):
+            continue
+        for axis, val in _RE_XZ.findall(s):        # координаты модальные
+            if axis == "X":
+                x = float(val)
+            else:
+                z = float(val)
+        if z is None or not s.startswith("G1"):
+            continue
+        if "partoff" in op:
+            continue
+        if "bore" in op:
+            bore = z if bore is None else min(bore, z)
+            if x:
+                r_bore = max(r_bore, x / 2.0)
+        elif "drill" in op:
+            if "center" not in op:
+                drill = z if drill is None else min(drill, z)
+        else:
+            outer = z if outer is None else min(outer, z)
+    return outer, (bore if bore is not None else drill), r_bore
 
 
 def limits_from_gcode(path):
@@ -70,21 +117,23 @@ def limits_from_gcode(path):
     m = _RE_TURNS.search(text)
     if not m:
         return {}
-    out = {"z_limit": min(float(m.group(1)), float(m.group(2)))}
+    z_head = min(float(m.group(1)), float(m.group(2)))
+
+    # Границы берём ПО ХОДАМ (см. limits_from_moves); шапка остаётся сверкой.
+    z_out, z_in, r_moves = limits_from_moves(text)
+    out = {"z_limit": z_out if z_out is not None else z_head}
+    if z_out is not None and abs(z_out - z_head) > 0.05:
+        print(f"[ldiff] шапка обещает точение до z {z_head:.2f}, ходы идут до "
+              f"{z_out:.2f} — беру ходы (разница = перекрытие установов)")
 
     mb, md = _RE_BORES.search(text), _RE_DRILLS.search(text)
-    if mb:
-        out["z_limit_bore"] = float(mb.group(1))
-        dm = _RE_BORE_D.search(text)
-        out["bore_radius"] = float(dm.group(1)) / 2.0 if dm else None
-    elif md:
-        # расточки нет — отверстие остаётся в размере сверла на всю глубину
-        out["z_limit_bore"] = float(md.group(1))
-        dm = _RE_DRILL_D.search(text)
-        out["bore_radius"] = float(dm.group(1)) / 2.0 if dm else None
-    if out.get("bore_radius") is None:
-        out.pop("z_limit_bore", None)
-        out.pop("bore_radius", None)
+    dm = _RE_BORE_D.search(text) or _RE_DRILL_D.search(text)
+    r = r_moves or (float(dm.group(1)) / 2.0 if dm else 0.0)
+    z_bore = z_in if z_in is not None else (
+        float(mb.group(1)) if mb else (float(md.group(1)) if md else None))
+    if r and z_bore is not None:
+        out["z_limit_bore"] = z_bore
+        out["bore_radius"] = r
     return out
 
 
