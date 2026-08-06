@@ -41,10 +41,11 @@ import numpy as np
 import FreeCAD as App
 import Part
 
-# ZCaster берётся из фрезерного воркера — метод один и тот же, и расходиться
-# двум реализациям нельзя. Хост кладёт оба файла рядом (в TEMP при кириллице).
+# ZCaster и фильтр тонких плёнок берутся из фрезерного воркера — метод один и
+# тот же, и расходиться двум реализациям нельзя. Хост кладёт оба файла рядом
+# (в TEMP при кириллице).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from freecad_diff_worker import ZCaster, load_solid   # noqa: E402
+from freecad_diff_worker import ZCaster, load_solid, thick_runs   # noqa: E402
 
 
 def log(msg):
@@ -108,22 +109,51 @@ def radial_profile(shape, z_lo, z_hi, step, angles):
     return grid, rmax, rmin
 
 
-def voxel_by_z(part, result, pitch, z_bin):
-    """Воксельный диф с раскладкой по поясам z. Возвращает (bins, tot_u, tot_o)."""
-    pb = part.BoundBox
+def voxel_by_z(part, result, pitch, z_bin, min_thick=0.0):
+    """Воксельный диф с раскладкой по поясам z.
+
+    Классификация ячеек — ровно как во фрезерном движке (`freecad_diff_worker`),
+    включая обе его поправки; отличается только суммирование: не в зоны-пятна,
+    а в пояса по z.
+
+    ВАЖНО про допуск по толщине. `thick_runs` режет короткие отрезки ВДОЛЬ ЛУЧА,
+    то есть вдоль оси детали, — значит для точения он гасит тонкие ТОРЦЕВЫЕ
+    расхождения (подрезка торца, дно канавки) и не трогает тонкие ЦИЛИНДРИЧЕСКИЕ
+    плёнки: у кольца в сотые доли миллиметра по радиусу отрезок вдоль z длиной со
+    всю обточенную поверхность. Радиальный допуск здесь недостижим в принципе —
+    его даёт профильная половина анализатора (dr(z), микроны), см. `bands(tol=)`.
+
+    Возвращает (bins, tot_u, tot_o, thin) — последнее это объём, отсечённый
+    фильтром толщины.
+    """
+    pb, rb = part.BoundBox, result.BoundBox
     cast_p = ZCaster(part, 0.05)
     cast_r = ZCaster(result, 0.05)
+    # Сетка поднимается до верха РЕЗУЛЬТАТА: над деталью стоит припуск заготовки
+    # под подрезку торца, и недоснятый торец обязан попасть в счёт. ВНИЗ сетка
+    # намеренно НЕ растёт — там пенёк от отрезки и остаток прутка, они к детали
+    # не относятся (у фрезеровки там стол, причина другая, правило то же).
+    z_top = max(pb.ZMax, rb.ZMax)
     nx = max(1, int(math.ceil(pb.XLength / pitch)))
     ny = max(1, int(math.ceil(pb.YLength / pitch)))
-    nz = max(1, int(math.ceil(pb.ZLength / pitch)))
+    nz = max(1, int(math.ceil((z_top - pb.ZMin) / pitch)))
     cell = pitch ** 3
-    log(f"сетка {nx}x{ny}x{nz} (шаг {pitch:.2f} мм, {nx * ny * nz} ячеек)")
+    log(f"сетка {nx}x{ny}x{nz} (шаг {pitch:.2f} мм, {nx * ny * nz} ячеек), "
+        f"z {pb.ZMin:.1f}..{z_top:.1f} (верх детали {pb.ZMax:.1f})")
 
     zc = pb.ZMin + (np.arange(nz) + 0.5) * pitch
+    below_top = zc <= pb.ZMax
+    run_len = max(1, int(math.ceil(min_thick / pitch - 1e-9)))
+    if run_len > 1:
+        log(f"порог толщины дефекта {min_thick} мм = {run_len} ячеек подряд "
+            f"(вдоль оси; по радиусу его даёт профиль)")
+    else:
+        log(f"фильтр толщины неактивен: {min_thick} мм ≤ шага {pitch} мм")
     ib = np.floor((zc - pb.ZMin) / z_bin).astype(int)
     nb = int(ib.max()) + 1
     under = np.zeros(nb)
     over = np.zeros(nb)
+    thin = 0.0
     jx, jy = 0.5 + 1.7e-3, 0.5 + 2.3e-3
     for iy in range(ny):
         y = pb.YMin + (iy + jy) * pitch
@@ -131,8 +161,14 @@ def voxel_by_z(part, result, pitch, z_bin):
             x = pb.XMin + (ix + jx) * pitch
             in_p = cast_p.inside(x, y, zc)
             in_r = cast_r.inside(x, y, zc)
-            u = in_r & ~in_p
-            o = in_p & ~in_r
+            if not in_p.any():
+                # В колонке нет тела детали: либо осевое/сквозное отверстие (его
+                # считаем — непрорезанная дыра есть недорез), либо пруток мимо
+                # габарита детали (не считаем). Различаем по высоте.
+                in_r = in_r & below_top
+            u_raw, o_raw = in_r & ~in_p, in_p & ~in_r
+            u, o = thick_runs(u_raw, run_len), thick_runs(o_raw, run_len)
+            thin += int(u_raw.sum() - u.sum() + o_raw.sum() - o.sum()) * cell
             if u.any():
                 np.add.at(under, ib[u], cell)
             if o.any():
@@ -141,7 +177,7 @@ def voxel_by_z(part, result, pitch, z_bin):
              "z1": round(pb.ZMin + (i + 1) * z_bin, 2),
              "under_mm3": round(under[i], 2),
              "over_mm3": round(over[i], 2)} for i in range(nb)]
-    return bins, float(under.sum()), float(over.sum())
+    return bins, float(under.sum()), float(over.sum()), thin
 
 
 def main():
@@ -160,11 +196,19 @@ def main():
     z_lo, z_hi = pb.ZMin, pb.ZMax
     step = float(p.get("prof_step", 0.05))
     angles = int(p.get("angles", 6))
-    grid, prm, prn = radial_profile(part, z_lo, z_hi, step, angles)
-    _, rrm, rrn = radial_profile(result, z_lo, z_hi, step, angles)
-    log(f"профиль снят: {len(grid)} точек, шаг {step} мм, {angles} сечений")
-
-    prof = []
+    prof, prof_note = [], None
+    try:
+        grid, prm, prn = radial_profile(part, z_lo, z_hi, step, angles)
+        _, rrm, rrn = radial_profile(result, z_lo, z_hi, step, angles)
+        log(f"профиль снят: {len(grid)} точек, шаг {step} мм, {angles} сечений")
+    except Exception as exc:
+        # Осевое сечение — булева операция, а на ФАСЕТНОМ теле (IPW из NX ISV)
+        # OCCT её не делает: `common` возвращает Null shape. Это не повод терять
+        # весь замер — воксельная половина работает на любом теле, поэтому
+        # профиль просто пропускается с пометкой.
+        prof_note = f"профиль не снят: {type(exc).__name__}: {exc}"
+        log(prof_note + " — считаю только воксели")
+        grid = []
     for i, z in enumerate(grid):
         row = {"z": round(z, 3)}
         for key, arr in (("part_rmax", prm), ("part_rmin", prn),
@@ -179,7 +223,8 @@ def main():
 
     pitch = float(p.get("pitch", 0)) or 0.25
     z_bin = float(p.get("z_bin", 1.0))
-    bins, tot_u, tot_o = voxel_by_z(part, result, pitch, z_bin)
+    min_thick = float(p.get("min_thickness", 0.0))
+    bins, tot_u, tot_o, thin = voxel_by_z(part, result, pitch, z_bin, min_thick)
 
     data = {
         "method": (f"воксельный рей-кастинг, шаг {pitch:.2f} мм, пояса по "
@@ -188,17 +233,22 @@ def main():
         "part_volume_mm3": round(abs(part.Volume), 1),
         "result_volume_mm3": round(abs(result.Volume), 1),
         "z_range": [round(z_lo, 2), round(z_hi, 2)],
+        "min_thickness_mm": min_thick,
+        "thin_film_mm3": round(thin, 1),
         "undercut_total_mm3": round(tot_u, 1),
         "overcut_total_mm3": round(tot_o, 1),
         "by_z": bins,
         "profile": prof,
+        "profile_note": prof_note,
         "note": "dr = r_результата − r_детали по наибольшему радиусу: >0 недорез, "
                 "<0 зарез. axisym=false — сечение неосесимметрично (грани под "
-                "ключ), точение там ни при чём.",
+                "ключ), точение там ни при чём. thin_film — отсечено фильтром "
+                "толщины ВДОЛЬ ОСИ; радиальный допуск даёт только профиль.",
     }
     with open(p["json_path"], "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=1)
-    log(f"OK недорез={tot_u:.1f} зарез={tot_o:.1f} json={p['json_path']}")
+    log(f"OK недорез={tot_u:.1f} зарез={tot_o:.1f} плёнка={thin:.1f} "
+        f"json={p['json_path']}")
 
 
 if os.environ.get("LATHE_DIFF_PARAMS"):

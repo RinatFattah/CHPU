@@ -28,15 +28,26 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
+import config
 from cam import freecad_cam
 
 _WORKER = os.path.join(_ROOT, "cam", "lathe_diff_worker.py")
 _DEP = os.path.join(_ROOT, "cam", "freecad_diff_worker.py")
 
 
-def analyse(part_path, result_path, json_path=None, pitch=0.25, z_bin=1.0,
-            angles=6, prof_step=0.05, timeout=1800):
-    """Возвращает dict с by_z и profile (см. cam/lathe_diff_worker.py)."""
+def analyse(part_path, result_path, json_path=None, pitch=None, z_bin=None,
+            angles=6, prof_step=0.05, min_thickness=None, timeout=1800):
+    """Возвращает dict с by_z и profile (см. cam/lathe_diff_worker.py).
+
+    Умолчания берутся из конфига: `LATHE_DIFF_PITCH`, `LATHE_DIFF_Z_BIN` и общий
+    с фрезеровкой допуск `DIFF_MIN_THICKNESS`.
+    """
+    if pitch is None:
+        pitch = float(getattr(config, "LATHE_DIFF_PITCH", 0.25))
+    if z_bin is None:
+        z_bin = float(getattr(config, "LATHE_DIFF_Z_BIN", 1.0))
+    if min_thickness is None:
+        min_thickness = float(getattr(config, "DIFF_MIN_THICKNESS", 0.0))
     fc = freecad_cam.find_freecadcmd()
     if not fc:
         raise RuntimeError("freecadcmd не найден (укажите FREECAD_CMD в конфиге)")
@@ -59,6 +70,7 @@ def analyse(part_path, result_path, json_path=None, pitch=0.25, z_bin=1.0,
             + os.path.basename(out_json),
         "pitch": pitch, "z_bin": z_bin,
         "angles": angles, "prof_step": prof_step,
+        "min_thickness": min_thickness,
     }
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
                                      encoding="utf-8") as tmp:
@@ -134,7 +146,12 @@ def bands(prof, tol=0.02):
 
 
 def report(data, min_len=0.15, tol=0.02):
-    """Человекочитаемый разбор: пояса по z + участки отклонения профиля."""
+    """Человекочитаемый разбор: пояса по z + участки отклонения профиля.
+
+    `tol` — радиальный допуск (мм), по которому режутся участки профиля. Он
+    НАМЕРЕННО мельче общего `DIFF_MIN_THICKNESS`: тот работает вдоль оси и в
+    масштабе фрезеровки, а по радиусу у точения интересны десятки микрон.
+    """
     L = []
     L.append(f"Метод: {data['method']}")
     L.append(f"Деталь {data['part_volume_mm3']:.0f} мм³, "
@@ -142,6 +159,10 @@ def report(data, min_len=0.15, tol=0.02):
              f"z {data['z_range'][0]}..{data['z_range'][1]}")
     L.append(f"Недорез {data['undercut_total_mm3']:.1f} мм³, "
              f"зарез {data['overcut_total_mm3']:.1f} мм³ (воксели)")
+    if data.get("thin_film_mm3"):
+        L.append(f"Отсечено фильтром толщины вдоль оси "
+                 f"({data.get('min_thickness_mm')} мм): "
+                 f"{data['thin_film_mm3']:.1f} мм³")
     L.append("")
     L.append("## Пояса по z (воксели)")
     L.append("")
@@ -153,6 +174,11 @@ def report(data, min_len=0.15, tol=0.02):
         L.append(f"| {b['z0']:.1f} | {b['z1']:.1f} | {b['under_mm3']:.2f} "
                  f"| {b['over_mm3']:.2f} |")
     L.append("")
+    if not data.get("profile"):
+        L.append("## Отклонение профиля")
+        L.append("")
+        L.append(f"НЕ СНЯТО: {data.get('profile_note') or 'нет данных'}")
+        return "\n".join(L)
     L.append(f"## Отклонение профиля (|dr| > {tol} мм, участки от {min_len} мм)")
     L.append("")
     L.append("| z от | z до | длина | dr пик | dr сред. | что |")
@@ -180,11 +206,14 @@ def main():
     ap.add_argument("part")
     ap.add_argument("result")
     ap.add_argument("out", nargs="?", help="отчёт .md (рядом ляжет .json)")
-    ap.add_argument("--pitch", type=float, default=0.25, help="шаг вокселей, мм")
-    ap.add_argument("--z-bin", type=float, default=1.0, help="ширина пояса, мм")
+    ap.add_argument("--pitch", type=float, help="шаг вокселей, мм (конфиг)")
+    ap.add_argument("--z-bin", type=float, help="ширина пояса, мм (конфиг)")
     ap.add_argument("--angles", type=int, default=6, help="сечений на 90°")
     ap.add_argument("--prof-step", type=float, default=0.05, help="шаг профиля, мм")
-    ap.add_argument("--tol", type=float, default=0.02, help="порог отклонения, мм")
+    ap.add_argument("--min-thickness", type=float,
+                    help="допуск по толщине вдоль оси, мм (конфиг)")
+    ap.add_argument("--tol", type=float, default=0.02,
+                    help="радиальный порог отклонения профиля, мм")
     a = ap.parse_args()
     for f in (a.part, a.result):
         if not os.path.exists(f):
@@ -192,7 +221,8 @@ def main():
             sys.exit(1)
     js = (os.path.splitext(a.out)[0] + ".json") if a.out else None
     data = analyse(a.part, a.result, js, pitch=a.pitch, z_bin=a.z_bin,
-                   angles=a.angles, prof_step=a.prof_step)
+                   angles=a.angles, prof_step=a.prof_step,
+                   min_thickness=a.min_thickness)
     text = report(data, tol=a.tol)
     print(text)
     if a.out:
