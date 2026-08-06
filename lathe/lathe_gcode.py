@@ -688,6 +688,57 @@ def generate(prof_data, params):
                  f"{params.get('finish_insert', 'VCMT110304')}, "
                  f"nose R{nose_r:g} mm, {geo_finish[1]:g}° rhombic)")
 
+    # 3a. ПРЕДВАРИТЕЛЬНЫЙ ПРОХОД ЧИСТОВЫМ РЕЗЦОМ — там, куда черновой не заходит
+    #
+    # Получистовой (2b) идёт ЧЕРНОВЫМ резцом и потому оставляет ровный припуск
+    # только в пределах ЕГО огибающей. В утопленный уступ 55°-ромб (φ₁ = 32°) не
+    # заходит, а 35°-ромб (φ₁ = 52°) заходит, и там чистовому досталось бы не
+    # 0.2 мм, а до 0.56 — то есть ровно то, ради чего получистовой и делался,
+    # в этих зонах не выполнялось.
+    #
+    # Поэтому чистовой резец сначала проходит эти зоны САМ, оставляя тот же
+    # припуск, и только потом идёт общий чистовой проход. Так же устроен завод:
+    # их переход 04 — это T2 (35°-ромб), выбирающий уступ Ø20.2…22.9 на
+    # z −19.8…−16.6 ДО общего чистового перехода 05.
+    #
+    # Зона = там, где огибающая чернового выше огибающей чистового больше чем на
+    # припуск. Границы расширяются до места, где припуск уже ровный, поэтому
+    # проход входит и выходит на уже готовой поверхности, без врезания.
+    n_pre = 0
+    pre_zones = []
+    if fin_tool and params.get("pre_finish", True) and allowance > 0:
+        tol = 0.02
+        pad_mm = 0.5
+        extra = [(z, _r_at(src_rough, z) - r) for z, r in src]
+        deep = [i for i, (_, d) in enumerate(extra) if d > allowance + tol]
+        runs = []
+        for i in deep:
+            if runs and i - runs[-1][1] <= 2:
+                runs[-1][1] = i
+            else:
+                runs.append([i, i])
+        step_z = abs(src[1][0] - src[0][0]) if len(src) > 1 else 0.05
+        pad = max(1, int(round(pad_mm / max(step_z, 1e-6))))
+        for a, b in runs:
+            a, b = max(0, a - pad), min(len(src) - 1, b + pad)
+            pts = _simplify([(z, r + allowance) for z, r in src[a:b + 1]],
+                            params.get("line_tol", 0.01))
+            if len(pts) < 2:
+                continue
+            n_pre += 1
+            pre_zones.append({"z_hi": round(pts[0][0], 3),
+                              "z_lo": round(pts[-1][0], 3),
+                              "max_extra": round(max(d for _, d in extra[a:b + 1]), 3)})
+            op(f"PreFinish{n_pre}")
+            # подвод РАДИАЛЬНЫЙ: на границе зоны материал стоит ровно на нашем
+            # радиусе, поэтому резец приходит на поверхность, а не в неё
+            g.append(f"G0 {X(retract_r)} Z{pts[0][0]:.3f}")
+            g.append(f"G1 {X(pts[0][1])} Z{pts[0][0]:.3f} {fmt(feed_finish)}")
+            for z, r in pts[1:]:
+                g.append(f"G1 {X(r)} Z{z:.3f} {fmt(feed_finish)}")
+            g.append(f"G0 {X(retract_r)} Z{pts[-1][0]:.3f}")
+            g.append(f"(Finish operation: PreFinish{n_pre})")
+
     op("Finish")
     g.append(f"G0 {X(retract_r)} Z{src[0][0] + clear:.3f}")
     g.append(f"G0 {X(src[0][1])} Z{src[0][0] + clear:.3f}")
@@ -1036,11 +1087,14 @@ def generate(prof_data, params):
              "second_setup": [(lz["z_hi"], lz["z_lo"], lz["volume_mm3"])
                               for lz in second_setup],
              "finish_tool": t_fin if fin_tool else 0,
-             # насколько глубже припуска чистовому приходится резать в уступах,
-             # куда черновой не заходит
+             # насколько глубже припуска чистовому пришлось бы резать в уступах,
+             # куда черновой не заходит. С PreFinish этого больше не происходит:
+             # зоны выбираются чистовым резцом заранее, с тем же припуском.
              "finish_max_depth": (max((rr - r for (_, rr), (_, r)
                                        in zip(src_rough, src)), default=0.0)
                                   + allowance) if fin_tool else 0.0,
+             "pre_finish": n_pre, "pre_finish_zones": pre_zones,
+             "semi_finish": n_semi,
              "uncut_mm3": uncut}
     return g, stats
 
