@@ -109,7 +109,8 @@ def radial_profile(shape, z_lo, z_hi, step, angles):
     return grid, rmax, rmin
 
 
-def voxel_by_z(part, result, pitch, z_bin, min_thick=0.0):
+def voxel_by_z(part, result, pitch, z_bin, min_thick=0.0,
+               z_limit=None, z_limit_bore=None, bore_radius=0.0):
     """Воксельный диф с раскладкой по поясам z.
 
     Классификация ячеек — ровно как во фрезерном движке (`freecad_diff_worker`),
@@ -123,8 +124,21 @@ def voxel_by_z(part, result, pitch, z_bin, min_thick=0.0):
     всю обточенную поверхность. Радиальный допуск здесь недостижим в принципе —
     его даёт профильная половина анализатора (dr(z), микроны), см. `bands(tol=)`.
 
-    Возвращает (bins, tot_u, tot_o, thin) — последнее это объём, отсечённый
-    фильтром толщины.
+    ЗОНА ОТВЕТСТВЕННОСТИ УСТАНОВА. Когда сравнивается результат ОДНОГО установа,
+    деталь целиком эталоном быть не может: всё, что оставлено следующему
+    установу, иначе идёт в недорез и забивает счёт (на 14-31A это 10.7 тыс. мм³
+    против 0.3 тыс. настоящего дефекта). Поэтому проверка режется по z:
+
+      * `z_limit`      — докуда установ точил НАРУЖНУЮ поверхность;
+      * `z_limit_bore` — докуда он растачивал отверстие (обычно глубже);
+      * `bore_radius`  — радиус отверстия: колонки внутри него живут по второй
+                         границе, снаружи — по первой.
+
+    Ниже своей границы ячейка не считается ни недорезом, ни зарезом: там либо
+    нетронутый пруток, либо намеренно недоделанное отверстие.
+
+    Возвращает (bins, tot_u, tot_o, thin, checked, skipped) — два последних это
+    объём детали внутри и вне проверяемой зоны.
     """
     pb, rb = part.BoundBox, result.BoundBox
     cast_p = ZCaster(part, 0.05)
@@ -153,7 +167,16 @@ def voxel_by_z(part, result, pitch, z_bin, min_thick=0.0):
     nb = int(ib.max()) + 1
     under = np.zeros(nb)
     over = np.zeros(nb)
-    thin = 0.0
+    thin = checked = skipped = 0.0
+    lim_out = -1e18 if z_limit is None else float(z_limit)
+    lim_in = lim_out if z_limit_bore is None else float(z_limit_bore)
+    keep_out = zc >= lim_out - 1e-9
+    keep_in = zc >= lim_in - 1e-9
+    r_bore = float(bore_radius or 0.0)
+    if z_limit is not None:
+        log(f"зона проверки: z ≥ {lim_out:.2f}" + (
+            f", в отверстии (r ≤ {r_bore:.2f}) z ≥ {lim_in:.2f}"
+            if r_bore > 0 and lim_in != lim_out else ""))
     jx, jy = 0.5 + 1.7e-3, 0.5 + 2.3e-3
     for iy in range(ny):
         y = pb.YMin + (iy + jy) * pitch
@@ -166,8 +189,15 @@ def voxel_by_z(part, result, pitch, z_bin, min_thick=0.0):
                 # считаем — непрорезанная дыра есть недорез), либо пруток мимо
                 # габарита детали (не считаем). Различаем по высоте.
                 in_r = in_r & below_top
-            u_raw, o_raw = in_r & ~in_p, in_p & ~in_r
-            u, o = thick_runs(u_raw, run_len), thick_runs(o_raw, run_len)
+            keep = (keep_in if (r_bore > 0 and math.hypot(x, y) <= r_bore)
+                    else keep_out)
+            checked += int((in_p & keep).sum()) * cell
+            skipped += int((in_p & ~keep).sum()) * cell
+            u_raw, o_raw = (in_r & ~in_p) & keep, (in_p & ~in_r) & keep
+            # длина отрезка считается ДО обрезки по границе, иначе отсечённый
+            # ею хвост длинного дефекта выглядел бы тонкой плёнкой
+            u = thick_runs(in_r & ~in_p, run_len) & keep
+            o = thick_runs(in_p & ~in_r, run_len) & keep
             thin += int(u_raw.sum() - u.sum() + o_raw.sum() - o.sum()) * cell
             if u.any():
                 np.add.at(under, ib[u], cell)
@@ -177,7 +207,63 @@ def voxel_by_z(part, result, pitch, z_bin, min_thick=0.0):
              "z1": round(pb.ZMin + (i + 1) * z_bin, 2),
              "under_mm3": round(under[i], 2),
              "over_mm3": round(over[i], 2)} for i in range(nb)]
-    return bins, float(under.sum()), float(over.sum()), thin
+    return (bins, float(under.sum()), float(over.sum()), thin,
+            checked, skipped)
+
+
+def enrich_bins(bins, grid, prm, prn, z_limit=None, bore_radius=0.0):
+    """Объём пояса → ОТКЛОНЕНИЕ ПО РАДИУСУ. Для тела вращения пересчёт точный:
+    слой толщиной dr на радиусе r и длине L занимает 2πr·L·dr, откуда
+    dr = V / (2πrL). Номинальный радиус берётся из профиля ДЕТАЛИ — он снимается
+    всегда, потому что деталь настоящий солид (на фасетном результате сечение
+    падает, см. main). Так радиальная величина получается и без профиля
+    результата — а именно она и нужна: 13 мм³ в поясе ничего не говорят, 0.19 мм
+    по радиусу говорят всё.
+
+    Пересчёт верен только на осесимметричной боковой поверхности, поэтому пояс
+    помечается:
+      * `axisym=False` — грани под ключ, точением не берутся (законный недорез);
+      * `face=True`    — номинальный радиус в поясе меняется быстрее, чем на
+                         45°, то есть это торец или уступ: там расхождение
+                         осевое, и делить его на окружность бессмысленно.
+    """
+    if not grid:
+        return
+    gz = np.asarray(grid)
+    for b in bins:
+        # Ниже наружной границы установа проверяется ТОЛЬКО отверстие, поэтому
+        # и радиус для пересчёта там внутренний: делить съём в отверстии на
+        # длину наружной окружности — бессмыслица.
+        if (z_limit is not None and bore_radius
+                and b["z1"] <= float(z_limit) + 1e-9):
+            b["r_nom"] = round(float(bore_radius), 3)
+            b["zone"] = "отверстие"
+            k = 2.0 * math.pi * float(bore_radius) * abs(b["z1"] - b["z0"])
+            if k > 1e-9:
+                b["dr_under_mm"] = round(b["under_mm3"] / k, 3)
+                b["dr_over_mm"] = round(-b["over_mm3"] / k, 3)
+            continue
+        m = (gz >= b["z0"]) & (gz < b["z1"])
+        if not m.any():
+            continue
+        rn = prm[m]
+        rn = rn[~np.isnan(rn)]
+        if rn.size == 0 or rn.max() < 0.5:
+            continue
+        r_nom = float(rn.mean())
+        b["r_nom"] = round(r_nom, 3)
+        # осесимметричность считается ПО СЕЧЕНИЯМ (rmax − rmin в одном и том же
+        # z), а не по разбросу вдоль пояса: на конусе радиус меняется от z к z,
+        # и разброс вдоль пояса ничего не говорит про грани под ключ
+        with np.errstate(invalid="ignore"):
+            spread = np.nanmax(prm[m] - prn[m])
+        b["axisym"] = bool(not np.isnan(spread) and spread < 0.02)
+        dz = abs(b["z1"] - b["z0"])
+        b["face"] = bool((rn.max() - rn.min()) > dz)
+        k = 2.0 * math.pi * r_nom * dz
+        if k > 1e-9:
+            b["dr_under_mm"] = round(b["under_mm3"] / k, 3)
+            b["dr_over_mm"] = round(-b["over_mm3"] / k, 3)
 
 
 def main():
@@ -197,19 +283,41 @@ def main():
     step = float(p.get("prof_step", 0.05))
     angles = int(p.get("angles", 6))
     prof, prof_note = [], None
+    grid, prm, prn, rrm, rrn = [], None, None, None, None
+    # Профиль ДЕТАЛИ снимается отдельно от профиля результата и почти всегда
+    # успешно: деталь — настоящий солид. Он нужен не только для dr(z), но и как
+    # номинал для пересчёта поясов в радиус (enrich_bins), поэтому терять его
+    # из-за фасетного результата нельзя.
     try:
         grid, prm, prn = radial_profile(part, z_lo, z_hi, step, angles)
-        _, rrm, rrn = radial_profile(result, z_lo, z_hi, step, angles)
-        log(f"профиль снят: {len(grid)} точек, шаг {step} мм, {angles} сечений")
+        log(f"профиль детали снят: {len(grid)} точек, шаг {step} мм, "
+            f"{angles} сечений")
     except Exception as exc:
-        # Осевое сечение — булева операция, а на ФАСЕТНОМ теле (IPW из NX ISV)
-        # OCCT её не делает: `common` возвращает Null shape. Это не повод терять
-        # весь замер — воксельная половина работает на любом теле, поэтому
-        # профиль просто пропускается с пометкой.
-        prof_note = f"профиль не снят: {type(exc).__name__}: {exc}"
-        log(prof_note + " — считаю только воксели")
-        grid = []
-    for i, z in enumerate(grid):
+        prof_note = f"профиль детали не снят: {type(exc).__name__}: {exc}"
+        log(prof_note)
+    if grid:
+        try:
+            _, rrm, rrn = radial_profile(result, z_lo, z_hi, step, angles)
+        except Exception as exc:
+            # Осевое сечение — булева операция, а на ФАСЕТНОМ теле (IPW из NX
+            # ISV) OCCT её не делает: `common` возвращает Null shape. Это не
+            # повод терять замер: воксели работают на любом теле, а радиальную
+            # величину даёт пересчёт поясов через номинал.
+            prof_note = (f"профиль результата не снят: "
+                         f"{type(exc).__name__}: {exc}")
+            log(prof_note + " — радиус считаю пересчётом поясов")
+    if rrm is None:
+        grid_rows = []
+    else:
+        grid_rows = list(enumerate(grid))
+    z_limit = p.get("z_limit")
+    z_limit_bore = p.get("z_limit_bore")
+    bore_radius = float(p.get("bore_radius") or 0.0)
+    for i, z in grid_rows:
+        # профиль — это НАРУЖНАЯ поверхность, поэтому режется наружной границей:
+        # ниже неё стоит пруток, и dr там был бы «недорезом» в миллиметры
+        if z_limit is not None and z < float(z_limit) - 1e-9:
+            continue
         row = {"z": round(z, 3)}
         for key, arr in (("part_rmax", prm), ("part_rmin", prn),
                          ("res_rmax", rrm), ("res_rmin", rrn)):
@@ -224,7 +332,10 @@ def main():
     pitch = float(p.get("pitch", 0)) or 0.25
     z_bin = float(p.get("z_bin", 1.0))
     min_thick = float(p.get("min_thickness", 0.0))
-    bins, tot_u, tot_o, thin = voxel_by_z(part, result, pitch, z_bin, min_thick)
+    bins, tot_u, tot_o, thin, checked, skipped = voxel_by_z(
+        part, result, pitch, z_bin, min_thick,
+        z_limit, z_limit_bore, bore_radius)
+    enrich_bins(bins, grid, prm, prn, z_limit, bore_radius)
 
     data = {
         "method": (f"воксельный рей-кастинг, шаг {pitch:.2f} мм, пояса по "
@@ -233,6 +344,11 @@ def main():
         "part_volume_mm3": round(abs(part.Volume), 1),
         "result_volume_mm3": round(abs(result.Volume), 1),
         "z_range": [round(z_lo, 2), round(z_hi, 2)],
+        "z_limit": z_limit,
+        "z_limit_bore": z_limit_bore,
+        "bore_radius": bore_radius or None,
+        "checked_volume_mm3": round(checked, 1),
+        "skipped_volume_mm3": round(skipped, 1),
         "min_thickness_mm": min_thick,
         "thin_film_mm3": round(thin, 1),
         "undercut_total_mm3": round(tot_u, 1),

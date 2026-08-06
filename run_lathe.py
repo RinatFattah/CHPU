@@ -292,8 +292,12 @@ def main():
         p2.update(threads=th2, partoff=False,
                   bore=(prof2.get("bore_raw") or []),
                   hole_depth_drill=z_hd, hole_depth_bore=z_hb,
+                  # разметка зоны — в том же формате, что у первого установа:
+                  # по ней lathe_diff режет проверку (lathe_diff.limits_from_gcode)
                   setup_note=(f"SETUP 2 of 2: part re-gripped and FLIPPED, "
                               f"Z0 = far face (was Z{z_end:.2f} in setup 1), "
+                              f"turns Z 0..{z_end - z_split:.2f}, "
+                              f"drills to Z{z_hd:.2f}, bores to Z{z_hb:.2f}, "
                               f"stock = result of setup 1"))
         p.update(threads=th1, partoff_z_ref=z_end - face_allow,
                  hole_depth_drill=z_hd, hole_depth_bore=z_hb,
