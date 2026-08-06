@@ -125,6 +125,34 @@ def _simplify(pts, tol):
     return _simplify(pts[:imax + 1], tol)[:-1] + _simplify(pts[imax:], tol)
 
 
+def level_pass_end(target, level):
+    """Докуда дойдёт ПРОДОЛЬНЫЙ проход на постоянном радиусе `level`.
+
+    Проход идёт от торца вглубь и обрывается там, где профиль-цель поднимается
+    выше уровня: дальше материал стоит стеной. Точка обрыва берётся с
+    интерполяцией, поэтому конец прохода ложится ТОЧНО на контур — ровно так
+    делает завод. Проверено по числам `UST1.NC`: у них конец прохода сдвигается
+    на 0.082 при шаге 0.465 по радиусу, а это тангенс 80° — наклон того самого
+    уступа на шестигранник; ниже по программе отношение становится 0.347/0.347,
+    то есть 45°, наклон фаски на резьбу.
+
+    `target` — профиль-цель (чистовой путь плюс припуск), отсортирован по
+    убыванию z. Возвращает z конца прохода либо None, если стена стоит уже у
+    торца и проход не режет ничего.
+    """
+    prev = None
+    for z, r in target:
+        if r > level + 1e-9:
+            if prev is None:
+                return None
+            pz, pr = prev
+            if r != pr:
+                return pz + (z - pz) * (level - pr) / (r - pr)
+            return pz
+        prev = (z, r)
+    return target[-1][0]
+
+
 def compress_lines(segs, first_point, tol=0.01):
     """Схлопывает подряд идущие отрезки: дуги ищутся по СЫРОМУ профилю, где
     прямые участки представлены сотнями точек через 0.1 мм. Дуги остаются
@@ -545,7 +573,40 @@ def generate(prof_data, params):
     # столько же, так что зазор под вспомогательной кромкой сохраняется.
     # Выше заготовки путь прижимается к её радиусу — там резец идёт по воздуху.
     n_rough = 0
-    if params.get("contour_rough", False):
+    if params.get("contour_rough", False) and params.get("rough_mode") == "levels":
+        # ЧЕРНОВЫЕ ПРОХОДЫ ПОСТОЯННОГО ДИАМЕТРА — заводская схема (LATHE_ROUGH_MODE
+        # = "levels"). Каждый проход идёт вдоль оси на своём радиусе и обрывается
+        # там, где профиль поднимается выше него; шаг между уровнями = глубина
+        # резания. Так устроен T1 в заводской UST1.NC: 11 проходов с шагом 0.465
+        # мм по радиусу, конец каждого лежит точно на контуре.
+        #
+        # РИСК, о котором нельзя забывать: такой проход НЕ следует форме детали,
+        # и на уклоне вспомогательная кромка резца идёт по уже обточенной стенке
+        # позади. Ровно поэтому черновая постоянного радиуса была убрана в июле
+        # (замерено: 0.29 мм зареза на уступе 43°, 1.23 мм на 75°). Завод так
+        # работает потому, что у его пластины φ₁ = 32°, а шаблон NX в ISV даёт
+        # 17.5° — то есть в симуляции волочение будет БОЛЬШЕ настоящего.
+        ap_r = max(0.05, ap)
+        allow = max(0.0, allowance)
+        base = _simplify(src_rough, params.get("line_tol", 0.01))
+        target = [(z, min(r + allow, r_stock)) for z, r in base]
+        r_min = min(r for _, r in target)
+        n_lv = max(0, -(-int((r_stock - r_min) * 1000) // int(ap_r * 1000)))
+        for i in range(n_lv):
+            level = max(r_min, r_stock - (i + 1) * ap_r)
+            z_stop = level_pass_end(target, level)
+            if z_stop is None or z_stop >= target[0][0] - 0.05:
+                continue                     # проход ничего не снимает
+            n_rough += 1
+            op(f"Rough{n_rough}")
+            g.append(f"G0 {X(retract_r)} Z{z_top + clear:.3f}")
+            g.append(f"G0 {X(level)} Z{z_top + clear:.3f}")
+            g.append(f"G1 {X(level)} Z{z_stop:.3f} {fmt(feed)}")
+            # отвод по радиусу: всё, что снаружи уровня выше z_stop, этим же
+            # проходом уже снято, поэтому наружу резец идёт по воздуху
+            g.append(f"G0 {X(retract_r)} Z{z_stop:.3f}")
+            g.append(f"(Finish operation: Rough{n_rough})")
+    elif params.get("contour_rough", False):
         ap_r = max(0.05, ap)
         allow = max(0.0, allowance)
         deepest = max(r_stock - r for _, r in src_rough)
