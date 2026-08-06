@@ -173,6 +173,28 @@ def make_drill(setup, pocket_no, diameter, used, flute=60.0):
     tb.Destroy()
 
 
+def set_insert_shape(tb, uname, shape):
+    """ФОРМА ПЛАСТИНЫ резца — не путать с подтипом.
+
+    Подтип (OD_55_R и т.п.) задаёт державку, руку и посадку; форма пластины —
+    отдельное поле `InsertShape`. Члены перечисления лежат в объекте-держателе
+    `InsertShapes` (множественное число), а НЕ в типе значения — именно на этом
+    первый заход зонда промахнулся и показал пустой список.
+
+    Доступны 20: Diamond35/55/75/80/86/100, Square, Rectangle, Triangle,
+    Trigon, Round, Pentagon, Hexagon, Octagon, Parallelogram55/82/85, PrimeA,
+    PrimeB, User. Наша по умолчанию — Diamond55 (ромб 55°, DCMT).
+
+    Форма решает, где сидит точка отсчёта модели относительно центра
+    скругления, а значит и плёнку: у ромба 55° она на 0.59·R, у точки по ISO —
+    на 1.00·R. Вызывать ДО Commit; проверять ТОЛЬКО прогоном ISV — «принято»
+    у NX ещё не значит «подействовало» (см. углы в блоке 5).
+    """
+    was = tb.InsertShape
+    tb.InsertShape = getattr(tb.InsertShapes, shape)
+    log(f"форма пластины {uname}: {was} → {shape}")
+
+
 def set_track_point(tb, uname, track):
     """ТОЧКА ОТСЛЕЖИВАНИЯ резца — какую точку пластины ISV ставит в
     запрограммированную координату.
@@ -215,7 +237,7 @@ def set_track_point(tb, uname, track):
 
 
 def make_tool(setup, subtype, uname, props, used, report, pocket_no=None,
-              track=None):
+              track=None, insert_shape=None):
     """Резец подтипа `subtype` в кармане револьвера с номером pocket_no.
 
     НОМЕР КАРМАНА ОБЯЗАН СОВПАДАТЬ С НОМЕРОМ ИНСТРУМЕНТА в программе: стойка
@@ -261,6 +283,12 @@ def make_tool(setup, subtype, uname, props, used, report, pocket_no=None,
                 except Exception as e:
                     log(f"warn: {prop}={val} не применилось: "
                         f"{type(e).__name__}: {e}")
+        if insert_shape:
+            try:
+                set_insert_shape(tb, uname, insert_shape)
+            except Exception as e:
+                log(f"warn: форма пластины {uname} не задана: "
+                    f"{type(e).__name__}: {e}")
         if track:
             try:
                 set_track_point(tb, uname, track)
@@ -425,10 +453,12 @@ def main():
     for name, val in (p.get("tool_params") or {}).items():
         props.append((name if name.endswith("Builder") else name + "Builder", val))
     trk_od = p.get("track_point") or None       # см. set_track_point
+    shp_od = p.get("insert_shape") or None      # см. set_insert_shape
     make_tool(setup, subtype, "TURN_OD", props, used,
               ("OrientAngleBuilder", "NoseAngleBuilder", "NoseRadiusBuilder",
                "SizeBuilder", "ReliefAngleBuilder"),
-              pocket_no=int(p.get("tool_number", 1)), track=trk_od)
+              pocket_no=int(p.get("tool_number", 1)), track=trk_od,
+              insert_shape=shp_od)
     log("(форму съёма задаёт ПОДТИП: φ₁ = 180 − φ − ε — вспомогательный угол "
         "в плане; чем он меньше, тем сильнее резец волочит по готовой стенке)")
 
@@ -444,7 +474,8 @@ def main():
                    ("SizeBuilder", float(p.get("insert_size", 6.35)))],
                   used,
                   ("OrientAngleBuilder", "NoseAngleBuilder", "NoseRadiusBuilder",
-                   "SizeBuilder"), pocket_no=lt, track=trk_od)
+                   "SizeBuilder"), pocket_no=lt, track=trk_od,
+                  insert_shape=shp_od)
 
     # Чистовой проходной T8 — 35°-ромб. Острее чернового, поэтому глубже заходит
     # в уступы; в программе он ведёт операцию Finish. Тип токарный, как у T1 и T3,
@@ -461,7 +492,7 @@ def main():
         before = len(used)
         make_tool(setup, fsub, "TURN_OD_FIN", fprops, used,
                   ("NoseAngleBuilder", "NoseRadiusBuilder", "SizeBuilder"),
-                  pocket_no=ft, track=trk_od)
+                  pocket_no=ft, track=trk_od, insert_shape=shp_od)
         if len(used) == before and fsub != subtype:
             log(f"подтип {fsub} не создался — ставлю {subtype} (как у чернового); "
                 f"в ISV чистовой будет волочить сильнее настоящего, на G-код не влияет")
@@ -474,7 +505,7 @@ def main():
                        ("SizeBuilder", float(p.get("insert_size", 6.35)))],
                       used,
                       ("NoseAngleBuilder", "NoseRadiusBuilder", "SizeBuilder"),
-                      pocket_no=ft, track=trk_od)
+                      pocket_no=ft, track=trk_od, insert_shape=shp_od)
 
     # Канавочный резец T2. Программа отдаёт ему канавки и отрезку — то, куда
     # проходной физически не лезет. Если его не создать, стойка на T2 возьмёт

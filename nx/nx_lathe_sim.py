@@ -391,7 +391,8 @@ def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
              groove_tool_number=2, groove_params=None,
              left_tool_number=0, finish_tool_number=0, finish_nose_angle=35.0,
              finish_nose_radius=0.4, finish_insert_size=6.35,
-             tool_length_x=0.0, tool_length_z=0.0, track_point=None):
+             tool_length_x=0.0, tool_length_z=0.0, track_point=None,
+             insert_shape=None):
     """Прогоняет токарный G-Code на виртуальном станке NX ISV.
 
     Результат возвращается в раме ДЕТАЛИ (ось Z): заготовку сажают на ось
@@ -540,6 +541,11 @@ def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
         # runs/80_track_point). Умолчание None = как в шаблоне NX.
         "track_point": (track_point if track_point is not None
                         else getattr(config, "NX_LATHE_TRACK_POINT", None)),
+        # Форма пластины (Diamond55 у нас по умолчанию, всего 20 вариантов —
+        # см. set_insert_shape в журнале). Не путать с подтипом: тот задаёт
+        # державку и руку. None = как в шаблоне NX.
+        "insert_shape": (insert_shape if insert_shape is not None
+                         else getattr(config, "NX_LATHE_INSERT_SHAPE", None)),
         # Канавочный резец T2. Проходной в канавку не лезет (волочит
         # вспомогательной кромкой по стенке позади), поэтому генератор отдаёт
         # канавки и отрезку отдельному инструменту — надо создать его и в ISV,
