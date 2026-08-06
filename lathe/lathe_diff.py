@@ -150,7 +150,7 @@ def limits_from_gcode(path):
 
 def analyse(part_path, result_path, json_path=None, pitch=None, z_bin=None,
             angles=6, prof_step=0.05, min_thickness=None, z_limit=None,
-            z_limit_bore=None, bore_radius=None, timeout=1800):
+            z_limit_bore=None, bore_radius=None, z_shift=0.0, timeout=1800):
     """Возвращает dict с by_z и profile (см. cam/lathe_diff_worker.py).
 
     Умолчания берутся из конфига: `LATHE_DIFF_PITCH`, `LATHE_DIFF_Z_BIN` и общий
@@ -186,7 +186,7 @@ def analyse(part_path, result_path, json_path=None, pitch=None, z_bin=None,
         "angles": angles, "prof_step": prof_step,
         "min_thickness": min_thickness,
         "z_limit": z_limit, "z_limit_bore": z_limit_bore,
-        "bore_radius": bore_radius,
+        "bore_radius": bore_radius, "z_shift": z_shift,
     }
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
                                      encoding="utf-8") as tmp:

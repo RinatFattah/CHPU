@@ -272,6 +272,15 @@ def main():
 
     part = load_solid(p["part"])
     result = load_solid(p["result"])
+    # ДИАГНОСТИЧЕСКИЙ осевой сдвиг результата. Если станок или стойка исполнили
+    # программу со смещением вдоль оси, расхождение с моделью растёт на уклонах
+    # и не растёт на цилиндрах — и тогда существует δz, при котором расхождение
+    # резко падает. Обычная ошибка траектории так не лечится ни при каком δz.
+    z_shift = float(p.get("z_shift") or 0.0)
+    if z_shift:
+        result = result.copy()
+        result.translate(App.Vector(0.0, 0.0, z_shift))
+        log(f"результат сдвинут по оси на {z_shift:+.3f} мм (диагностика)")
     pb, rb = part.BoundBox, result.BoundBox
     log(f"деталь {abs(part.Volume) / 1000.0:.2f} см³, результат "
         f"{abs(result.Volume) / 1000.0:.2f} см³")
@@ -344,6 +353,7 @@ def main():
         "part_volume_mm3": round(abs(part.Volume), 1),
         "result_volume_mm3": round(abs(result.Volume), 1),
         "z_range": [round(z_lo, 2), round(z_hi, 2)],
+        "z_shift": z_shift or None,
         "z_limit": z_limit,
         "z_limit_bore": z_limit_bore,
         "bore_radius": bore_radius or None,
