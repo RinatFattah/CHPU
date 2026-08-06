@@ -312,6 +312,16 @@ def write_to_ini(machine_dir, nose_radius, tool_number=1,
 
     if tools:                       # готовый список (обычно из tools_from_gcode)
         tools = [dict(t) for t in tools]
+        if length_x or length_z:
+            # ВЫЛЕТ РЕЗЦА в таблице стойки — то же самое, что замер инструмента
+            # на приборе у настоящего станка: он сообщает стойке, ГДЕ реально
+            # лежит вершина относительно точки привязки резцедержателя. У нас
+            # он по умолчанию нулевой, то есть мы утверждаем «вершина ровно в
+            # точке привязки» — а модель пластины в NX имеет свою геометрию
+            # относительно той же точки, и привязки расходятся.
+            for t in tools:
+                if int(t.get("type", 500)) in (500, 510):
+                    t["lx"], t["lz"] = length_x, length_z
         for t in (extra_tools or []):
             if t and t.get("n"):
                 tools.append(dict(t))
@@ -380,7 +390,8 @@ def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
              relief_angle=None, tool_params=None, groove_width=0.0,
              groove_tool_number=2, groove_params=None,
              left_tool_number=0, finish_tool_number=0, finish_nose_angle=35.0,
-             finish_nose_radius=0.4, finish_insert_size=6.35):
+             finish_nose_radius=0.4, finish_insert_size=6.35,
+             tool_length_x=0.0, tool_length_z=0.0, track_point=None):
     """Прогоняет токарный G-Code на виртуальном станке NX ISV.
 
     Результат возвращается в раме ДЕТАЛИ (ось Z): заготовку сажают на ось
@@ -410,6 +421,7 @@ def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
     _log("инструменты программы: "
          + ", ".join(f"T{t['n']}({t['name']})" for t in tool_list))
     write_to_ini(mdir, nose_radius, groove_width=groove_width,
+                 length_x=tool_length_x, length_z=tool_length_z,
                  groove_tool_number=groove_tool_number,
                  left_tool_number=left_tool_number, tools=tool_list)
 
@@ -523,6 +535,11 @@ def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
         "insert_size": (insert_size if insert_size is not None
                         else getattr(config, "LATHE_INSERT_SIZE", 6.35)),
         "orient_angle": getattr(config, "NX_LATHE_ORIENT_ANGLE", None),
+        # Точка отслеживания резца — какую точку пластины ISV ставит в
+        # запрограммированную координату (см. set_track_point в журнале и
+        # runs/80_track_point). Умолчание None = как в шаблоне NX.
+        "track_point": (track_point if track_point is not None
+                        else getattr(config, "NX_LATHE_TRACK_POINT", None)),
         # Канавочный резец T2. Проходной в канавку не лезет (волочит
         # вспомогательной кромкой по стенке позади), поэтому генератор отдаёт
         # канавки и отрезку отдельному инструменту — надо создать его и в ISV,

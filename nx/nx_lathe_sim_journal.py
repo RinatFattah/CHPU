@@ -173,7 +173,40 @@ def make_drill(setup, pocket_no, diameter, used, flute=60.0):
     tb.Destroy()
 
 
-def make_tool(setup, subtype, uname, props, used, report, pocket_no=None):
+def set_track_point(tb, uname, track):
+    """ТОЧКА ОТСЛЕЖИВАНИЯ резца — какую точку пластины ISV ставит в
+    запрограммированную координату.
+
+    У токарного резца в NX ровно одна такая точка (`NumberOfTrackPoints = 1`),
+    и она несёт НОМЕР ПОЛОЖЕНИЯ ВЕРШИНЫ по тому же справочнику, что
+    Schneidenlage у стойки, плюс собственные смещения. Замерено зондом
+    (`nx/research/turn_tracking_probe_journal.py`, runs/80):
+
+        OD_55_R → tpNumber 4,  xOffset 0, yOffset 0
+        ID_55_L → tpNumber 2,  xOffset 0, yOffset 0
+
+    В таблицу стойки мы при этом пишем положение 3 (INSERT_POSITION_OD_RIGHT).
+    Это НЕ опечатка в одном из двух мест: таблица стойки на съём в ISV не
+    влияет вовсе (вылеты $TC_DP3/DP4 проверены в runs/79 — ноль эффекта),
+    съём строит модель резца NX, и вот у неё привязка своя.
+
+    track — {"tp": номер, "dx": смещение X, "dy": смещение Y}; любой ключ
+    необязателен, отсутствующий оставляет значение NX. Вызывать ДО Commit.
+    """
+    trk = tb.TrackingBuilder
+    pt = trk.GetTrackPoint(0)                       # позиция с нуля
+    name, rid, tp, ang, rad, dx, dy, adj, cc = trk.Get(pt)
+    was = (tp, dx, dy)
+    tp = int(track.get("tp", tp))
+    dx = float(track.get("dx", dx))
+    dy = float(track.get("dy", dy))
+    trk.Modify(pt, name, rid, tp, ang, rad, dx, dy, adj, cc)
+    log(f"точка отслеживания {uname}: было tp={was[0]} dx={was[1]:g} "
+        f"dy={was[2]:g} → стало tp={tp} dx={dx:g} dy={dy:g}")
+
+
+def make_tool(setup, subtype, uname, props, used, report, pocket_no=None,
+              track=None):
     """Резец подтипа `subtype` в кармане револьвера с номером pocket_no.
 
     НОМЕР КАРМАНА ОБЯЗАН СОВПАДАТЬ С НОМЕРОМ ИНСТРУМЕНТА в программе: стойка
@@ -219,6 +252,12 @@ def make_tool(setup, subtype, uname, props, used, report, pocket_no=None):
                 except Exception as e:
                     log(f"warn: {prop}={val} не применилось: "
                         f"{type(e).__name__}: {e}")
+        if track:
+            try:
+                set_track_point(tb, uname, track)
+            except Exception as e:
+                log(f"warn: точка отслеживания {uname} не изменена: "
+                    f"{type(e).__name__}: {e}")
         # Commit ОБЯЗАН быть под try. NX валидирует резец целиком и на неудачном
         # сочетании подтипа и размеров бросает исключение с посторонним текстом
         # (на OD_35_R + Size 6.35 это «диаметр спирали должен быть больше
@@ -244,6 +283,13 @@ def make_tool(setup, subtype, uname, props, used, report, pocket_no=None):
                                  f"{getattr(tb2, prop).Value:g}")
                 except Exception:
                     check.append(f"{prop.replace('Builder', '')}=н/д")
+            if track:                       # сохранилась ли привязка после Commit
+                try:
+                    t2 = tb2.TrackingBuilder
+                    v = t2.Get(t2.GetTrackPoint(0))
+                    check.append(f"tp={v[2]}, dx={v[5]:g}, dy={v[6]:g}")
+                except Exception:
+                    check.append("tp=н/д")
             tb2.Destroy()
         except Exception as e:
             check.append(f"<перечитать не удалось: {e}>")
@@ -369,10 +415,11 @@ def main():
     # nx/research/turn_tool_probe_journal.py).
     for name, val in (p.get("tool_params") or {}).items():
         props.append((name if name.endswith("Builder") else name + "Builder", val))
+    trk_od = p.get("track_point") or None       # см. set_track_point
     make_tool(setup, subtype, "TURN_OD", props, used,
               ("OrientAngleBuilder", "NoseAngleBuilder", "NoseRadiusBuilder",
                "SizeBuilder", "ReliefAngleBuilder"),
-              pocket_no=int(p.get("tool_number", 1)))
+              pocket_no=int(p.get("tool_number", 1)), track=trk_od)
     log("(форму съёма задаёт ПОДТИП: φ₁ = 180 − φ − ε — вспомогательный угол "
         "в плане; чем он меньше, тем сильнее резец волочит по готовой стенке)")
 
@@ -388,7 +435,7 @@ def main():
                    ("SizeBuilder", float(p.get("insert_size", 6.35)))],
                   used,
                   ("OrientAngleBuilder", "NoseAngleBuilder", "NoseRadiusBuilder",
-                   "SizeBuilder"), pocket_no=lt)
+                   "SizeBuilder"), pocket_no=lt, track=trk_od)
 
     # Чистовой проходной T8 — 35°-ромб. Острее чернового, поэтому глубже заходит
     # в уступы; в программе он ведёт операцию Finish. Тип токарный, как у T1 и T3,
@@ -405,7 +452,7 @@ def main():
         before = len(used)
         make_tool(setup, fsub, "TURN_OD_FIN", fprops, used,
                   ("NoseAngleBuilder", "NoseRadiusBuilder", "SizeBuilder"),
-                  pocket_no=ft)
+                  pocket_no=ft, track=trk_od)
         if len(used) == before and fsub != subtype:
             log(f"подтип {fsub} не создался — ставлю {subtype} (как у чернового); "
                 f"в ISV чистовой будет волочить сильнее настоящего, на G-код не влияет")
@@ -418,7 +465,7 @@ def main():
                        ("SizeBuilder", float(p.get("insert_size", 6.35)))],
                       used,
                       ("NoseAngleBuilder", "NoseRadiusBuilder", "SizeBuilder"),
-                      pocket_no=ft)
+                      pocket_no=ft, track=trk_od)
 
     # Канавочный резец T2. Программа отдаёт ему канавки и отрезку — то, куда
     # проходной физически не лезет. Если его не создать, стойка на T2 возьмёт
