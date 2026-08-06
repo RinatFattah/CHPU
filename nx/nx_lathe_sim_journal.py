@@ -190,19 +190,28 @@ def set_track_point(tb, uname, track):
     влияет вовсе (вылеты $TC_DP3/DP4 проверены в runs/79 — ноль эффекта),
     съём строит модель резца NX, и вот у неё привязка своя.
 
-    track — {"tp": номер, "dx": смещение X, "dy": смещение Y}; любой ключ
-    необязателен, отсутствующий оставляет значение NX. Вызывать ДО Commit.
+    track — {"tp": номер, "dx": смещение X, "dy": смещение Y,
+    "angle": угол, "radius": радиус}; любой ключ необязателен, отсутствующий
+    оставляет значение NX. Вызывать ДО Commit.
+
+    ЖИВОЙ РЫЧАГ ТОЛЬКО "tp". Декартовы dx/dy записываются и перечитываются, но
+    на съём не влияют — они лишь переводят NX в положение 9 (замерено: dx = 0.5
+    и dy = 0.5 дали побитово одинаковый результат, равный простому tp = 9).
+    Полярная пара angle/radius проверена там же и тоже инертна.
     """
     trk = tb.TrackingBuilder
     pt = trk.GetTrackPoint(0)                       # позиция с нуля
     name, rid, tp, ang, rad, dx, dy, adj, cc = trk.Get(pt)
-    was = (tp, dx, dy)
+    was = (tp, dx, dy, ang, rad)
     tp = int(track.get("tp", tp))
     dx = float(track.get("dx", dx))
     dy = float(track.get("dy", dy))
+    ang = float(track.get("angle", ang))
+    rad = float(track.get("radius", rad))
     trk.Modify(pt, name, rid, tp, ang, rad, dx, dy, adj, cc)
     log(f"точка отслеживания {uname}: было tp={was[0]} dx={was[1]:g} "
-        f"dy={was[2]:g} → стало tp={tp} dx={dx:g} dy={dy:g}")
+        f"dy={was[2]:g} угол={was[3]:g} радиус={was[4]:g} → стало tp={tp} "
+        f"dx={dx:g} dy={dy:g} угол={ang:g} радиус={rad:g}")
 
 
 def make_tool(setup, subtype, uname, props, used, report, pocket_no=None,
