@@ -54,6 +54,79 @@ _ROTATE_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "_rotate_worker.py")
 
 
+def is_faceted_step(path):
+    """Фасетное тело (результат ISV) или настоящий солид?
+
+    У фасетного экспорта вершины лежат одним `COORDINATES_LIST`, а граней
+    B-Rep (`ADVANCED_FACE`) нет вовсе. Различать нужно потому, что OCCT
+    фасетный STEP не крутит — `exportStep` отдаёт 0 граней (см. I8).
+
+    Файл читается ЦЕЛИКОМ: `COORDINATES_LIST` стоит после многомегабайтного
+    блока вершин, и по первым сотням килобайт фасетное тело не опознаётся.
+    """
+    try:
+        text = open(path, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return False
+    return "COORDINATES_LIST" in text and "ADVANCED_FACE" not in text
+
+
+def transform_facet_step(in_path, out_path, axis=(0.0, 1.0, 0.0), angle=90.0,
+                         offset=(0.0, 0.0, 0.0)):
+    """Аффинное преобразование ФАСЕТНОГО STEP прямо по тексту.
+
+    Единственный способ повернуть результат ISV: OCCT фасеты не крутит, а
+    внутри NX это делается вершинами в два прохода (I8) — сюда её тащить незачем.
+    Правится ровно `COORDINATES_LIST`, где лежат вершины сетки; нормалей в
+    этом экспорте НЕТ (проверено: 0 сущностей `*NORMAL*`), поэтому намотка
+    граней задаётся порядком вершин и при СОБСТВЕННОМ повороте (det = +1)
+    остаётся верной. Остальные `CARTESIAN_POINT` в файле — камеры и виды,
+    к геометрии сетки отношения не имеют, размещение тела единичное
+    (подтверждено тем, что радиусы читаются из списка напрямую и сходятся).
+
+    Поворот — формула Родрига, та же семантика, что у `_rotate_step`.
+    """
+    ax, ay, az = axis
+    n = math.sqrt(ax * ax + ay * ay + az * az) or 1.0
+    kx, ky, kz = ax / n, ay / n, az / n
+    th = math.radians(float(angle))
+    c, s = math.cos(th), math.sin(th)
+    ox, oy, oz = offset
+
+    def rot(x, y, z):
+        cx = ky * z - kz * y                      # k × v
+        cy = kz * x - kx * z
+        cz = kx * y - ky * x
+        d = (kx * x + ky * y + kz * z) * (1.0 - c)   # k (k·v)(1−cosθ)
+        return (x * c + cx * s + kx * d + ox,
+                y * c + cy * s + ky * d + oy,
+                z * c + cz * s + kz * d + oz)
+
+    text = open(in_path, encoding="utf-8", errors="replace").read()
+    m = re.search(r"(COORDINATES_LIST\s*\([^(]*\(\()(.*?)(\)\s*\)\s*\)\s*;)",
+                  text, re.S)
+    if not m:
+        raise RuntimeError(f"в {os.path.basename(in_path)} нет COORDINATES_LIST "
+                           f"— это не фасетное тело")
+    num = r"-?\d+(?:\.\d*)?(?:E[+-]?\d+)?"
+    trip = re.compile(rf"\(\s*({num})\s*,\s*({num})\s*,\s*({num})\s*\)")
+    cnt = 0
+
+    def sub(mm):
+        nonlocal cnt
+        cnt += 1
+        x, y, z = rot(*(float(g) for g in mm.groups()))
+        return f"({x:.6f},{y:.6f},{z:.6f})"
+
+    body = trip.sub(sub, m.group(2))
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(text[:m.start()] + m.group(1) + body + m.group(3)
+                + text[m.end():])
+    _log(f"фасет преобразован: {cnt} вершин, поворот {angle:g}° вокруг "
+         f"({kx:g}, {ky:g}, {kz:g}), сдвиг ({ox:g}, {oy:g}, {oz:g})")
+    return out_path
+
+
 def _rotate_step(in_path, out_path, axis=(0.0, 1.0, 0.0), angle=90.0):
     """Повернуть BREP-STEP (деталь/заготовку) в другую раму через freecadcmd.
 
@@ -510,7 +583,13 @@ def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
     rot_angle = float(rot_angle) if rot_angle is not None else 90.0
     if do_rotate:
         stock_for_nx = os.path.join(tdir, f"{stem}_stock_nx.stp")
-        _rotate_step(stock_step_path, stock_for_nx, rot_axis, rot_angle)
+        # Заготовкой второго установа служит ФАСЕТНЫЙ результат первого — его
+        # OCCT не крутит, поэтому там работает текстовое преобразование.
+        if is_faceted_step(stock_step_path):
+            transform_facet_step(stock_step_path, stock_for_nx,
+                                 rot_axis, rot_angle)
+        else:
+            _rotate_step(stock_step_path, stock_for_nx, rot_axis, rot_angle)
         _log("заготовка повёрнута на ось шпинделя станка")
     else:
         stock_for_nx = stock_step_path
