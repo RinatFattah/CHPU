@@ -80,7 +80,14 @@ async def api_start(model: UploadFile, form: str = Form("{}"),
     except json.JSONDecodeError:
         raise HTTPException(400, "форма пришла не в JSON")
 
-    tmp = os.path.join(jobs.RUNS, "_upload")
+    # Загрузки кладём в ASCII-каталог, а НЕ рядом с прогонами. Репозиторий
+    # лежит под кириллицей, FreeCAD/OCCT такие пути не открывают, и
+    # `_ascii_safe` переводит их в короткие 8.3-имена — а 8.3 обрезает
+    # расширение до трёх букв: `.step` превращается в `.STE`, FreeCAD его не
+    # узнаёт и валится в ветку мешей («File extension not supported»).
+    # `.stp` не страдает, поэтому на образце с таким расширением всё работало,
+    # а на `.step` падало сразу.
+    tmp = jobs.UPLOADS
     os.makedirs(tmp, exist_ok=True)
     model_path = os.path.join(tmp, safe_name(model.filename))
     with open(model_path, "wb") as f:

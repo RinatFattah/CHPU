@@ -24,12 +24,15 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUNS = os.path.join(ROOT, "runs", "web")
+# Загруженные файлы — в ASCII-путь: см. пояснение в web/server.py.
+UPLOADS = os.path.join(tempfile.gettempdir(), "cam_web_uploads")
 
 # ── этапы, которые показываем ───────────────────────────────────────────────
 PHASES = [
@@ -127,7 +130,21 @@ class Job:
                 "llm": self.llm, "llm_model": self.llm_model,
                 "elapsed": round((self.finished or time.time()) - self.started),
                 "error": self.error, "metrics": self.metrics,
-                "verdicts": self.verdicts, "outputs": self.outputs()}
+                "verdicts": self.verdicts, "outputs": self.outputs(),
+                "tail": self.tail() if self.status == "failed" else []}
+
+    def tail(self, n=25):
+        """Последние осмысленные строки лога — их показываем при падении.
+
+        Без этого пользователь видел только «не получилось» и пустую строку:
+        причина уходила в блок, который в этот момент скрыт."""
+        path = os.path.join(self.dir, "web.log")
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                lines = [l.rstrip() for l in f if l.strip()]
+        except OSError:
+            return []
+        return lines[-n:]
 
     def outputs(self):
         """Файлы результата — по суффиксу, в порядке полезности."""
@@ -228,7 +245,11 @@ def _pump(job, cmd):
         job.error = str(e)
     finally:
         job.finished = time.time()
-        job.emit("done", status=job.status, error=job.error)
+        done = {"ok": "готово", "failed": "НЕ ПОЛУЧИЛОСЬ",
+                "stopped": "остановлено"}.get(job.status, job.status)
+        job.emit("done", status=job.status, error=job.error,
+                 text=done + (f": {job.error}" if job.error else ""),
+                 tail=job.tail())
         with _lock:
             if _active == job.id:
                 _active = None

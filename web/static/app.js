@@ -94,8 +94,6 @@ function renderSteps(state) {
 }
 
 function addFeed(ev) {
-  const showRaw = $("raw").checked;
-  if (ev.kind === "log" && !showRaw) return;
   const d = document.createElement("div");
   d.className = "k-" + ev.kind;
   d.dataset.kind = ev.kind;
@@ -135,9 +133,13 @@ function renderResult(state) {
   const title = { ok: "готово", failed: "не получилось",
                   stopped: "остановлено" }[state.status] || state.status;
   $("phase").textContent = title;
-  if (state.error) {
-    $("form-error").hidden = false;
-    $("form-error").textContent = state.error;
+  // Причину показываем ВНУТРИ карточки обработки: блок формы в этот момент
+  // скрыт, и раньше сообщение уходило в никуда — оставались слова
+  // «не получилось» и пустая строка.
+  if (state.status === "failed") {
+    $("fail").hidden = false;
+    $("fail-why").textContent = state.error || "обработка прервалась";
+    $("fail-tail").textContent = (state.tail || []).join("\n");
   }
   if (!state.outputs.length) return;
   $("result").hidden = false;
@@ -173,6 +175,7 @@ function follow(state) {
   $("progress").hidden = false;
   document.querySelector("main").classList.add("solo");
   $("feed").innerHTML = "";
+  $("fail").hidden = true;
   $("form-error").hidden = true;
   tick(state);
   startClock(state);
@@ -243,8 +246,7 @@ async function start() {
     $("result").hidden = true; $("metrics-box").hidden = true;
   });
   $("raw").addEventListener("change", () => {
-    document.querySelectorAll("#feed div[data-kind=log]").forEach(
-      (d) => { d.hidden = !$("raw").checked; });
+    $("feed").classList.toggle("raw", $("raw").checked);
   });
 
   if (spec.active && spec.active.status === "running") follow(spec.active);
