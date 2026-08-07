@@ -457,7 +457,7 @@ def main():
                                   ("max_dr", "total", "under", "over")},
                         "analysis": str((entry.get("llm") or {})
                                         .get("analysis", ""))[:400]})
-        active = new
+        active = nxt
     else:
         log(f"достигнут лимит итераций ({args.iters})")
 

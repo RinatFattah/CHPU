@@ -41,6 +41,10 @@ lathe_tools.py — КАТАЛОГ токарного инструмента и �
 """
 
 # ── КАТАЛОГ ─────────────────────────────────────────────────────────────────
+# Здесь только то, что РЕАЛЬНО ЕСТЬ — заводской комплект 14-31A (КнААЗ, станок
+# DMG CTX500 beta). Придумывать инструмент нельзя: агент «решит» задачу тем,
+# чего у цеха нет, и результат будет ложным. Появится новый резец в наличии —
+# он добавляется в `LATHE_TOOLS` конфига или сюда, но только по факту.
 # Поля резца: nose_angle — ε, угол при вершине пластины; approach — φ, угол в
 # плане (даёт державка); size — размер пластины (вписанная окружность), от него
 # зависит длина подреза; nx_shape — форма пластины в NX ISV, ОБЯЗАНА совпадать
@@ -52,23 +56,11 @@ CATALOG = [
      "size": 6.35, "approach": 107.5, "nx_shape": "Diamond55",
      "desc": "черновой проходной, ромб 55°, R0.4, державка 107.5° — "
              "заводской; φ₁ = 17.5°"},
-    {"id": "rough_ccmt80", "role": "rough", "number": 1,
-     "insert": "CCMT09T304", "nose_angle": 80.0, "nose_radius": 0.4,
-     "size": 9.525, "approach": 95.0, "nx_shape": "Diamond80",
-     "desc": "черновой проходной, ромб 80°, крупнее и жёстче, но φ₁ = 5° — "
-             "волочит по готовой стенке до 6 мм"},
-
     {"id": "finish_vcmt35", "role": "finish", "number": 8,
      "insert": "VCMT110304", "nose_angle": 35.0, "nose_radius": 0.4,
      "size": 6.35, "approach": 107.5, "nx_shape": "Diamond35",
      "desc": "чистовой проходной, ромб 35°, R0.4 — заводской; φ₁ = 37.5°, "
              "заходит в узкие уступы"},
-    {"id": "finish_dcmt55", "role": "finish", "number": 8,
-     "insert": "DCMT070202", "nose_angle": 55.0, "nose_radius": 0.2,
-     "size": 6.35, "approach": 107.5, "nx_shape": "Diamond55",
-     "desc": "чистовой ромб 55°, R0.2 — жёстче 35°, но φ₁ = 17.5°: в уступы "
-             "заходит мельче, больше остаётся канавочному"},
-
     {"id": "left_dcmt55", "role": "left", "number": 3,
      "insert": "DCMT070204L", "nose_angle": 55.0, "nose_radius": 0.4,
      "size": 6.35, "approach": 107.5, "nx_shape": "Diamond55",
@@ -119,7 +111,7 @@ def default_active(cat=None):
     cat = cat or catalog()
     want = ("rough_dcmt55", "finish_vcmt35", "left_dcmt55",
             "groove_3", "groove_2", "groove_1",
-            "drill", "bore", "center", "thread")
+            "drill", "bore", "center", "thread")   # весь пул
     return [i for i in want if i in cat]
 
 
