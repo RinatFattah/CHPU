@@ -125,6 +125,34 @@ def _simplify(pts, tol):
     return _simplify(pts[:imax + 1], tol)[:-1] + _simplify(pts[imax:], tol)
 
 
+def level_pass_end(target, level):
+    """Докуда дойдёт ПРОДОЛЬНЫЙ проход на постоянном радиусе `level`.
+
+    Проход идёт от торца вглубь и обрывается там, где профиль-цель поднимается
+    выше уровня: дальше материал стоит стеной. Точка обрыва берётся с
+    интерполяцией, поэтому конец прохода ложится ТОЧНО на контур — ровно так
+    делает завод. Проверено по числам `UST1.NC`: у них конец прохода сдвигается
+    на 0.082 при шаге 0.465 по радиусу, а это тангенс 80° — наклон того самого
+    уступа на шестигранник; ниже по программе отношение становится 0.347/0.347,
+    то есть 45°, наклон фаски на резьбу.
+
+    `target` — профиль-цель (чистовой путь плюс припуск), отсортирован по
+    убыванию z. Возвращает z конца прохода либо None, если стена стоит уже у
+    торца и проход не режет ничего.
+    """
+    prev = None
+    for z, r in target:
+        if r > level + 1e-9:
+            if prev is None:
+                return None
+            pz, pr = prev
+            if r != pr:
+                return pz + (z - pz) * (level - pr) / (r - pr)
+            return pz
+        prev = (z, r)
+    return target[-1][0]
+
+
 def compress_lines(segs, first_point, tol=0.01):
     """Схлопывает подряд идущие отрезки: дуги ищутся по СЫРОМУ профилю, где
     прямые участки представлены сотнями точек через 0.1 мм. Дуги остаются
@@ -545,7 +573,40 @@ def generate(prof_data, params):
     # столько же, так что зазор под вспомогательной кромкой сохраняется.
     # Выше заготовки путь прижимается к её радиусу — там резец идёт по воздуху.
     n_rough = 0
-    if params.get("contour_rough", False):
+    if params.get("contour_rough", False) and params.get("rough_mode") == "levels":
+        # ЧЕРНОВЫЕ ПРОХОДЫ ПОСТОЯННОГО ДИАМЕТРА — заводская схема (LATHE_ROUGH_MODE
+        # = "levels"). Каждый проход идёт вдоль оси на своём радиусе и обрывается
+        # там, где профиль поднимается выше него; шаг между уровнями = глубина
+        # резания. Так устроен T1 в заводской UST1.NC: 11 проходов с шагом 0.465
+        # мм по радиусу, конец каждого лежит точно на контуре.
+        #
+        # РИСК, о котором нельзя забывать: такой проход НЕ следует форме детали,
+        # и на уклоне вспомогательная кромка резца идёт по уже обточенной стенке
+        # позади. Ровно поэтому черновая постоянного радиуса была убрана в июле
+        # (замерено: 0.29 мм зареза на уступе 43°, 1.23 мм на 75°). Завод так
+        # работает потому, что у его пластины φ₁ = 32°, а шаблон NX в ISV даёт
+        # 17.5° — то есть в симуляции волочение будет БОЛЬШЕ настоящего.
+        ap_r = max(0.05, ap)
+        allow = max(0.0, allowance)
+        base = _simplify(src_rough, params.get("line_tol", 0.01))
+        target = [(z, min(r + allow, r_stock)) for z, r in base]
+        r_min = min(r for _, r in target)
+        n_lv = max(0, -(-int((r_stock - r_min) * 1000) // int(ap_r * 1000)))
+        for i in range(n_lv):
+            level = max(r_min, r_stock - (i + 1) * ap_r)
+            z_stop = level_pass_end(target, level)
+            if z_stop is None or z_stop >= target[0][0] - 0.05:
+                continue                     # проход ничего не снимает
+            n_rough += 1
+            op(f"Rough{n_rough}")
+            g.append(f"G0 {X(retract_r)} Z{z_top + clear:.3f}")
+            g.append(f"G0 {X(level)} Z{z_top + clear:.3f}")
+            g.append(f"G1 {X(level)} Z{z_stop:.3f} {fmt(feed)}")
+            # отвод по радиусу: всё, что снаружи уровня выше z_stop, этим же
+            # проходом уже снято, поэтому наружу резец идёт по воздуху
+            g.append(f"G0 {X(retract_r)} Z{z_stop:.3f}")
+            g.append(f"(Finish operation: Rough{n_rough})")
+    elif params.get("contour_rough", False):
         ap_r = max(0.05, ap)
         allow = max(0.0, allowance)
         deepest = max(r_stock - r for _, r in src_rough)
@@ -577,6 +638,44 @@ def generate(prof_data, params):
             g.append(f"G0 {X(retract_r)} Z{z_end:.3f}")
             g.append(f"(Finish operation: Rough{i + 1})")
 
+    # 2b. ПОЛУЧИСТОВОЙ ПРОХОД — граница между стадиями, по контуру, с припуском
+    #
+    # Зачем он нужен именно при черновой УРОВНЯМИ. Проходы постоянного диаметра
+    # не следуют форме, и на каждом уклоне остаётся лестница высотой в шаг: на
+    # 14-31A при ap 0.465 чистовой резец шёл бы то по 0.2 мм припуска, то по
+    # 0.2 + 0.465 = 0.665. Переменный припуск — это переменная сила резания,
+    # переменное отжатие и след на поверхности ровно там, где припуск менялся.
+    # Получистовой проход срезает лестницу и оставляет припуск РОВНЫМ.
+    #
+    # В режиме "contour" он не нужен и не печатается: последний контурный слой
+    # там уже идёт со смещением ровно `allowance`, то есть сам является этой
+    # стадией (off = allow при i = n_rough−1).
+    #
+    # Идёт ЧЕРНОВЫМ резцом: это ещё съём, а не окончательная поверхность, и
+    # предел у него свой — `src_rough`. Там, где чистовой резец заходит глубже
+    # (острее ромб, больше φ₁), припуск останется больше; величина считается и
+    # печатается в отчёт как «в уступах снимает до N мм».
+    n_semi = 0
+    if (params.get("contour_rough", False) and params.get("semi_finish", True)
+            and params.get("rough_mode") == "levels" and allowance > 0):
+        pts = [(z, min(r + allowance, r_stock)) for z, r in
+               _simplify(src_rough, params.get("line_tol", 0.01))]
+        pts = [pt for j, pt in enumerate(pts)
+               if not (0 < j < len(pts) - 1
+                       and pt[1] >= r_stock - 1e-9
+                       and pts[j - 1][1] >= r_stock - 1e-9
+                       and pts[j + 1][1] >= r_stock - 1e-9)]
+        if len(pts) > 1:
+            n_semi = 1
+            op("SemiFinish")
+            g.append(f"G0 {X(retract_r)} Z{pts[0][0] + clear:.3f}")
+            g.append(f"G0 {X(pts[0][1])} Z{pts[0][0] + clear:.3f}")
+            g.append(f"G1 {X(pts[0][1])} Z{pts[0][0]:.3f} {fmt(feed)}")
+            for z, r in pts[1:]:
+                g.append(f"G1 {X(r)} Z{z:.3f} {fmt(feed)}")
+            g.append(f"G0 {X(retract_r)} Z{z_end:.3f}")
+            g.append("(Finish operation: SemiFinish)")
+
     # ЧИСТОВОЙ РЕЗЕЦ T8 — отдельным инструментом, как на заводе
     t_fin = params.get("finish_tool_number", 8)
     if fin_tool:
@@ -588,6 +687,57 @@ def generate(prof_data, params):
         g.append(f"(Tool T{t_fin}: finishing insert "
                  f"{params.get('finish_insert', 'VCMT110304')}, "
                  f"nose R{nose_r:g} mm, {geo_finish[1]:g}° rhombic)")
+
+    # 3a. ПРЕДВАРИТЕЛЬНЫЙ ПРОХОД ЧИСТОВЫМ РЕЗЦОМ — там, куда черновой не заходит
+    #
+    # Получистовой (2b) идёт ЧЕРНОВЫМ резцом и потому оставляет ровный припуск
+    # только в пределах ЕГО огибающей. В утопленный уступ 55°-ромб (φ₁ = 32°) не
+    # заходит, а 35°-ромб (φ₁ = 52°) заходит, и там чистовому досталось бы не
+    # 0.2 мм, а до 0.56 — то есть ровно то, ради чего получистовой и делался,
+    # в этих зонах не выполнялось.
+    #
+    # Поэтому чистовой резец сначала проходит эти зоны САМ, оставляя тот же
+    # припуск, и только потом идёт общий чистовой проход. Так же устроен завод:
+    # их переход 04 — это T2 (35°-ромб), выбирающий уступ Ø20.2…22.9 на
+    # z −19.8…−16.6 ДО общего чистового перехода 05.
+    #
+    # Зона = там, где огибающая чернового выше огибающей чистового больше чем на
+    # припуск. Границы расширяются до места, где припуск уже ровный, поэтому
+    # проход входит и выходит на уже готовой поверхности, без врезания.
+    n_pre = 0
+    pre_zones = []
+    if fin_tool and params.get("pre_finish", True) and allowance > 0:
+        tol = 0.02
+        pad_mm = 0.5
+        extra = [(z, _r_at(src_rough, z) - r) for z, r in src]
+        deep = [i for i, (_, d) in enumerate(extra) if d > allowance + tol]
+        runs = []
+        for i in deep:
+            if runs and i - runs[-1][1] <= 2:
+                runs[-1][1] = i
+            else:
+                runs.append([i, i])
+        step_z = abs(src[1][0] - src[0][0]) if len(src) > 1 else 0.05
+        pad = max(1, int(round(pad_mm / max(step_z, 1e-6))))
+        for a, b in runs:
+            a, b = max(0, a - pad), min(len(src) - 1, b + pad)
+            pts = _simplify([(z, r + allowance) for z, r in src[a:b + 1]],
+                            params.get("line_tol", 0.01))
+            if len(pts) < 2:
+                continue
+            n_pre += 1
+            pre_zones.append({"z_hi": round(pts[0][0], 3),
+                              "z_lo": round(pts[-1][0], 3),
+                              "max_extra": round(max(d for _, d in extra[a:b + 1]), 3)})
+            op(f"PreFinish{n_pre}")
+            # подвод РАДИАЛЬНЫЙ: на границе зоны материал стоит ровно на нашем
+            # радиусе, поэтому резец приходит на поверхность, а не в неё
+            g.append(f"G0 {X(retract_r)} Z{pts[0][0]:.3f}")
+            g.append(f"G1 {X(pts[0][1])} Z{pts[0][0]:.3f} {fmt(feed_finish)}")
+            for z, r in pts[1:]:
+                g.append(f"G1 {X(r)} Z{z:.3f} {fmt(feed_finish)}")
+            g.append(f"G0 {X(retract_r)} Z{pts[-1][0]:.3f}")
+            g.append(f"(Finish operation: PreFinish{n_pre})")
 
     op("Finish")
     g.append(f"G0 {X(retract_r)} Z{src[0][0] + clear:.3f}")
@@ -937,11 +1087,14 @@ def generate(prof_data, params):
              "second_setup": [(lz["z_hi"], lz["z_lo"], lz["volume_mm3"])
                               for lz in second_setup],
              "finish_tool": t_fin if fin_tool else 0,
-             # насколько глубже припуска чистовому приходится резать в уступах,
-             # куда черновой не заходит
+             # насколько глубже припуска чистовому пришлось бы резать в уступах,
+             # куда черновой не заходит. С PreFinish этого больше не происходит:
+             # зоны выбираются чистовым резцом заранее, с тем же припуском.
              "finish_max_depth": (max((rr - r for (_, rr), (_, r)
                                        in zip(src_rough, src)), default=0.0)
                                   + allowance) if fin_tool else 0.0,
+             "pre_finish": n_pre, "pre_finish_zones": pre_zones,
+             "semi_finish": n_semi,
              "uncut_mm3": uncut}
     return g, stats
 

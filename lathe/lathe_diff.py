@@ -14,6 +14,22 @@ lathe_diff.py — ОСЕВОЙ анализатор точения: где им�
 
 CLI:  python lathe/lathe_diff.py деталь.step результат.step [отчёт.md] [--pitch 0.25]
 API:  lathe_diff.analyse(part, result) -> dict
+
+────────────────────────────────────────────────────────────────────────────────
+`z_shift` — ТОЛЬКО ИНСТРУМЕНТ АНАЛИЗА. Он сдвигает результат вдоль оси перед
+сверкой и отвечает на вопрос «если бы единственной бедой было смещение на δz,
+совпало бы остальное». В ПАЙПЛАЙН ОН НЕ ВХОДИТ И ВХОДИТЬ НЕ ДОЛЖЕН:
+
+  * генерация, оба симулятора и конфиг о нём не знают — проверено grep'ом,
+    он живёт ровно в двух файлах, этом и `cam/lathe_diff_worker.py`;
+  * умолчание 0.0 и НЕ читается из конфига: не должно существовать настройки,
+    которой можно молча включить сдвиг на всех прогонах;
+  * CLI-флага намеренно нет — вызывается только из Python, чтобы случайно не
+    попасть в пакетный прогон и не подкрасить опубликованные цифры.
+
+Сдвинутое число нельзя выдавать за результат программы: металл от сдвига
+никуда не девается. Это ответ на диагностический вопрос, а не оценка детали.
+────────────────────────────────────────────────────────────────────────────────
 """
 
 import argparse
@@ -43,6 +59,7 @@ _RE_BORE_D = re.compile(r"boring bar, to D\s*(\d+(?:\.\d+)?)")
 _RE_DRILL_D = re.compile(r"twist drill D\s*(\d+(?:\.\d+)?)")
 _RE_OP = re.compile(r"\(Begin operation:\s*([A-Za-z0-9_]+)\)")
 _RE_XZ = re.compile(r"([XZ])(-?\d+(?:\.\d+)?)")
+_RE_G = re.compile(r"^G(\d+)")
 
 
 def limits_from_moves(text):
@@ -67,14 +84,19 @@ def limits_from_moves(text):
         if m:
             op = m.group(1).lower()
             continue
-        if not (s.startswith("G0") or s.startswith("G1")):
+        mg = _RE_G.match(s)
+        if not mg:
             continue
+        code = int(mg.group(1))                    # G0/G00, G1/G01, G2/G02…
+        if code > 3:
+            continue                               # G18, G54, G95, G97 — не ход
+        z_prev = z
         for axis, val in _RE_XZ.findall(s):        # координаты модальные
             if axis == "X":
                 x = float(val)
             else:
                 z = float(val)
-        if z is None or not s.startswith("G1"):
+        if z is None or code == 0:
             continue
         if "partoff" in op:
             continue
@@ -85,7 +107,12 @@ def limits_from_moves(text):
         elif "drill" in op:
             if "center" not in op:
                 drill = z if drill is None else min(drill, z)
-        else:
+        elif z_prev is not None and abs(z - z_prev) > 1e-6:
+            # ПРОДОЛЬНЫЙ ход, и только он. Врезание на одном z (отрезка, канавка,
+            # подрезка торца) осевую границу зоны не задаёт: отрезной уходит за
+            # торец детали (у завода на z −51) и утащил бы границу за собой.
+            # В чужой программе на имя операции полагаться нельзя — импортёр
+            # метит отрезку тем же `Turn`, что и точение.
             outer = z if outer is None else min(outer, z)
     return outer, (bore if bore is not None else drill), r_bore
 
@@ -139,7 +166,8 @@ def limits_from_gcode(path):
 
 def analyse(part_path, result_path, json_path=None, pitch=None, z_bin=None,
             angles=6, prof_step=0.05, min_thickness=None, z_limit=None,
-            z_limit_bore=None, bore_radius=None, timeout=1800):
+            z_limit_bore=None, bore_radius=None, z_shift=0.0, timeout=1800,
+            film=None):
     """Возвращает dict с by_z и profile (см. cam/lathe_diff_worker.py).
 
     Умолчания берутся из конфига: `LATHE_DIFF_PITCH`, `LATHE_DIFF_Z_BIN` и общий
@@ -151,6 +179,10 @@ def analyse(part_path, result_path, json_path=None, pitch=None, z_bin=None,
         z_bin = float(getattr(config, "LATHE_DIFF_Z_BIN", 1.0))
     if min_thickness is None:
         min_thickness = float(getattr(config, "DIFF_MIN_THICKNESS", 0.0))
+    if film is None:                    # поправка на плёнку моста в ISV, см. конфиг
+        film = (float(getattr(config, "LATHE_DIFF_FILM_FACTOR", 0.41))
+                * float(getattr(config, "LATHE_NOSE_RADIUS", 0.4))
+                if getattr(config, "LATHE_DIFF_FILM", True) else 0.0)
     fc = freecad_cam.find_freecadcmd()
     if not fc:
         raise RuntimeError("freecadcmd не найден (укажите FREECAD_CMD в конфиге)")
@@ -175,7 +207,7 @@ def analyse(part_path, result_path, json_path=None, pitch=None, z_bin=None,
         "angles": angles, "prof_step": prof_step,
         "min_thickness": min_thickness,
         "z_limit": z_limit, "z_limit_bore": z_limit_bore,
-        "bore_radius": bore_radius,
+        "bore_radius": bore_radius, "z_shift": z_shift, "film": float(film),
     }
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
                                      encoding="utf-8") as tmp:
@@ -273,7 +305,12 @@ def report(data, min_len=0.15, tol=0.02):
                  f"из {chk + skp:.0f} ({share:.0f} %), остальное оставлено "
                  f"следующему установу и в счёт не идёт")
     L.append(f"Недорез {data['undercut_total_mm3']:.1f} мм³, "
-             f"зарез {data['overcut_total_mm3']:.1f} мм³ (воксели)")
+             f"зарез {data['overcut_total_mm3']:.1f} мм³ "
+             f"(воксели, БЕЗ поправок)")
+    if data.get("film_mm"):
+        L.append(f"**С поправкой на плёнку моста {data['film_mm']:.3f} мм по "
+                 f"радиусу: недорез {data['undercut_fixed_mm3']:.1f} мм³, "
+                 f"зарез {data['overcut_fixed_mm3']:.1f} мм³** (по поясам)")
     if data.get("thin_film_mm3"):
         L.append(f"Отсечено фильтром толщины вдоль оси "
                  f"({data.get('min_thickness_mm')} мм): "
@@ -284,15 +321,29 @@ def report(data, min_len=0.15, tol=0.02):
     L.append("Столбец «по радиусу» — объём пояса, делённый на длину окружности: "
              "для тела вращения это точная толщина слоя. Плюс — металл остался, "
              "минус — срезано лишнее.")
+    if data.get("film_mm"):
+        L.append("")
+        L.append(f"Столбец «с поправкой» — то же после снятия плёнки моста "
+                 f"({data['film_mm']:.3f} мм). Прочерк — поправка к поясу не "
+                 f"применялась: грани под ключ, торец/уступ (там расхождение "
+                 f"осевое) или отверстие (у расточного своя привязка).")
     L.append("")
-    L.append("| z от | z до | r ном. | недорез, мм³ | зарез, мм³ | по радиусу, мм | |")
-    L.append("|---:|---:|---:|---:|---:|---:|---|")
+    hdr = "| z от | z до | r ном. | недорез, мм³ | зарез, мм³ | по радиусу, мм |"
+    sep = "|---:|---:|---:|---:|---:|---:|"
+    if data.get("film_mm"):
+        hdr += " с поправкой, мм |"
+        sep += "---:|"
+    L.append(hdr + " |")
+    L.append(sep + "---|")
     for b in data["by_z"]:
         if b["under_mm3"] < 0.05 and b["over_mm3"] < 0.05:
             continue
         rn = f"{b['r_nom']:.2f}" if b.get("r_nom") is not None else "—"
         dr = b.get("dr_under_mm", 0.0) + b.get("dr_over_mm", 0.0)
         drs = "—" if "r_nom" not in b else f"{dr:+.3f}"
+        if data.get("film_mm"):
+            drs += (f" | {b['dr_fixed_mm']:+.3f}" if b.get("film_applied")
+                    else " | —")
         what = []
         if b.get("zone"):
             what.append(b["zone"])
@@ -350,6 +401,12 @@ def main():
     ap.add_argument("--z-limit-bore", type=float,
                     help="докуда расточено отверстие")
     ap.add_argument("--bore-radius", type=float, help="радиус отверстия, мм")
+    ap.add_argument("--film", type=float,
+                    help="поправка на плёнку моста в ISV, мм по радиусу "
+                         "(по умолчанию FACTOR·R из конфига)")
+    ap.add_argument("--no-film", action="store_true",
+                    help="без поправки на плёнку — для замера с настоящего "
+                         "станка или для legacy-симулятора")
     a = ap.parse_args()
     lim = limits_from_gcode(a.gcode) if a.gcode else {}
     if a.gcode and not lim:
@@ -366,7 +423,8 @@ def main():
     js = (os.path.splitext(a.out)[0] + ".json") if a.out else None
     data = analyse(a.part, a.result, js, pitch=a.pitch, z_bin=a.z_bin,
                    angles=a.angles, prof_step=a.prof_step,
-                   min_thickness=a.min_thickness, **lim)
+                   min_thickness=a.min_thickness,
+                   film=(0.0 if a.no_film else a.film), **lim)
     text = report(data, tol=a.tol)
     print(text)
     if a.out:

@@ -266,12 +266,76 @@ def enrich_bins(bins, grid, prm, prn, z_limit=None, bore_radius=0.0):
             b["dr_over_mm"] = round(-b["over_mm3"] / k, 3)
 
 
+def apply_film(bins, film):
+    """Поправка на ПЛЁНКУ моста в NX ISV — известное равномерное смещение.
+
+    Что поправляем. ISV ставит в запрограммированную координату свою точку
+    модели резца, сидящую на 0.59·R от центра скругления, тогда как программа
+    (и любая стойка) считает от точки по ISO — пересечения касательных к дуге,
+    параллельных осям, на 1.00·R. Разница 0.41·R по радиусу режется лишней.
+    Замерено на одной программе при трёх радиусах: 0.022 / 0.164 / 0.322 при
+    R = 0.1 / 0.4 / 0.8, и подтверждено якорем — положение «центр скругления»
+    даёт ровно −1.00·R. Подробно: demo/0807/02_film, .claude/CLAUDE.md I19.
+
+    Это КАЛИБРОВКА ПРИБОРА, а не подгонка результата: величина выведена из
+    независимого замера, одна на все прогоны и не настраивается под деталь.
+    Сырые числа при этом никуда не деваются — отчёт печатает и их тоже.
+
+    Модель поправки — равномерный сдвиг результата по радиусу на +film:
+    отклонение пояса dr становится dr + film, и объём пересчитывается обратно
+    через длину окружности. Поэтому поправка не просто «вычитает зарез»: там,
+    где программа на самом деле оставила металл, а плёнка его съела, объём
+    ПЕРЕТЕКАЕТ из зареза в недорез — как и должно быть.
+
+    Поправка НЕ применяется к поясу, если:
+      * `axisym=False`  — грани под ключ, точением не берутся;
+      * `face=True`     — торец или уступ: расхождение там осевое, а осевая
+                          составляющая смещения у нас не измерена;
+      * `zone="отверстие"` — у расточного своя привязка (tp 2 против 4) и своя
+                          плёнка (+0.075), не охарактеризованная.
+    """
+    tot_u = tot_o = 0.0
+    for b in bins:
+        dz = abs(b["z1"] - b["z0"])
+        r_nom = b.get("r_nom")
+        ok = (film > 0 and r_nom and r_nom > 0.5 and b.get("axisym") is not False
+              and not b.get("face") and b.get("zone") != "отверстие")
+        if not ok:
+            b["film_applied"] = False
+            tot_u += b["under_mm3"]
+            tot_o += b["over_mm3"]
+            continue
+        k = 2.0 * math.pi * float(r_nom) * dz
+        dr = b.get("dr_under_mm", 0.0) + b.get("dr_over_mm", 0.0) + film
+        u, o = (dr * k, 0.0) if dr >= 0 else (0.0, -dr * k)
+        b["film_applied"] = True
+        b["dr_fixed_mm"] = round(dr, 3)
+        b["under_fixed_mm3"] = round(u, 2)
+        b["over_fixed_mm3"] = round(o, 2)
+        tot_u += u
+        tot_o += o
+    return tot_u, tot_o
+
+
 def main():
     with open(os.environ["LATHE_DIFF_PARAMS"], encoding="utf-8") as f:
         p = json.load(f)
 
     part = load_solid(p["part"])
     result = load_solid(p["result"])
+    # ДИАГНОСТИЧЕСКИЙ осевой сдвиг результата. Если станок или стойка исполнили
+    # программу со смещением вдоль оси, расхождение с моделью растёт на уклонах
+    # и не растёт на цилиндрах — и тогда существует δz, при котором расхождение
+    # резко падает. Обычная ошибка траектории так не лечится ни при каком δz.
+    #
+    # ТОЛЬКО АНАЛИЗ. В пайплайн не входит: ни генерация, ни симуляторы, ни
+    # конфиг о нём не знают, умолчание 0.0, из конфига НЕ читается. Сдвинутое
+    # число — ответ на диагностический вопрос, а не оценка детали.
+    z_shift = float(p.get("z_shift") or 0.0)
+    if z_shift:
+        result = result.copy()
+        result.translate(App.Vector(0.0, 0.0, z_shift))
+        log(f"результат сдвинут по оси на {z_shift:+.3f} мм (диагностика)")
     pb, rb = part.BoundBox, result.BoundBox
     log(f"деталь {abs(part.Volume) / 1000.0:.2f} см³, результат "
         f"{abs(result.Volume) / 1000.0:.2f} см³")
@@ -336,6 +400,8 @@ def main():
         part, result, pitch, z_bin, min_thick,
         z_limit, z_limit_bore, bore_radius)
     enrich_bins(bins, grid, prm, prn, z_limit, bore_radius)
+    film = float(p.get("film") or 0.0)
+    fix_u, fix_o = apply_film(bins, film)
 
     data = {
         "method": (f"воксельный рей-кастинг, шаг {pitch:.2f} мм, пояса по "
@@ -344,6 +410,7 @@ def main():
         "part_volume_mm3": round(abs(part.Volume), 1),
         "result_volume_mm3": round(abs(result.Volume), 1),
         "z_range": [round(z_lo, 2), round(z_hi, 2)],
+        "z_shift": z_shift or None,
         "z_limit": z_limit,
         "z_limit_bore": z_limit_bore,
         "bore_radius": bore_radius or None,
@@ -353,6 +420,12 @@ def main():
         "thin_film_mm3": round(thin, 1),
         "undercut_total_mm3": round(tot_u, 1),
         "overcut_total_mm3": round(tot_o, 1),
+        # с поправкой на плёнку моста в ISV (см. apply_film). Считается ПО
+        # ПОЯСАМ, поэтому с воксельными суммами сходится не побитово: у пояса
+        # отклонение одно на всю его боковую поверхность.
+        "film_mm": film or None,
+        "undercut_fixed_mm3": round(fix_u, 1) if film else None,
+        "overcut_fixed_mm3": round(fix_o, 1) if film else None,
         "by_z": bins,
         "profile": prof,
         "profile_note": prof_note,

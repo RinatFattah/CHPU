@@ -54,6 +54,107 @@ _ROTATE_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "_rotate_worker.py")
 
 
+def is_faceted_step(path):
+    """Фасетное тело (результат ISV) или настоящий солид?
+
+    У фасетного экспорта вершины лежат одним `COORDINATES_LIST`, а граней
+    B-Rep (`ADVANCED_FACE`) нет вовсе. Различать нужно потому, что OCCT
+    фасетный STEP не крутит — `exportStep` отдаёт 0 граней (см. I8).
+
+    Файл читается ЦЕЛИКОМ: `COORDINATES_LIST` стоит после многомегабайтного
+    блока вершин, и по первым сотням килобайт фасетное тело не опознаётся.
+    """
+    try:
+        text = open(path, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return False
+    return "COORDINATES_LIST" in text and "ADVANCED_FACE" not in text
+
+
+def transform_facet_step(in_path, out_path, axis=(0.0, 1.0, 0.0), angle=90.0,
+                         offset=(0.0, 0.0, 0.0)):
+    """Аффинное преобразование ФАСЕТНОГО STEP прямо по тексту.
+
+    Единственный способ повернуть результат ISV: OCCT фасеты не крутит, а
+    внутри NX это делается вершинами в два прохода (I8) — сюда её тащить незачем.
+
+    Правятся ДВА места, и второе легко пропустить:
+      * `COORDINATES_LIST` — вершины сетки, поворот со сдвигом;
+      * `COMPLEX_TRIANGULATED_FACE` — там СРАЗУ ЗА СЧЁТЧИКОМ лежит список
+        НОРМАЛЕЙ, отдельной сущности `*NORMAL*` в файле нет, поэтому поиском по
+        типам они не находятся. Нормали поворачиваются БЕЗ сдвига. Если их не
+        тронуть, тело едет, а освещение остаётся от старой ориентации — грани
+        затеняются как попало, и по телу идут ложные «разрезы».
+
+    Нормали отличаются от списка индексов треугольников тем, что у них есть
+    десятичная точка: индексы — целые. По этому признаку они и берутся.
+
+    Остальные `CARTESIAN_POINT` в файле — камеры и виды, к геометрии сетки
+    отношения не имеют, размещение тела единичное (подтверждено тем, что
+    радиусы читаются из списка напрямую и сходятся).
+
+    Поворот — формула Родрига, та же семантика, что у `_rotate_step`;
+    он собственный (det = +1), поэтому намотка граней остаётся верной.
+    """
+    ax, ay, az = axis
+    n = math.sqrt(ax * ax + ay * ay + az * az) or 1.0
+    kx, ky, kz = ax / n, ay / n, az / n
+    th = math.radians(float(angle))
+    c, s = math.cos(th), math.sin(th)
+    ox, oy, oz = offset
+
+    def rot(x, y, z, shift=True):
+        cx = ky * z - kz * y                      # k × v
+        cy = kz * x - kx * z
+        cz = kx * y - ky * x
+        d = (kx * x + ky * y + kz * z) * (1.0 - c)   # k (k·v)(1−cosθ)
+        return (x * c + cx * s + kx * d + (ox if shift else 0.0),
+                y * c + cy * s + ky * d + (oy if shift else 0.0),
+                z * c + cz * s + kz * d + (oz if shift else 0.0))
+
+    text = open(in_path, encoding="utf-8", errors="replace").read()
+    num = r"-?\d+(?:\.\d*)?(?:E[+-]?\d+)?"
+    fnum = r"-?\d+\.\d*(?:E[+-]?\d+)?"            # с точкой: не индекс
+    trip = re.compile(rf"\(\s*({num})\s*,\s*({num})\s*,\s*({num})\s*\)")
+    ftrip = re.compile(rf"\(\s*({fnum})\s*,\s*({fnum})\s*,\s*({fnum})\s*\)")
+
+    def replacer(shift):
+        n = [0]
+
+        def sub(mm):
+            n[0] += 1
+            x, y, z = rot(*(float(g) for g in mm.groups()), shift=shift)
+            return f"({x:.9f},{y:.9f},{z:.9f})" if not shift else \
+                   f"({x:.6f},{y:.6f},{z:.6f})"
+        return sub, n
+
+    # 1. вершины сетки
+    m = re.search(r"(COORDINATES_LIST\s*\([^(]*\(\()(.*?)(\)\s*\)\s*\)\s*;)",
+                  text, re.S)
+    if not m:
+        raise RuntimeError(f"в {os.path.basename(in_path)} нет COORDINATES_LIST "
+                           f"— это не фасетное тело")
+    sub_v, nv = replacer(True)
+    text = text[:m.start()] + m.group(1) + trip.sub(sub_v, m.group(2)) \
+        + m.group(3) + text[m.end():]
+
+    # 2. НОРМАЛИ — внутри COMPLEX_TRIANGULATED_FACE, поворот без сдвига
+    nn = [0]
+    f = re.search(r"COMPLEX_TRIANGULATED_FACE\s*\(.*?\)\s*;", text, re.S)
+    if f:
+        sub_n, nn = replacer(False)
+        text = text[:f.start()] + ftrip.sub(sub_n, f.group(0)) + text[f.end():]
+    else:
+        _log("warn: COMPLEX_TRIANGULATED_FACE не найден — нормали не повёрнуты")
+
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    _log(f"фасет преобразован: {nv[0]} вершин, {nn[0]} нормалей, поворот "
+         f"{angle:g}° вокруг ({kx:g}, {ky:g}, {kz:g}), "
+         f"сдвиг ({ox:g}, {oy:g}, {oz:g})")
+    return out_path
+
+
 def _rotate_step(in_path, out_path, axis=(0.0, 1.0, 0.0), angle=90.0):
     """Повернуть BREP-STEP (деталь/заготовку) в другую раму через freecadcmd.
 
@@ -312,6 +413,16 @@ def write_to_ini(machine_dir, nose_radius, tool_number=1,
 
     if tools:                       # готовый список (обычно из tools_from_gcode)
         tools = [dict(t) for t in tools]
+        if length_x or length_z:
+            # ВЫЛЕТ РЕЗЦА в таблице стойки — то же самое, что замер инструмента
+            # на приборе у настоящего станка: он сообщает стойке, ГДЕ реально
+            # лежит вершина относительно точки привязки резцедержателя. У нас
+            # он по умолчанию нулевой, то есть мы утверждаем «вершина ровно в
+            # точке привязки» — а модель пластины в NX имеет свою геометрию
+            # относительно той же точки, и привязки расходятся.
+            for t in tools:
+                if int(t.get("type", 500)) in (500, 510):
+                    t["lx"], t["lz"] = length_x, length_z
         for t in (extra_tools or []):
             if t and t.get("n"):
                 tools.append(dict(t))
@@ -380,7 +491,10 @@ def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
              relief_angle=None, tool_params=None, groove_width=0.0,
              groove_tool_number=2, groove_params=None,
              left_tool_number=0, finish_tool_number=0, finish_nose_angle=35.0,
-             finish_nose_radius=0.4, finish_insert_size=6.35):
+             finish_nose_radius=0.4, finish_insert_size=6.35,
+             tool_length_x=0.0, tool_length_z=0.0, track_point=None,
+             insert_shape=None, finish_insert_shape=None,
+             holder_style=None):
     """Прогоняет токарный G-Code на виртуальном станке NX ISV.
 
     Результат возвращается в раме ДЕТАЛИ (ось Z): заготовку сажают на ось
@@ -410,6 +524,7 @@ def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
     _log("инструменты программы: "
          + ", ".join(f"T{t['n']}({t['name']})" for t in tool_list))
     write_to_ini(mdir, nose_radius, groove_width=groove_width,
+                 length_x=tool_length_x, length_z=tool_length_z,
                  groove_tool_number=groove_tool_number,
                  left_tool_number=left_tool_number, tools=tool_list)
 
@@ -497,7 +612,13 @@ def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
     rot_angle = float(rot_angle) if rot_angle is not None else 90.0
     if do_rotate:
         stock_for_nx = os.path.join(tdir, f"{stem}_stock_nx.stp")
-        _rotate_step(stock_step_path, stock_for_nx, rot_axis, rot_angle)
+        # Заготовкой второго установа служит ФАСЕТНЫЙ результат первого — его
+        # OCCT не крутит, поэтому там работает текстовое преобразование.
+        if is_faceted_step(stock_step_path):
+            transform_facet_step(stock_step_path, stock_for_nx,
+                                 rot_axis, rot_angle)
+        else:
+            _rotate_step(stock_step_path, stock_for_nx, rot_axis, rot_angle)
         _log("заготовка повёрнута на ось шпинделя станка")
     else:
         stock_for_nx = stock_step_path
@@ -523,6 +644,26 @@ def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
         "insert_size": (insert_size if insert_size is not None
                         else getattr(config, "LATHE_INSERT_SIZE", 6.35)),
         "orient_angle": getattr(config, "NX_LATHE_ORIENT_ANGLE", None),
+        # Точка отслеживания резца — какую точку пластины ISV ставит в
+        # запрограммированную координату (см. set_track_point в журнале и
+        # runs/80_track_point). Умолчание None = как в шаблоне NX.
+        "track_point": (track_point if track_point is not None
+                        else getattr(config, "NX_LATHE_TRACK_POINT", None)),
+        # Форма пластины (Diamond55 у нас по умолчанию, всего 20 вариантов —
+        # см. set_insert_shape в журнале). Не путать с подтипом: тот задаёт
+        # державку и руку. None = как в шаблоне NX.
+        "insert_shape": (insert_shape if insert_shape is not None
+                         else getattr(config, "NX_LATHE_INSERT_SHAPE", None)),
+        # Чистовой в программе — VCMT 35°, а подтипа OD_35_R в шаблонах NX
+        # НЕТ, поэтому без явной формы он моделируется 55°-ромбом и волочит
+        # там, где настоящий не волочит (runs/87, конус на шестиграннике).
+        "finish_insert_shape": (
+            finish_insert_shape if finish_insert_shape is not None
+            else getattr(config, "NX_LATHE_FINISH_INSERT_SHAPE", None)),
+        # Стиль державки = угол в плане φ (коды ISO 5608; J = 93°, как считает
+        # наш генератор). Шаблон NX даёт 107.5° — см. set_holder_style.
+        "holder_style": (holder_style if holder_style is not None
+                         else getattr(config, "NX_LATHE_HOLDER_STYLE", None)),
         # Канавочный резец T2. Проходной в канавку не лезет (волочит
         # вспомогательной кромкой по стенке позади), поэтому генератор отдаёт
         # канавки и отрезку отдельному инструменту — надо создать его и в ISV,
