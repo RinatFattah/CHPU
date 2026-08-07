@@ -430,6 +430,11 @@ NX_LATHE_GROOVE_GEOMETRY = True           # False = взять геометри�
 NX_LATHE_GROOVE_PARAMS  = {}              # произвольные свойства билдера T2
 NX_LATHE_TOOL_PARAMS    = {}      # произвольные свойства TurnToolBuilder, напр.
                                   # {"ThicknessBuilder": 3.18}
+# Какие установы гонять в ISV при --two-setups: "both" (по умолчанию — оба
+# подряд, затем сборка итоговой детали), "1" или "2" — только один, без сборки.
+# Каждый установ идёт по ЧИСТОМУ ПРУТКУ: подавать фасетный результат первого
+# заготовкой во второй нельзя, это стоит лишних 0.15 мм по радиусу (runs/87).
+LATHE_SIM_SETUP         = "both"
 NX_LATHE_ROTATE_TO_SPINDLE = True # сажать заготовку на физическую ось шпинделя
 NX_LATHE_SPINDLE_ROT_AXIS = None  # ручной override оси поворота (иначе зонд)
 NX_LATHE_SPINDLE_ROT_ANGLE = None # ручной override угла поворота, °
