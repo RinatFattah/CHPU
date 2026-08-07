@@ -1,9 +1,10 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
+// Порядок этапов. Внимание: это НЕ прямая — «apply» (правки агента) возвращает
+// в «generate», и цикл повторяется до «в допуске» либо до лимита итераций.
 const PHASES = ["prepare", "convert", "generate", "simulate", "diff", "llm",
                 "apply", "compare", "done"];
-const PHASE_TITLES = ["подготовка", ".prt → STEP", "генерация", "симуляция NX",
-                      "сверка", "агент", "правки", "сборка", "готово"];
+const CYCLE = ["generate", "simulate", "diff", "llm", "apply"];
 let SPEC = null, JOB = null, ES = null, TIMER = null;
 
 // ── параметры ────────────────────────────────────────────────────────────────
@@ -77,11 +78,19 @@ function wireFile(inputId, nameId, emptyText) {
 }
 
 // ── прогресс ─────────────────────────────────────────────────────────────────
-function renderSteps(phase) {
-  const at = PHASES.indexOf(phase);
-  $("steps").innerHTML = PHASE_TITLES.map((t, i) =>
-    `<li class="${i < at ? "past" : i === at ? "now" : ""}">${t}</li>`
-  ).join("");
+function renderSteps(state) {
+  const phase = state.phase, at = PHASES.indexOf(phase);
+  const inCycle = CYCLE.indexOf(phase);
+  document.querySelectorAll(".pipeline [data-phase]").forEach((el) => {
+    const p = el.dataset.phase, i = PHASES.indexOf(p), c = CYCLE.indexOf(p);
+    el.classList.toggle("now", p === phase);
+    // «Пройдено» внутри цикла считается ОТ НАЧАЛА ТЕКУЩЕЙ ИТЕРАЦИИ: на второй
+    // итерации генерация снова впереди, а не позади.
+    el.classList.toggle("past", c >= 0 && inCycle >= 0 ? c < inCycle : i < at);
+  });
+  $("cycle").classList.toggle("active", inCycle >= 0);
+  $("cyc-iter").textContent = state.iters
+    ? `${state.iter} из ${state.iters}` : "—";
 }
 
 function addFeed(ev) {
@@ -145,7 +154,7 @@ function tick(state) {
   $("phase").classList.toggle("spin", state.status === "running");
   $("iter").textContent = state.iters
     ? `итерация ${state.iter} из ${state.iters}` : "";
-  renderSteps(state.phase);
+  renderSteps(state);
 }
 
 function startClock(state) {
@@ -162,6 +171,7 @@ function follow(state) {
   JOB = state.id;
   $("setup").hidden = true;
   $("progress").hidden = false;
+  document.querySelector("main").classList.add("solo");
   $("feed").innerHTML = "";
   $("form-error").hidden = true;
   tick(state);
@@ -228,6 +238,7 @@ async function start() {
   });
   $("again").addEventListener("click", () => {
     $("progress").hidden = true; $("setup").hidden = false;
+    document.querySelector("main").classList.remove("solo");
     $("start").disabled = !$("model").files[0];
     $("result").hidden = true; $("metrics-box").hidden = true;
   });
