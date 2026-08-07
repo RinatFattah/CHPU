@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CAM-пайплайн</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header>
+  <h1>CAM-пайплайн <span class="sub">модель детали → управляющая программа</span></h1>
+  <div class="agent" id="agent">агент: …</div>
+</header>
+
+<main>
+  <!-- ЛЕВАЯ КОЛОНКА: что обрабатываем -->
+  <section class="card" id="setup">
+    <h2>1. Что обрабатываем</h2>
+
+    <label class="file" id="drop-model">
+      <input type="file" id="model" accept=".step,.stp,.iges,.igs,.brep,.stl,.obj,.prt">
+      <span class="file-title">Модель детали</span>
+      <span class="file-name" id="model-name">файл не выбран</span>
+      <span class="file-hint">STEP, IGES, BREP, STL, OBJ или NX .prt</span>
+    </label>
+
+    <label class="file" id="drop-stock">
+      <input type="file" id="stock" accept=".step,.stp,.iges,.igs,.brep,.stl,.obj,.prt">
+      <span class="file-title">Заготовка <em>— необязательно</em></span>
+      <span class="file-name" id="stock-name">не выбрана: бокс от габарита детали</span>
+      <span class="file-hint">Файл должен быть в той же системе координат, что и деталь</span>
+    </label>
+
+    <h2>2. Параметры</h2>
+    <p class="note">Подставлены дефолты пайплайна. Меняйте только то, что нужно —
+      остальное уйдёт как есть.</p>
+    <div id="params"></div>
+
+    <div class="actions">
+      <button id="start" class="primary" disabled>Начать обработку</button>
+      <button id="reset" class="ghost">Вернуть дефолты</button>
+    </div>
+    <div class="error" id="form-error" hidden></div>
+  </section>
+
+  <!-- ПРАВАЯ КОЛОНКА: как идёт -->
+  <section class="card" id="progress" hidden>
+    <h2>Обработка</h2>
+
+    <div class="status">
+      <div class="phase" id="phase">подготовка</div>
+      <div class="meta"><span id="iter"></span><span id="elapsed"></span></div>
+    </div>
+    <ol class="steps" id="steps"></ol>
+
+    <div id="metrics-box" hidden>
+      <h3>Расхождение с моделью по итерациям</h3>
+      <table class="metrics"><thead><tr>
+        <th>итер.</th><th>недорез, мм³</th><th>зарез, мм³</th><th>вердикт агента</th>
+      </tr></thead><tbody id="metrics"></tbody></table>
+      <p class="note">Недорез — металл остался там, где его быть не должно.
+        Зарез — срезано лишнее, это брак: восстановить нельзя.</p>
+    </div>
+
+    <div class="feed-head">
+      <h3>Что происходит</h3>
+      <label class="toggle"><input type="checkbox" id="raw"> показывать весь лог</label>
+    </div>
+    <div class="feed" id="feed"></div>
+
+    <div id="result" hidden>
+      <h3>Результат</h3>
+      <div id="files"></div>
+      <p class="note">Скачайте <b>_compare.prt</b> и откройте в NX: слой 1 —
+        модель детали, слой 2 — то, что реально вырезалось.</p>
+    </div>
+
+    <div class="actions">
+      <button id="stop" class="danger">Остановить</button>
+      <button id="again" class="ghost" hidden>Новая обработка</button>
+    </div>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
