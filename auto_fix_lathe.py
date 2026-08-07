@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+"""
+auto_fix_lathe.py — агентная петля для ТОЧЕНИЯ: подбор НАБОРА ИНСТРУМЕНТА.
+
+Одна итерация — один вызов `run_lathe.py --two-setups --simulate`, то есть
+обе программы, оба установа в NX ISV, сборка итоговой детали и сверка с
+моделью. Дальше факты уходят ЛЛМ, та возвращает НОВЫЙ АКТИВНЫЙ НАБОР
+инструмента, и цикл повторяется.
+
+    набор инструмента → генерация → ISV установа 1 → ISV установа 2 →
+    сборка итога → сверка → ЛЛМ → новый набор
+
+Почему именно набор, а не отдельные ручки. Достижимость считается по геометрии
+резца (φ₁ = 180 − φ − ε); что не достаёт проходной, уходит канавочному и
+левому; чего в наборе нет — не делается вовсе. Убери 35°-чистовой, и
+недостижимый проходным объём на 14-31A растёт со 100 до 169 мм³. То есть набор
+инструмента — это рычаг, который реально перераспределяет работу, и его
+последствия видны в сверке. Отдельные числовые параметры (припуск, глубина
+резания) сюда намеренно НЕ вынесены: на разобранной детали они уже на
+разрешении метода, а метрику ими можно двигать без улучшения детали.
+
+ЦЕЛЕВАЯ ФУНКЦИЯ считается за вычетом ПОСТОЯННОГО ПОЛА метрики — того, что
+точением не лечится в принципе:
+  * пояса «грани под ключ» (axisym=false) — лыски шестигранника делает фреза,
+    их не точат ни у нас, ни на заводе (на 14-31A это 526 из 529 мм³ недореза);
+  * пояса торцов/уступов (face=true) — там расхождение осевое, а не радиальное;
+  * КРАЙНИЕ пояса у обоих торцов — известная и необъяснённая просадка торца
+    в ISV на ~0.8 мм, воспроизводится на обоих концах с точностью 0.001 мм.
+Вычтенное печатается каждой итерацией — молча пол не прячется.
+
+Транспорт ЛЛМ — OpenRouter (ключ в `.openrouter_key`, файл в .gitignore),
+общий с фрезерной петлёй: `auto_fix.ask_openrouter` уже умеет обходить
+строки-«пульс» перед телом ответа и повторять запрос, когда у рассуждающей
+модели ответ умирает на стороне провайдера.
+
+CLI:
+  python auto_fix_lathe.py деталь.prt --gcode runs/N/out.gcode \
+         --config cfg.yaml --iters 3
+"""
+
+import argparse
+import json
+import math
+import os
+import subprocess
+import sys
+import time
+
+import config
+from lathe import lathe_tools
+from auto_fix import ask_openrouter, extract_json     # общий транспорт и парсер
+
+for _s in (sys.stdout, sys.stderr):
+    if (getattr(_s, "encoding", "") or "").lower().replace("-", "") != "utf8":
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_MODEL = "deepseek/deepseek-v4-flash-0731"
+
+
+def log(msg):
+    print(f"[loop] {msg}", flush=True)
+
+
+# ── ЦЕЛЕВАЯ ФУНКЦИЯ ─────────────────────────────────────────────────────────
+
+def score(diff, z_end=None):
+    """Расхождение с моделью ЗА ВЫЧЕТОМ постоянного пола метрики.
+
+    Возвращает {"under","over","total","floor_under","floor_over","skipped"}.
+    Объёмы пересчитываются из радиального отклонения пояса: для тела вращения
+    объём пояса = 2π·r·dz·dr, поэтому обратный ход точен. Берётся отклонение
+    С ПОПРАВКОЙ на плёнку моста ISV там, где поправка применялась.
+    """
+    u = o = fu = fo = 0.0
+    worst, worst_at = 0.0, None
+    skipped = []
+    bands = diff.get("by_z") or []
+    # Торцы детали: ближний в нуле, дальний в z_end. Границы СПИСКА поясов для
+    # этого не годятся — он выходит за деталь (у 14-31A есть пояс z 0..+1, где
+    # металла нет вовсе, и поправка на плёнку дорисовывает там 7 мм³).
+    z_hi = 0.0
+    z_lo = float(z_end) if z_end is not None else (
+        min(float(b["z0"]) for b in bands) if bands else 0.0)
+    for b in bands:
+        z0, z1 = float(b["z0"]), float(b["z1"])
+        if z0 >= z_hi - 1e-6 or z1 <= z_lo + 1e-6:
+            continue                        # пояс целиком вне тела детали
+        why = None
+        if b.get("axisym") is False:
+            why = "грани под ключ"
+        elif b.get("face"):
+            why = "торец/уступ"
+        elif z0 - 1e-6 <= z_hi <= z1 + 1e-6 or z0 - 1e-6 <= z_lo <= z1 + 1e-6:
+            why = "крайний пояс (просадка торца в ISV)"
+        bu, bo = float(b.get("under_mm3", 0.0)), float(b.get("over_mm3", 0.0))
+        dr = float(b.get("dr_under_mm", 0.0)) + float(b.get("dr_over_mm", 0.0))
+        if b.get("film_applied") and b.get("r_nom"):
+            dz = abs(float(b["z1"]) - float(b["z0"]))
+            k = 2.0 * math.pi * float(b["r_nom"]) * dz
+            dr = float(b.get("dr_fixed_mm", 0.0))
+            bu, bo = (dr * k, 0.0) if dr >= 0 else (0.0, -dr * k)
+        if why:
+            fu += bu
+            fo += bo
+            if bu + bo > 1.0:
+                skipped.append(f"z {b['z0']:.0f}..{b['z1']:.0f} {why}: "
+                               f"{bu + bo:.0f} мм³")
+            continue
+        u += bu
+        o += bo
+        if abs(dr) > abs(worst):
+            worst, worst_at = dr, (b["z0"], b["z1"])
+    return {"under": round(u, 1), "over": round(o, 1), "total": round(u + o, 1),
+            "max_dr": round(worst, 3), "max_dr_at": worst_at,
+            "floor_under": round(fu, 1), "floor_over": round(fo, 1),
+            "skipped": skipped}
+
+
+# ── ОДНА ИТЕРАЦИЯ ───────────────────────────────────────────────────────────
+
+def run_once(model, gcode, active, args, tag):
+    """Запускает run_lathe.py заданным набором и возвращает его отчёт (dict)."""
+    out_dir = os.path.dirname(os.path.abspath(gcode))
+    rep_path = os.path.join(out_dir, f"report_{tag}.json")
+    log_path = os.path.join(out_dir, f"run_{tag}.log")
+    cmd = [sys.executable, "-X", "utf8", "-u", os.path.join(ROOT, "run_lathe.py"),
+           model, gcode, "--two-setups", "--simulate",
+           "--tools", ",".join(active), "--report", rep_path]
+    if args.config:
+        cmd += ["--config", args.config]
+    if args.sim_setup:
+        cmd += ["--sim-setup", args.sim_setup]
+    t0 = time.perf_counter()
+    with open(log_path, "w", encoding="utf-8") as lf:
+        proc = subprocess.run(cmd, cwd=ROOT, stdout=lf, stderr=subprocess.STDOUT,
+                              text=True, encoding="utf-8", errors="replace",
+                              timeout=args.timeout)
+    wall = round(time.perf_counter() - t0, 1)
+    if not os.path.exists(rep_path):
+        tail = ""
+        try:
+            with open(log_path, encoding="utf-8", errors="replace") as f:
+                tail = "".join(f.readlines()[-12:])
+        except OSError:
+            pass
+        raise RuntimeError(f"прогон не дал отчёта (код {proc.returncode}), "
+                           f"лог {log_path}\n{tail}")
+    with open(rep_path, encoding="utf-8") as f:
+        rep = json.load(f)
+    rep["wall_s"] = wall
+    rep["log"] = log_path
+    return rep
+
+
+# ── ПРОМПТ ──────────────────────────────────────────────────────────────────
+
+def build_prompt(rep, sc, history, catalog_desc):
+    setups = [{k: v for k, v in s.items() if k != "ops"} for s in rep["setups"]]
+    bands = [b for b in (rep["diff"].get("by_z") or [])
+             if b.get("under_mm3", 0) + b.get("over_mm3", 0) > 1.0]
+    return f"""Ты — технолог-программист ЧПУ. Токарный CAM-пайплайн сам сгенерировал
+управляющую программу на деталь, прогнал её на виртуальном станке NX ISV со съёмом
+материала и сверил результат с моделью. Твоя задача — выбрать НАБОР ИНСТРУМЕНТА.
+
+КАК ЭТО РАБОТАЕТ. Программа строится ТОЛЬКО теми инструментами, что выданы
+активными. Достижимость считается по геометрии резца: вспомогательный угол в плане
+φ₁ = 180 − φ − ε, где φ — угол державки (approach), ε — угол при вершине пластины
+(nose_angle). Чем меньше φ₁, тем дольше резец волочит по уже обточенной стенке,
+тем дальше приходится держаться от уступа — и тем больше работы уходит канавочному
+резцу и левому. Роли, которой в наборе нет, работа не достаётся вовсе: она
+остаётся необработанной.
+
+КАТАЛОГ — всё, что есть в наличии:
+{json.dumps(catalog_desc, ensure_ascii=False)}
+
+АКТИВНЫЙ НАБОР в этом прогоне: {json.dumps(rep['tools']['active'], ensure_ascii=False)}
+Роли без инструмента (работа НЕ делается): {json.dumps(rep['tools']['roles_off'], ensure_ascii=False)}
+Граница установов z = {rep.get('z_split')}, дальний торец детали z = {rep.get('z_end')}.
+
+ЧТО ПОЛУЧИЛОСЬ У ГЕНЕРАТОРА (по установам):
+{json.dumps(setups, ensure_ascii=False)}
+  uncut_mm3 — объём, который в этом установе не обработан ничем;
+  groove_volume_mm3 — объём, недостижимый проходным резцом, отдан канавочному;
+  blade_mm — ширина подобранной канавочной пластины, blade_tight=true значит,
+  что нужна пластина УЖЕ самой узкой наличной, и дно канавки останется недорезанным;
+  left_passes — сколько проходов делает левый резец.
+
+СВЕРКА С МОДЕЛЬЮ (NX ISV, воксельная, поправка на плёнку моста уже снята):
+  ХУДШЕЕ ОТКЛОНЕНИЕ ПО РАДИУСУ: {sc['max_dr']:+.3f} мм — это и есть приёмка
+  объём по существу: недорез {sc['under']} мм³, зарез {sc['over']} мм³
+  не в счёт (точением не лечится): {sc['floor_under'] + sc['floor_over']:.0f} мм³ —
+  {'; '.join(sc['skipped']) or 'нет'}
+Пояса по z с расхождением (dr в мм по радиусу, плюс = остался металл,
+минус = срезано лишнее):
+{json.dumps(bands, ensure_ascii=False)}
+
+ИСТОРИЯ ИТЕРАЦИЙ (не повторяй уже испробованный набор):
+{json.dumps(history, ensure_ascii=False)}
+
+ВАЖНОЕ, это НЕ дефекты и чинить их не надо:
+- лыски шестигранника точением не делаются ни у нас, ни на заводе — это отдельная
+  фрезерная операция, и в целевую функцию они уже не входят;
+- торцы в ISV срезаются на ~0.8 мм глубже программы, это известная особенность
+  симулятора, а не программы;
+- остаточная плёнка 0.1–0.2 мм по радиусу — смещённая точка отсчёта у модели резца
+  в NX ISV, она снята поправкой;
+- резьба нарезается только по явному объявлению, шаг из модели не выводится.
+
+ЧТО ТЫ МОЖЕШЬ СДЕЛАТЬ: задать НОВЫЙ АКТИВНЫЙ НАБОР — список id из каталога.
+Больше ничего; параметры резания и границу установов трогать нельзя.
+Соображения, по которым набор меняют:
+- нечем выбрать узкий уступ → добавить чистовой резец с БОЛЬШИМ φ₁ (меньший
+  угол при вершине, например ромб 35° вместо 55°);
+- blade_tight=true → нужна более узкая канавочная пластина, а если её нет —
+  сменить проходной так, чтобы канавка получилась шире;
+- велик uncut_mm3 у роли, которой нет в наборе → вернуть эту роль;
+- лишний инструмент, который ничего не делает (left_passes=0, канавок нет),
+  можно убрать: меньше смен инструмента — короче программа.
+
+ОТВЕТЬ СТРОГО ОДНИМ JSON-ОБЪЕКТОМ, без markdown и текста вокруг:
+{{"analysis": "краткий разбор по-русски: чем вызвано расхождение",
+  "verdict": "ok | retry | unfixable",
+  "tools": ["id", "id", ...],
+  "report": "итог для технолога по-русски"}}
+verdict=ok — расхождение приемлемо, набор менять не надо (поле tools повтори);
+retry — выдай ДРУГОЙ набор, его и прогоним; unfixable — набором инструмента это
+не лечится, объясни в report."""
+
+
+# ── ПЕТЛЯ ───────────────────────────────────────────────────────────────────
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Агентная петля точения: ЛЛМ подбирает набор инструмента")
+    ap.add_argument("model", help="деталь: .step/.stp/.prt")
+    ap.add_argument("--gcode", required=True,
+                    help="куда писать программу (папка прогона)")
+    ap.add_argument("--config", metavar="FILE", help="YAML-конфиг")
+    ap.add_argument("--iters", type=int, default=3, metavar="N",
+                    help="максимум итераций (дефолт 3; итерация ~6 минут)")
+    ap.add_argument("--tools", metavar="IDS",
+                    help="стартовый набор (по умолчанию — заводской комплект)")
+    ap.add_argument("--llm-model", default=DEFAULT_MODEL, metavar="M",
+                    help=f"модель OpenRouter (дефолт {DEFAULT_MODEL})")
+    ap.add_argument("--sim-setup", choices=("1", "2", "both"),
+                    help="гнать в ISV только один установ — вдвое дешевле, "
+                         "для отладки самой петли")
+    ap.add_argument("--ok-dr", type=float, default=0.12, metavar="MM",
+                    help="ДОПУСК ПРИЁМКИ по радиусу, мм (дефолт 0.12). Именно "
+                         "он решает, готово ли: у токаря приёмка — допуск, а не "
+                         "объём. Объём зависит от размера детали и идёт в отчёт "
+                         "как контекст")
+    ap.add_argument("--timeout", type=int, default=3600, metavar="SEC",
+                    help="потолок на одну итерацию, с (дефолт 3600)")
+    args = ap.parse_args()
+
+    if args.config:
+        config.load(args.config)
+    cat = lathe_tools.catalog(getattr(config, "LATHE_TOOLS", None))
+    active = ([s.strip() for s in args.tools.split(",") if s.strip()]
+              if args.tools else lathe_tools.default_active(cat))
+    cat_desc = lathe_tools.describe(getattr(config, "LATHE_TOOLS", None))
+
+    stem = os.path.splitext(os.path.abspath(args.gcode))[0]
+    journal_path = stem + "_loop.json"
+    journal = {"model": os.path.abspath(args.model), "llm": "openrouter",
+               "llm_model": args.llm_model, "iterations": []}
+    history = []
+
+    for it in range(1, args.iters + 1):
+        log(f"── итерация {it}/{args.iters} ── набор: {', '.join(active)}")
+        try:
+            rep = run_once(args.model, args.gcode, active, args, f"it{it}")
+        except Exception as e:
+            log(f"прогон не удался: {e}")
+            journal["iterations"].append({"iter": it, "tools": list(active),
+                                          "error": str(e)[:2000]})
+            break
+
+        if not (rep.get("diff") or {}).get("by_z"):
+            # без поясов по z считать нечего: так бывает при --sim-setup 1|2,
+            # когда итог не собирается. Молча выдать ноль нельзя — это читалось
+            # бы как «дефектов нет».
+            log("сверка без поясов по z (итог не собран) — петле нечего "
+                "оптимизировать; уберите --sim-setup")
+            journal["iterations"].append({"iter": it, "tools": list(active),
+                                          "error": "нет by_z в сверке"})
+            break
+        sc = score(rep.get("diff") or {}, rep.get("z_end"))
+        entry = {"iter": it, "tools": list(active), "wall_s": rep["wall_s"],
+                 "setups": [{k: s[k] for k in
+                             ("setup", "lines", "uncut_mm3", "blade_mm",
+                              "blade_tight", "groove_volume_mm3", "left_passes")}
+                            for s in rep["setups"]],
+                 "score": sc}
+        at = (f" (пояс z {sc['max_dr_at'][0]:.0f}..{sc['max_dr_at'][1]:.0f})"
+              if sc.get("max_dr_at") else "")
+        log(f"худшее отклонение по радиусу: {sc['max_dr']:+.3f} мм{at}; "
+            f"объём по существу {sc['total']} мм³ "
+            f"(недорез {sc['under']} + зарез {sc['over']}; не в счёт "
+            f"{sc['floor_under'] + sc['floor_over']:.0f} мм³)")
+        for s in sc["skipped"]:
+            log(f"   не в счёт: {s}")
+        log(f"итерация заняла {rep['wall_s']:.0f} с")
+
+        if abs(sc["max_dr"]) <= args.ok_dr:
+            entry["verdict"] = "ok (по допуску, без ЛЛМ)"
+            journal["iterations"].append(entry)
+            log(f"в допуске (|{sc['max_dr']:+.3f}| ≤ {args.ok_dr} мм) — готово ✅")
+            break
+
+        log(f"спрашиваю ЛЛМ ({args.llm_model})...")
+        try:
+            raw = ask_openrouter(build_prompt(rep, sc, history, cat_desc),
+                                 timeout=900, model=args.llm_model)
+            ans = extract_json(raw)
+        except Exception as e:
+            log(f"ЛЛМ не ответила разбираемым JSON: {e}")
+            entry["llm_error"] = str(e)[:2000]
+            journal["iterations"].append(entry)
+            break
+
+        entry["llm"] = {k: ans.get(k) for k in ("analysis", "verdict", "report")}
+        log(f"ЛЛМ: {ans.get('verdict')} — {str(ans.get('analysis', ''))[:250]}")
+
+        if ans.get("verdict") == "ok":
+            entry["verdict"] = "ok (по оценке ЛЛМ)"
+            journal["iterations"].append(entry)
+            log(f"ЛЛМ считает результат приемлемым: {ans.get('report', '')}")
+            break
+        if ans.get("verdict") == "unfixable":
+            entry["verdict"] = "unfixable"
+            journal["iterations"].append(entry)
+            log(f"набором инструмента не лечится: {ans.get('report', '')}")
+            break
+
+        # ВАЛИДАЦИЯ набора: чужих id нет, обязательная роль есть, набор новый
+        new = [str(t).strip() for t in (ans.get("tools") or []) if str(t).strip()]
+        bad = [t for t in new if t not in cat]
+        if bad:
+            log(f"ЛЛМ назвала несуществующий инструмент {bad} — останавливаюсь")
+            entry["verdict"] = f"отклонено: нет в каталоге {bad}"
+            journal["iterations"].append(entry)
+            break
+        try:
+            lathe_tools.resolve(new, extra=getattr(config, "LATHE_TOOLS", None))
+        except ValueError as e:
+            log(f"набор непригоден: {e}")
+            entry["verdict"] = f"отклонено: {e}"
+            journal["iterations"].append(entry)
+            break
+        if sorted(new) == sorted(active):
+            log("ЛЛМ вернула тот же набор — прогресса не будет, останавливаюсь")
+            entry["verdict"] = "тот же набор"
+            journal["iterations"].append(entry)
+            break
+        if sorted(new) in [sorted(h["tools"]) for h in history]:
+            log(f"набор {new} уже пробовали — останавливаюсь")
+            entry["verdict"] = "повтор набора"
+            journal["iterations"].append(entry)
+            break
+
+        entry["next_tools"] = new
+        journal["iterations"].append(entry)
+        history.append({"iter": it, "tools": list(active), "score": sc,
+                        "analysis": str(ans.get("analysis", ""))[:400]})
+        active = new
+    else:
+        log(f"достигнут лимит итераций ({args.iters})")
+
+    with open(journal_path, "w", encoding="utf-8") as f:
+        json.dump(journal, f, ensure_ascii=False, indent=1)
+    log(f"журнал: {journal_path}")
+
+
+if __name__ == "__main__":
+    main()
