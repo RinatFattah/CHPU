@@ -65,6 +65,21 @@ def log(msg):
     print(f"[loop] {msg}", flush=True)
 
 
+def signature(ids, extra=None):
+    """Подпись набора: {роль: инструмент} ПОСЛЕ разрешения.
+
+    Сравнивать сырые списки id мало. На роль берётся один инструмент, поэтому
+    набор, где к 35°-чистовому просто ДОБАВЛЕН 55°-й, даёт побитово ту же
+    программу — и в runs/100 такая итерация впустую сожгла 340 секунд ISV.
+    """
+    _, _, chosen = resolve_quiet(ids, extra)
+    return {r: t["id"] for r, t in chosen.items()}
+
+
+def resolve_quiet(ids, extra=None):
+    return lathe_tools.resolve(ids, extra=extra)
+
+
 # ── ЦЕЛЕВАЯ ФУНКЦИЯ ─────────────────────────────────────────────────────────
 
 def score(diff, z_end=None):
@@ -158,11 +173,19 @@ def run_once(model, gcode, active, args, tag):
 
 # ── ПРОМПТ ──────────────────────────────────────────────────────────────────
 
-def build_prompt(rep, sc, history, catalog_desc):
+def build_prompt(rep, sc, history, catalog_desc, ok_dr, failure=None):
     setups = [{k: v for k, v in s.items() if k != "ops"} for s in rep["setups"]]
     bands = [b for b in (rep["diff"].get("by_z") or [])
              if b.get("under_mm3", 0) + b.get("over_mm3", 0) > 1.0]
-    return f"""Ты — технолог-программист ЧПУ. Токарный CAM-пайплайн сам сгенерировал
+    fail = ("" if not failure else f"""
+⚠ ПОСЛЕДНЯЯ ПОПЫТКА ПРОВАЛИЛАСЬ. Набор {json.dumps(failure['tools'], ensure_ascii=False)}
+не удалось прогнать в симуляторе даже со второй попытки:
+  {failure['error']}
+Ниже — данные ПРЕДЫДУЩЕГО удачного прогона. Выбери набор, отличный от
+провалившегося; смена чистового резца на форму пластины, которой в удачных
+прогонах не было, — вероятная причина отказа симулятора.
+""")
+    return f"""Ты — технолог-программист ЧПУ.{fail} Токарный CAM-пайплайн сам сгенерировал
 управляющую программу на деталь, прогнал её на виртуальном станке NX ISV со съёмом
 материала и сверил результат с моделью. Твоя задача — выбрать НАБОР ИНСТРУМЕНТА.
 
@@ -211,6 +234,11 @@ def build_prompt(rep, sc, history, catalog_desc):
 - резьба нарезается только по явному объявлению, шаг из модели не выводится.
 
 ЧТО ТЫ МОЖЕШЬ СДЕЛАТЬ: задать НОВЫЙ АКТИВНЫЙ НАБОР — список id из каталога.
+НА КАЖДУЮ РОЛЬ БЕРЁТСЯ РОВНО ОДИН ИНСТРУМЕНТ. Если назовёшь на роль несколько,
+возьмётся первый по каталогу, а остальные будут проигнорированы — то есть
+«добавить второй чистовой, не убрав первый» НЕ МЕНЯЕТ НИЧЕГО. Исключение —
+канавочные: это ряд пластин, называй их все, генератор возьмёт самую широкую,
+что влезает во все канавки.
 Больше ничего; параметры резания и границу установов трогать нельзя.
 Соображения, по которым набор меняют:
 - нечем выбрать узкий уступ → добавить чистовой резец с БОЛЬШИМ φ₁ (меньший
@@ -221,14 +249,92 @@ def build_prompt(rep, sc, history, catalog_desc):
 - лишний инструмент, который ничего не делает (left_passes=0, канавок нет),
   можно убрать: меньше смен инструмента — короче программа.
 
+ТРЕБОВАНИЕ К РЕЗУЛЬТАТУ, жёсткое и не на твоё усмотрение:
+ДОПУСК ПО РАДИУСУ {ok_dr} мм. Сейчас худшее отклонение {sc['max_dr']:+.3f} мм, то есть
+{'ДОПУСК ВЫДЕРЖАН' if abs(sc['max_dr']) <= ok_dr else 'ДОПУСК НЕ ВЫДЕРЖАН'}.
+verdict=ok разрешён ТОЛЬКО когда |отклонение| ≤ {ok_dr} мм. Если допуск не выдержан,
+у тебя ровно два ответа: retry с ДРУГИМ набором инструмента либо unfixable с
+объяснением, почему набором это не лечится. Объявлять ok при непройденном допуске
+ЗАПРЕЩЕНО — приёмку задаёт допуск, а не твоя оценка.
+
 ОТВЕТЬ СТРОГО ОДНИМ JSON-ОБЪЕКТОМ, без markdown и текста вокруг:
 {{"analysis": "краткий разбор по-русски: чем вызвано расхождение",
   "verdict": "ok | retry | unfixable",
   "tools": ["id", "id", ...],
   "report": "итог для технолога по-русски"}}
-verdict=ok — расхождение приемлемо, набор менять не надо (поле tools повтори);
-retry — выдай ДРУГОЙ набор, его и прогоним; unfixable — набором инструмента это
-не лечится, объясни в report."""
+verdict=ok — допуск выдержан, набор менять не надо (поле tools повтори);
+retry — выдай ДРУГОЙ набор (не тот же самый и не из истории), его и прогоним;
+unfixable — набором инструмента это не лечится, объясни в report."""
+
+
+# ── ЗАПРОС К ЛЛМ И ВАЛИДАЦИЯ ОТВЕТА ─────────────────────────────────────────
+
+def ask_next(rep, sc, history, cat_desc, args, cat, journal, entry, active,
+             failure=None):
+    """Спросить ЛЛМ новый набор. Возвращает список id или None (остановиться).
+
+    Запись в журнал делается здесь же, чтобы след остался у любого исхода.
+    """
+    extra = getattr(config, "LATHE_TOOLS", None)
+    log(f"спрашиваю ЛЛМ ({args.llm_model})...")
+    try:
+        raw = ask_openrouter(build_prompt(rep, sc, history, cat_desc,
+                                          args.ok_dr, failure),
+                             timeout=900, model=args.llm_model)
+        ans = extract_json(raw)
+    except Exception as e:
+        log(f"ЛЛМ не ответила разбираемым JSON: {e}")
+        entry["llm_error"] = str(e)[:2000]
+        journal["iterations"].append(entry)
+        return None
+
+    entry["llm"] = {k: ans.get(k) for k in ("analysis", "verdict", "report")}
+    log(f"ЛЛМ: {ans.get('verdict')} — {str(ans.get('analysis', ''))[:250]}")
+
+    def stop(verdict, msg):
+        entry["verdict"] = verdict
+        journal["iterations"].append(entry)
+        log(msg)
+        return None
+
+    if ans.get("verdict") == "ok":
+        # Допуск проверен ДО вызова, и он не прошёл — иначе мы бы сюда не
+        # дошли. Принимать «ok» после этого нельзя: это ровно тот случай,
+        # когда судья двигает собственную планку.
+        return stop("ЛЛМ сказала ok при непройденном допуске",
+                    f"⚠  ЛЛМ объявила ok, но допуск не выдержан "
+                    f"(|{sc['max_dr']:+.3f}| > {args.ok_dr} мм). Её оценку не "
+                    f"принимаю — приёмку задаёт допуск. Ответ модели: "
+                    f"{ans.get('report', '')}")
+    if ans.get("verdict") == "unfixable":
+        return stop("unfixable",
+                    f"набором инструмента не лечится: {ans.get('report', '')}")
+
+    new = [str(t).strip() for t in (ans.get("tools") or []) if str(t).strip()]
+    bad = [t for t in new if t not in cat]
+    if bad:
+        return stop(f"отклонено: нет в каталоге {bad}",
+                    f"ЛЛМ назвала несуществующий инструмент {bad} — "
+                    f"останавливаюсь")
+    try:
+        sig_new = signature(new, extra)
+    except ValueError as e:
+        return stop(f"отклонено: {e}", f"набор непригоден: {e}")
+
+    # Сравниваем РАЗРЕШЁННЫЕ наборы, а не списки id: «добавить второй чистовой,
+    # не убрав первый» даёт побитово ту же программу (runs/100, 340 с впустую).
+    if sig_new == signature(active, extra):
+        return stop("тот же набор по существу",
+                    f"после разрешения ролей набор тот же ({sig_new}) — "
+                    f"программа выйдет прежней, останавливаюсь")
+    if sig_new in [h.get("sig") for h in history]:
+        return stop("повтор набора",
+                    f"набор {sig_new} уже пробовали — останавливаюсь")
+
+    entry["next_tools"] = new
+    entry["next_sig"] = sig_new
+    journal["iterations"].append(entry)
+    return new
 
 
 # ── ПЕТЛЯ ───────────────────────────────────────────────────────────────────
@@ -270,16 +376,42 @@ def main():
     journal = {"model": os.path.abspath(args.model), "llm": "openrouter",
                "llm_model": args.llm_model, "iterations": []}
     history = []
+    last_ok = None            # (rep, sc) последнего УДАЧНОГО прогона
+    failure = None            # чем провалилась последняя попытка
 
     for it in range(1, args.iters + 1):
         log(f"── итерация {it}/{args.iters} ── набор: {', '.join(active)}")
         try:
             rep = run_once(args.model, args.gcode, active, args, f"it{it}")
         except Exception as e:
-            log(f"прогон не удался: {e}")
-            journal["iterations"].append({"iter": it, "tools": list(active),
-                                          "error": str(e)[:2000]})
-            break
+            # ISV — капризная часть: программа иногда не доходит до конца.
+            # Один повтор дешевле потерянной петли.
+            log(f"прогон не удался: {str(e)[:300]}")
+            log("повторяю тем же набором...")
+            try:
+                rep = run_once(args.model, args.gcode, active, args, f"it{it}r")
+            except Exception as e2:
+                # Повторилось — набор действительно не симулируется. Это ФАКТ
+                # для агента, а не конец петли: пусть выберет другой.
+                failure = {"tools": list(active), "error": str(e2)[:600]}
+                journal["iterations"].append(
+                    {"iter": it, "tools": list(active),
+                     "error": str(e2)[:2000], "retried": True})
+                log("повтор тоже не прошёл — отдаю провал агенту как факт")
+                if last_ok is None:
+                    log("удачных прогонов ещё не было, рассуждать не от чего "
+                        "— останавливаюсь")
+                    break
+                rep, sc = last_ok
+                history.append({"iter": it, "tools": list(active),
+                                "СИМУЛЯЦИЯ НЕ ПРОШЛА": failure["error"][:200]})
+                nxt = ask_next(rep, sc, history, cat_desc, args, cat,
+                               journal, {"iter": it, "tools": list(active)},
+                               active, failure)
+                if nxt is None:
+                    break
+                active, failure = nxt, None
+                continue
 
         if not (rep.get("diff") or {}).get("by_z"):
             # без поясов по z считать нечего: так бывает при --sim-setup 1|2,
@@ -313,61 +445,18 @@ def main():
             log(f"в допуске (|{sc['max_dr']:+.3f}| ≤ {args.ok_dr} мм) — готово ✅")
             break
 
-        log(f"спрашиваю ЛЛМ ({args.llm_model})...")
-        try:
-            raw = ask_openrouter(build_prompt(rep, sc, history, cat_desc),
-                                 timeout=900, model=args.llm_model)
-            ans = extract_json(raw)
-        except Exception as e:
-            log(f"ЛЛМ не ответила разбираемым JSON: {e}")
-            entry["llm_error"] = str(e)[:2000]
-            journal["iterations"].append(entry)
+        last_ok = (rep, sc)
+        nxt = ask_next(rep, sc, history, cat_desc, args, cat, journal, entry,
+                       active)
+        if nxt is None:
             break
-
-        entry["llm"] = {k: ans.get(k) for k in ("analysis", "verdict", "report")}
-        log(f"ЛЛМ: {ans.get('verdict')} — {str(ans.get('analysis', ''))[:250]}")
-
-        if ans.get("verdict") == "ok":
-            entry["verdict"] = "ok (по оценке ЛЛМ)"
-            journal["iterations"].append(entry)
-            log(f"ЛЛМ считает результат приемлемым: {ans.get('report', '')}")
-            break
-        if ans.get("verdict") == "unfixable":
-            entry["verdict"] = "unfixable"
-            journal["iterations"].append(entry)
-            log(f"набором инструмента не лечится: {ans.get('report', '')}")
-            break
-
-        # ВАЛИДАЦИЯ набора: чужих id нет, обязательная роль есть, набор новый
-        new = [str(t).strip() for t in (ans.get("tools") or []) if str(t).strip()]
-        bad = [t for t in new if t not in cat]
-        if bad:
-            log(f"ЛЛМ назвала несуществующий инструмент {bad} — останавливаюсь")
-            entry["verdict"] = f"отклонено: нет в каталоге {bad}"
-            journal["iterations"].append(entry)
-            break
-        try:
-            lathe_tools.resolve(new, extra=getattr(config, "LATHE_TOOLS", None))
-        except ValueError as e:
-            log(f"набор непригоден: {e}")
-            entry["verdict"] = f"отклонено: {e}"
-            journal["iterations"].append(entry)
-            break
-        if sorted(new) == sorted(active):
-            log("ЛЛМ вернула тот же набор — прогресса не будет, останавливаюсь")
-            entry["verdict"] = "тот же набор"
-            journal["iterations"].append(entry)
-            break
-        if sorted(new) in [sorted(h["tools"]) for h in history]:
-            log(f"набор {new} уже пробовали — останавливаюсь")
-            entry["verdict"] = "повтор набора"
-            journal["iterations"].append(entry)
-            break
-
-        entry["next_tools"] = new
-        journal["iterations"].append(entry)
-        history.append({"iter": it, "tools": list(active), "score": sc,
-                        "analysis": str(ans.get("analysis", ""))[:400]})
+        history.append({"iter": it, "tools": list(active),
+                        "sig": signature(active, getattr(config, "LATHE_TOOLS",
+                                                         None)),
+                        "score": {k: sc[k] for k in
+                                  ("max_dr", "total", "under", "over")},
+                        "analysis": str((entry.get("llm") or {})
+                                        .get("analysis", ""))[:400]})
         active = new
     else:
         log(f"достигнут лимит итераций ({args.iters})")
