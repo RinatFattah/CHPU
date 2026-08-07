@@ -77,14 +77,24 @@ def transform_facet_step(in_path, out_path, axis=(0.0, 1.0, 0.0), angle=90.0,
 
     Единственный способ повернуть результат ISV: OCCT фасеты не крутит, а
     внутри NX это делается вершинами в два прохода (I8) — сюда её тащить незачем.
-    Правится ровно `COORDINATES_LIST`, где лежат вершины сетки; нормалей в
-    этом экспорте НЕТ (проверено: 0 сущностей `*NORMAL*`), поэтому намотка
-    граней задаётся порядком вершин и при СОБСТВЕННОМ повороте (det = +1)
-    остаётся верной. Остальные `CARTESIAN_POINT` в файле — камеры и виды,
-    к геометрии сетки отношения не имеют, размещение тела единичное
-    (подтверждено тем, что радиусы читаются из списка напрямую и сходятся).
 
-    Поворот — формула Родрига, та же семантика, что у `_rotate_step`.
+    Правятся ДВА места, и второе легко пропустить:
+      * `COORDINATES_LIST` — вершины сетки, поворот со сдвигом;
+      * `COMPLEX_TRIANGULATED_FACE` — там СРАЗУ ЗА СЧЁТЧИКОМ лежит список
+        НОРМАЛЕЙ, отдельной сущности `*NORMAL*` в файле нет, поэтому поиском по
+        типам они не находятся. Нормали поворачиваются БЕЗ сдвига. Если их не
+        тронуть, тело едет, а освещение остаётся от старой ориентации — грани
+        затеняются как попало, и по телу идут ложные «разрезы».
+
+    Нормали отличаются от списка индексов треугольников тем, что у них есть
+    десятичная точка: индексы — целые. По этому признаку они и берутся.
+
+    Остальные `CARTESIAN_POINT` в файле — камеры и виды, к геометрии сетки
+    отношения не имеют, размещение тела единичное (подтверждено тем, что
+    радиусы читаются из списка напрямую и сходятся).
+
+    Поворот — формула Родрига, та же семантика, что у `_rotate_step`;
+    он собственный (det = +1), поэтому намотка граней остаётся верной.
     """
     ax, ay, az = axis
     n = math.sqrt(ax * ax + ay * ay + az * az) or 1.0
@@ -93,37 +103,55 @@ def transform_facet_step(in_path, out_path, axis=(0.0, 1.0, 0.0), angle=90.0,
     c, s = math.cos(th), math.sin(th)
     ox, oy, oz = offset
 
-    def rot(x, y, z):
+    def rot(x, y, z, shift=True):
         cx = ky * z - kz * y                      # k × v
         cy = kz * x - kx * z
         cz = kx * y - ky * x
         d = (kx * x + ky * y + kz * z) * (1.0 - c)   # k (k·v)(1−cosθ)
-        return (x * c + cx * s + kx * d + ox,
-                y * c + cy * s + ky * d + oy,
-                z * c + cz * s + kz * d + oz)
+        return (x * c + cx * s + kx * d + (ox if shift else 0.0),
+                y * c + cy * s + ky * d + (oy if shift else 0.0),
+                z * c + cz * s + kz * d + (oz if shift else 0.0))
 
     text = open(in_path, encoding="utf-8", errors="replace").read()
+    num = r"-?\d+(?:\.\d*)?(?:E[+-]?\d+)?"
+    fnum = r"-?\d+\.\d*(?:E[+-]?\d+)?"            # с точкой: не индекс
+    trip = re.compile(rf"\(\s*({num})\s*,\s*({num})\s*,\s*({num})\s*\)")
+    ftrip = re.compile(rf"\(\s*({fnum})\s*,\s*({fnum})\s*,\s*({fnum})\s*\)")
+
+    def replacer(shift):
+        n = [0]
+
+        def sub(mm):
+            n[0] += 1
+            x, y, z = rot(*(float(g) for g in mm.groups()), shift=shift)
+            return f"({x:.9f},{y:.9f},{z:.9f})" if not shift else \
+                   f"({x:.6f},{y:.6f},{z:.6f})"
+        return sub, n
+
+    # 1. вершины сетки
     m = re.search(r"(COORDINATES_LIST\s*\([^(]*\(\()(.*?)(\)\s*\)\s*\)\s*;)",
                   text, re.S)
     if not m:
         raise RuntimeError(f"в {os.path.basename(in_path)} нет COORDINATES_LIST "
                            f"— это не фасетное тело")
-    num = r"-?\d+(?:\.\d*)?(?:E[+-]?\d+)?"
-    trip = re.compile(rf"\(\s*({num})\s*,\s*({num})\s*,\s*({num})\s*\)")
-    cnt = 0
+    sub_v, nv = replacer(True)
+    text = text[:m.start()] + m.group(1) + trip.sub(sub_v, m.group(2)) \
+        + m.group(3) + text[m.end():]
 
-    def sub(mm):
-        nonlocal cnt
-        cnt += 1
-        x, y, z = rot(*(float(g) for g in mm.groups()))
-        return f"({x:.6f},{y:.6f},{z:.6f})"
+    # 2. НОРМАЛИ — внутри COMPLEX_TRIANGULATED_FACE, поворот без сдвига
+    nn = [0]
+    f = re.search(r"COMPLEX_TRIANGULATED_FACE\s*\(.*?\)\s*;", text, re.S)
+    if f:
+        sub_n, nn = replacer(False)
+        text = text[:f.start()] + ftrip.sub(sub_n, f.group(0)) + text[f.end():]
+    else:
+        _log("warn: COMPLEX_TRIANGULATED_FACE не найден — нормали не повёрнуты")
 
-    body = trip.sub(sub, m.group(2))
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(text[:m.start()] + m.group(1) + body + m.group(3)
-                + text[m.end():])
-    _log(f"фасет преобразован: {cnt} вершин, поворот {angle:g}° вокруг "
-         f"({kx:g}, {ky:g}, {kz:g}), сдвиг ({ox:g}, {oy:g}, {oz:g})")
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    _log(f"фасет преобразован: {nv[0]} вершин, {nn[0]} нормалей, поворот "
+         f"{angle:g}° вокруг ({kx:g}, {ky:g}, {kz:g}), "
+         f"сдвиг ({ox:g}, {oy:g}, {oz:g})")
     return out_path
 
 
@@ -465,7 +493,8 @@ def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
              left_tool_number=0, finish_tool_number=0, finish_nose_angle=35.0,
              finish_nose_radius=0.4, finish_insert_size=6.35,
              tool_length_x=0.0, tool_length_z=0.0, track_point=None,
-             insert_shape=None):
+             insert_shape=None, finish_insert_shape=None,
+             holder_style=None):
     """Прогоняет токарный G-Code на виртуальном станке NX ISV.
 
     Результат возвращается в раме ДЕТАЛИ (ось Z): заготовку сажают на ось
@@ -625,6 +654,16 @@ def simulate(gcode_path, stock_step_path, out_stem=None, nose_radius=0.4,
         # державку и руку. None = как в шаблоне NX.
         "insert_shape": (insert_shape if insert_shape is not None
                          else getattr(config, "NX_LATHE_INSERT_SHAPE", None)),
+        # Чистовой в программе — VCMT 35°, а подтипа OD_35_R в шаблонах NX
+        # НЕТ, поэтому без явной формы он моделируется 55°-ромбом и волочит
+        # там, где настоящий не волочит (runs/87, конус на шестиграннике).
+        "finish_insert_shape": (
+            finish_insert_shape if finish_insert_shape is not None
+            else getattr(config, "NX_LATHE_FINISH_INSERT_SHAPE", None)),
+        # Стиль державки = угол в плане φ (коды ISO 5608; J = 93°, как считает
+        # наш генератор). Шаблон NX даёт 107.5° — см. set_holder_style.
+        "holder_style": (holder_style if holder_style is not None
+                         else getattr(config, "NX_LATHE_HOLDER_STYLE", None)),
         # Канавочный резец T2. Проходной в канавку не лезет (волочит
         # вспомогательной кромкой по стенке позади), поэтому генератор отдаёт
         # канавки и отрезку отдельному инструменту — надо создать его и в ISV,
