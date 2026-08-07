@@ -127,7 +127,13 @@ def main():
                     help="после генерации прогнать G-Code на виртуальном "
                          "токарном станке NX ISV (нужен установленный NX); "
                          "результат — обработанная заготовка <gcode>_nxsim.stp "
-                         "и _nxsim.prt (как --simulate у фрезеровки)")
+                         "и _nxsim.prt (как --simulate у фрезеровки). При "
+                         "--two-setups гоняются ОБА установа и собирается "
+                         "итоговая деталь <gcode>_full.step")
+    ap.add_argument("--sim-setup", choices=("1", "2", "both"),
+                    help="какие установы гнать в ISV при --two-setups: both "
+                         "(по умолчанию — оба и сборка итога), 1 или 2 — "
+                         "только один, без сборки")
     ap.add_argument("--simulate-own", action="store_true",
                     help="съём нашей собственной моделью (быстро, но это "
                          "самопроверка: генератор и симулятор писались вместе, "
@@ -285,7 +291,11 @@ def main():
     # первый точит конец детали, сверлит насквозь и отрезает; второй берётся за
     # уже обточенное и делает второй конец. Так же устроен заводской эталон.
     prof2 = p2 = gcode2 = None
-    z_split = None
+    z_split = z_end = None
+    # порог радиуса между стенкой отверстия и наружной поверхностью — им
+    # разделяются контуры при сборке итога из двух результатов ISV
+    r_bore = max((r for _, r in (prof.get("bore_raw") or [])), default=0.0)
+    r_split = (r_bore + min(r for _, r in prof["profile"])) / 2.0 if r_bore else 0.0
     if args.two_setups or getattr(config, "LATHE_TWO_SETUPS", False):
         from lathe import lathe_setups
         z_end = min(z for z, _ in prof["profile"])
@@ -428,47 +438,120 @@ def main():
             print(f"   (сверка не выполнена: {e})")
 
     if args.simulate:
-        print("Симуляция на виртуальном токарном станке NX ISV "
-              "(откроется окно NX, трогать не нужно)...")
-        if prof2 is not None:
-            print("   ⚠  в ISV идёт ТОЛЬКО программа первого установа: перехват "
-                  "детали и вторая заготовка там не автоматизированы. Полный "
-                  "результат двух установов даёт --simulate-own")
         from nx import nx_lathe_sim
+
+        def sim_kwargs(st):
+            """Инструмент для ISV. Общее — из конфига, своё каждый установ
+            объявляет сам: ширина канавочной пластины и участие левого резца
+            зависят от того, что достаётся именно этой половине детали."""
+            return dict(
+                nose_radius=p["nose_radius"], nose_angle=p["nose_angle"],
+                insert_size=p["insert_edge"],
+                groove_width=st.get("blade") or 0.0,
+                groove_tool_number=p["groove_tool_number"],
+                left_tool_number=(p["left_tool_number"]
+                                  if st.get("left_passes") else 0),
+                finish_tool_number=st.get("finish_tool") or 0,
+                finish_nose_angle=p["finish_nose_angle"],
+                finish_nose_radius=getattr(config, "LATHE_FINISH_NOSE_RADIUS", 0.4),
+                finish_insert_size=p["finish_insert_edge"])
+
+        def sim_tail(r):
+            return ((f"  (машинное время {r['machine_time']}"
+                     + (f", {r['triangles']} треуг." if r.get("triangles") else "")
+                     + ")") if r.get("machine_time") else "")
+
+        which = (args.sim_setup
+                 or getattr(config, "LATHE_SIM_SETUP", None) or "both")
+        both = prof2 is not None and which == "both"
+        stock = stem + "_stock.stp"
+        print("Симуляция на виртуальном токарном станке NX ISV "
+              "(откроется окно NX, трогать не нужно)"
+              + (": ДВА УСТАНОВА подряд..." if both else "..."))
+        res = res1 = res2 = None
         try:
-            res = nx_lathe_sim.simulate(gcode, stem + "_stock.stp",
-                                        nose_radius=p["nose_radius"],
-                                        nose_angle=p["nose_angle"],
-                                        insert_size=p["insert_edge"],
-                                        groove_width=stats.get("blade") or 0.0,
-                                        groove_tool_number=p["groove_tool_number"],
-                                        left_tool_number=(p["left_tool_number"]
-                                                          if stats.get("left_passes")
-                                                          else 0),
-                                        finish_tool_number=stats.get("finish_tool") or 0,
-                                        finish_nose_angle=p["finish_nose_angle"],
-                                        finish_nose_radius=getattr(
-                                            config, "LATHE_FINISH_NOSE_RADIUS", 0.4),
-                                        finish_insert_size=p["finish_insert_edge"])
+            if prof2 is None:
+                res = nx_lathe_sim.simulate(gcode, stock, **sim_kwargs(stats))
+            else:
+                # Каждый установ гоняется по ЧИСТОМУ ПРУТКУ и обрабатывает свою
+                # половину. Подавать результат первого заготовкой во второй
+                # НЕЛЬЗЯ: фасетная заготовка в ISV стоит лишних 0.15 мм по
+                # радиусу плюс конусность (замерено, runs/87). Итоговая деталь
+                # собирается пересечением двух результатов — для тела вращения
+                # это точно (lathe/lathe_assemble.py).
+                # Пруток годится обоим установам: он симметричен по z и
+                # накрывает деталь в любой из двух рам.
+                if which in ("1", "both"):
+                    res1 = nx_lathe_sim.simulate(gcode, stock,
+                                                 out_stem=stem + "_setup1",
+                                                 **sim_kwargs(stats))
+                    print(f"   установ 1 → {res1['step']}{sim_tail(res1)}")
+                if which in ("2", "both"):
+                    res2 = nx_lathe_sim.simulate(gcode2, stock,
+                                                 out_stem=stem + "_setup2",
+                                                 **sim_kwargs(stats2))
+                    print(f"   установ 2 → {res2['step']}{sim_tail(res2)}"
+                          f"   (в раме УСТАНОВА 2, не детали)")
+                res = res1 or res2
         except Exception as e:
             print(f"⚠  NX-симуляция не удалась: {e}")
             sys.exit(2)
-        tail = (f"  (машинное время {res['machine_time']}"
-                + (f", {res['triangles']} треуг." if res.get("triangles") else "")
-                + ")") if res.get("machine_time") else ""
-        print(f"✅ NX ISV: обработанная заготовка → {res['step']}{tail}")
-        # результат возвращён в раму детали (ось Z) — ложится на out_part.step
-        print(f"   ▶ наложить на деталь: {res['step']}  +  "
-              f"{stem + '_part.step'}  (обе в раме детали, ось Z)")
-        try:
-            from cam import step_diff
-            d = step_diff.diff(stem + "_part.step", res["step"],
-                               stem + "_nxdiff.json")
-            print(f"   сверка NX-результата с моделью: "
-                  f"недорез {d['undercut_total_mm3']:.1f} мм³, "
-                  f"зарез {d['overcut_total_mm3']:.1f} мм³")
-        except Exception as e:
-            print(f"   (сверка не выполнена: {e})")
+
+        if not both:
+            if prof2 is None:
+                # результат возвращён в раму детали — ложится на out_part.step
+                print(f"✅ NX ISV: обработанная заготовка → {res['step']}"
+                      f"{sim_tail(res)}")
+                print(f"   ▶ наложить на деталь: {res['step']}  +  "
+                      f"{stem + '_part.step'}  (обе в раме детали, ось Z)")
+            else:
+                print(f"⚠  прогнан только установ {which} (--sim-setup): "
+                      f"итоговая деталь НЕ собрана, чужая половина в сверке "
+                      f"пойдёт недорезом")
+            if which != "2":       # результат установа 2 — в своей раме
+                try:
+                    from cam import step_diff
+                    d = step_diff.diff(stem + "_part.step", res["step"],
+                                       stem + "_nxdiff.json")
+                    print(f"   сверка NX-результата с моделью: "
+                          f"недорез {d['undercut_total_mm3']:.1f} мм³, "
+                          f"зарез {d['overcut_total_mm3']:.1f} мм³")
+                except Exception as e:
+                    print(f"   (сверка не выполнена: {e})")
+        else:
+            from lathe import lathe_assemble
+            full = stem + "_full.step"
+            try:
+                a = lathe_assemble.assemble(res1["step"], res2["step"], full,
+                                            z_end=z_end, r_split=r_split)
+            except Exception as e:
+                print(f"⚠  итоговая деталь не собралась: {e}")
+                sys.exit(2)
+            z0, z1 = a["z_range"]
+            print(f"✅ ИТОГ двух установов → {full}  (солид, объём "
+                  f"{a['volume']:.1f} мм³, z {z0:.2f}..{z1:.2f})")
+            print(f"   ▶ наложить на деталь: {full}  +  {stem + '_part.step'}")
+            # Сверять итог осевым анализатором, а не общим step_diff: у него
+            # пояса пересчитываются в радиус и снимается плёнка моста ISV
+            # (см. lathe/lathe_diff.py). Границы установа не задаём — деталь
+            # обработана целиком, за неё отвечают оба.
+            try:
+                from lathe import lathe_diff
+                d = lathe_diff.analyse(stem + "_part.step", full,
+                                       stem + "_nxdiff.json")
+                with open(stem + "_nxdiff.md", "w", encoding="utf-8") as f:
+                    f.write(lathe_diff.report(d))
+                print(f"   сверка итога с моделью: недорез "
+                      f"{d['undercut_total_mm3']:.1f} мм³, зарез "
+                      f"{d['overcut_total_mm3']:.1f} мм³ (сырое)")
+                if d.get("film_mm"):
+                    print(f"   с поправкой на плёнку моста {d['film_mm']:.3f} мм: "
+                          f"недорез {d['undercut_fixed_mm3']:.1f} мм³, зарез "
+                          f"{d['overcut_fixed_mm3']:.1f} мм³")
+                print(f"   разбор по поясам → {stem + '_nxdiff.md'}  "
+                      f"(граница установов z {z_split:.2f})")
+            except Exception as e:
+                print(f"   (сверка не выполнена: {e})")
 
 
 if __name__ == "__main__":
