@@ -173,7 +173,6 @@ function follow(state) {
   JOB = state.id;
   $("setup").hidden = true;
   $("progress").hidden = false;
-  document.querySelector("main").classList.add("solo");
   $("feed").innerHTML = "";
   $("fail").hidden = true;
   $("form-error").hidden = true;
@@ -241,7 +240,6 @@ async function start() {
   });
   $("again").addEventListener("click", () => {
     $("progress").hidden = true; $("setup").hidden = false;
-    document.querySelector("main").classList.remove("solo");
     $("start").disabled = !$("model").files[0];
     $("result").hidden = true; $("metrics-box").hidden = true;
   });

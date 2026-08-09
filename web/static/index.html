@@ -18,19 +18,21 @@
   <section class="card" id="setup">
     <h2>1. Что обрабатываем</h2>
 
-    <label class="file" id="drop-model">
-      <input type="file" id="model" accept=".step,.stp,.iges,.igs,.brep,.stl,.obj,.prt">
-      <span class="file-title">Модель детали</span>
-      <span class="file-name" id="model-name">файл не выбран</span>
-      <span class="file-hint">STEP, IGES, BREP, STL, OBJ или NX .prt</span>
-    </label>
+    <div class="files">
+      <label class="file" id="drop-model">
+        <input type="file" id="model" accept=".step,.stp,.iges,.igs,.brep,.stl,.obj,.prt">
+        <span class="file-title">Модель детали</span>
+        <span class="file-name" id="model-name">файл не выбран</span>
+        <span class="file-hint">STEP, IGES, BREP, STL, OBJ или NX .prt</span>
+      </label>
 
-    <label class="file" id="drop-stock">
-      <input type="file" id="stock" accept=".step,.stp,.iges,.igs,.brep,.stl,.obj,.prt">
-      <span class="file-title">Заготовка <em>— необязательно</em></span>
-      <span class="file-name" id="stock-name">не выбрана: бокс от габарита детали</span>
-      <span class="file-hint">Файл должен быть в той же системе координат, что и деталь</span>
-    </label>
+      <label class="file" id="drop-stock">
+        <input type="file" id="stock" accept=".step,.stp,.iges,.igs,.brep,.stl,.obj,.prt">
+        <span class="file-title">Заготовка <em>— необязательно</em></span>
+        <span class="file-name" id="stock-name">не выбрана: бокс от габарита детали</span>
+        <span class="file-hint">Файл должен быть в той же системе координат, что и деталь</span>
+      </label>
+    </div>
 
     <h2>2. Параметры</h2>
     <p class="note">Подставлены дефолты пайплайна. Меняйте только то, что нужно —
