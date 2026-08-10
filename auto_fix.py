@@ -706,7 +706,11 @@ def main():
             journal["iterations"].append(entry)
             break
         entry["llm"] = {k: ans.get(k) for k in ("analysis", "verdict", "report")}
-        log(f"ЛЛМ: {ans.get('verdict')} — {ans.get('analysis', '')[:200]}")
+        # analysis печатаем целиком (без обрезки), но переносы строк схлопываем в
+        # пробелы: строку разбирает построчный регэксп в web/jobs.py, и внутренний
+        # \n разорвал бы её на «хвост», который в фид уже не попадёт.
+        analysis = " ".join((ans.get("analysis") or "").split())
+        log(f"ЛЛМ: {ans.get('verdict')} — {analysis}")
 
         if ans.get("verdict") == "ok":
             entry["verdict"] = "ok (по оценке ЛЛМ)"
