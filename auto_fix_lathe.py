@@ -31,10 +31,11 @@ auto_fix_lathe.py — агентная петля для ТОЧЕНИЯ: под�
     в ISV на ~0.8 мм, воспроизводится на обоих концах с точностью 0.001 мм.
 Вычтенное печатается каждой итерацией — молча пол не прячется.
 
-Транспорт ЛЛМ — OpenRouter (ключ в `.openrouter_key`, файл в .gitignore),
-общий с фрезерной петлёй: `auto_fix.ask_openrouter` уже умеет обходить
-строки-«пульс» перед телом ответа и повторять запрос, когда у рассуждающей
-модели ответ умирает на стороне провайдера.
+Транспорт ЛЛМ общий с фрезерной петлёй (`auto_fix.ask_llm`): по умолчанию
+OpenRouter (ключ в `.openrouter_key`, файл в .gitignore) — он уже умеет
+обходить строки-«пульс» перед телом ответа и повторять запрос, когда у
+рассуждающей модели ответ умирает на стороне провайдера. `--llm claude` и
+`--llm gigachat` работают через тот же диспетчер.
 
 CLI:
   python auto_fix_lathe.py деталь.prt --gcode runs/N/out.gcode \
@@ -47,11 +48,12 @@ import math
 import os
 import subprocess
 import sys
+import threading
 import time
 
 import config
 from lathe import lathe_tools
-from auto_fix import ask_openrouter, extract_json     # общий транспорт и парсер
+from auto_fix import ask_llm, extract_json            # общий транспорт и парсер
 
 for _s in (sys.stdout, sys.stderr):
     if (getattr(_s, "encoding", "") or "").lower().replace("-", "") != "utf8":
@@ -136,6 +138,37 @@ def score(diff, z_end=None):
 
 # ── ОДНА ИТЕРАЦИЯ ───────────────────────────────────────────────────────────
 
+def _run_logged(cmd, log_path, timeout, stream=False):
+    """Запуск прогона с логом. При stream=True вывод дублируется в свой stdout.
+
+    Дублирование нужно тому, кто смотрит за петлёй снаружи (веб-морда): вехи
+    прогона печатает run_lathe.py, и без пересылки страница пять минут
+    показывала бы «генерация», пока идут два прогона в ISV.
+    """
+    with open(log_path, "w", encoding="utf-8") as lf:
+        if not stream:
+            return subprocess.run(cmd, cwd=ROOT, stdout=lf,
+                                  stderr=subprocess.STDOUT, text=True,
+                                  encoding="utf-8", errors="replace",
+                                  timeout=timeout)
+        proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True,
+                                encoding="utf-8", errors="replace", bufsize=1)
+        # Таймаут своими руками: чтение из трубы блокирует, и на зависшем
+        # прогоне communicate(timeout=…) сюда уже не добраться.
+        killer = threading.Timer(timeout, proc.kill)
+        killer.start()
+        try:
+            for line in proc.stdout:
+                lf.write(line)
+                lf.flush()
+                print(line.rstrip(), flush=True)
+            proc.wait()
+        finally:
+            killer.cancel()
+        return proc
+
+
 def run_once(model, gcode, active, args, tag):
     """Запускает run_lathe.py заданным набором и возвращает его отчёт (dict)."""
     out_dir = os.path.dirname(os.path.abspath(gcode))
@@ -149,10 +182,7 @@ def run_once(model, gcode, active, args, tag):
     if args.sim_setup:
         cmd += ["--sim-setup", args.sim_setup]
     t0 = time.perf_counter()
-    with open(log_path, "w", encoding="utf-8") as lf:
-        proc = subprocess.run(cmd, cwd=ROOT, stdout=lf, stderr=subprocess.STDOUT,
-                              text=True, encoding="utf-8", errors="replace",
-                              timeout=args.timeout)
+    proc = _run_logged(cmd, log_path, args.timeout, stream=args.stream)
     wall = round(time.perf_counter() - t0, 1)
     if not os.path.exists(rep_path):
         tail = ""
@@ -276,11 +306,11 @@ def ask_next(rep, sc, history, cat_desc, args, cat, journal, entry, active,
     Запись в журнал делается здесь же, чтобы след остался у любого исхода.
     """
     extra = getattr(config, "LATHE_TOOLS", None)
-    log(f"спрашиваю ЛЛМ ({args.llm_model})...")
+    log(f"спрашиваю ЛЛМ ({args.llm_model or args.llm})...")
     try:
-        raw = ask_openrouter(build_prompt(rep, sc, history, cat_desc,
-                                          args.ok_dr, failure),
-                             timeout=900, model=args.llm_model)
+        raw = ask_llm(build_prompt(rep, sc, history, cat_desc,
+                                   args.ok_dr, failure),
+                      timeout=900, model=args.llm_model, provider=args.llm)
         ans = extract_json(raw)
     except Exception as e:
         log(f"ЛЛМ не ответила разбираемым JSON: {e}")
@@ -350,8 +380,14 @@ def main():
                     help="максимум итераций (дефолт 3; итерация ~6 минут)")
     ap.add_argument("--tools", metavar="IDS",
                     help="стартовый набор (по умолчанию — заводской комплект)")
-    ap.add_argument("--llm-model", default=DEFAULT_MODEL, metavar="M",
-                    help=f"модель OpenRouter (дефолт {DEFAULT_MODEL})")
+    ap.add_argument("--llm", default="openrouter",
+                    choices=("openrouter", "claude", "gigachat"),
+                    help="транспорт запроса к агенту (дефолт openrouter)")
+    ap.add_argument("--llm-model", default="", metavar="M",
+                    help=f"модель; для openrouter дефолт {DEFAULT_MODEL}")
+    ap.add_argument("--stream", action="store_true",
+                    help="дублировать вывод прогонов в свой stdout — так за "
+                         "петлёй видно снаружи (этим пользуется веб-морда)")
     ap.add_argument("--sim-setup", choices=("1", "2", "both"),
                     help="гнать в ISV только один установ — вдвое дешевле, "
                          "для отладки самой петли")
@@ -363,6 +399,8 @@ def main():
     ap.add_argument("--timeout", type=int, default=3600, metavar="SEC",
                     help="потолок на одну итерацию, с (дефолт 3600)")
     args = ap.parse_args()
+    if args.llm == "openrouter" and not args.llm_model:
+        args.llm_model = DEFAULT_MODEL
 
     if args.config:
         config.load(args.config)
@@ -375,7 +413,7 @@ def main():
 
     stem = os.path.splitext(os.path.abspath(args.gcode))[0]
     journal_path = stem + "_loop.json"
-    journal = {"model": os.path.abspath(args.model), "llm": "openrouter",
+    journal = {"model": os.path.abspath(args.model), "llm": args.llm,
                "llm_model": args.llm_model, "iterations": []}
     history = []
     last_ok = None            # (rep, sc) последнего УДАЧНОГО прогона

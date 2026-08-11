@@ -4,10 +4,15 @@ web/server.py — self-hosted веб-морда пайплайна.
 
     python -m web.server --port 8080 --llm openrouter
 
-Открывается на http://localhost:<порт>. Выбираете деталь и заготовку, правите
-параметры (подставлены дефолты пайплайна), жмёте «Начать обработку» — дальше
-крутится ЛЛМ-петля `auto_fix.py`, а страница показывает, на каком этапе она
-сейчас. В конце — файлы результата на скачивание.
+Открывается на http://localhost:<порт>. Выбираете деталь, вид обработки
+(ФРЕЗЕРОВКА или ТОЧЕНИЕ) и заготовку, правите параметры (подставлены дефолты
+пайплайна), жмёте «Начать обработку» — дальше крутится ЛЛМ-петля своего вида
+(`auto_fix.py` либо `auto_fix_lathe.py`), а страница показывает, на каком этапе
+она сейчас. В конце — файлы результата на скачивание.
+
+ВИД ОБРАБОТКИ ВЫБИРАЕТСЯ В БРАУЗЕРЕ, потому что это свойство ДЕТАЛИ: тело
+вращения точат, корпусную деталь фрезеруют. У каждого вида свой набор
+параметров, свои этапы и своя петля — см. web/params.py и web/jobs.py.
 
 АГЕНТ ВЫБИРАЕТСЯ ПРИ ЗАПУСКЕ СЕРВЕРА (`--llm`), а не в браузере: это настройка
 установки, а не параметр детали. Наличие ключа проверяется сразу — иначе
@@ -66,15 +71,20 @@ def index():
 
 @app.get("/api/params")
 def api_params():
-    return {"params": params.current(), "agent": AGENT,
+    """Спецификации ОБОИХ видов обработки разом: переключатель в браузере
+    меняет форму без похода на сервер, а этапы нужны фронту, чтобы нарисовать
+    схему процесса — у точения она своя."""
+    return {"kinds": params.all_kinds(), "default": params.DEFAULT_KIND,
+            "phases": jobs.PHASES, "agent": AGENT,
             "active": (jobs.active().state() if jobs.active() else None)}
 
 
 @app.post("/api/jobs")
 async def api_start(model: UploadFile, form: str = Form("{}"),
+                    kind: str = Form(params.DEFAULT_KIND),
                     stock: UploadFile | None = None):
     try:
-        cfg, run = params.build(json.loads(form or "{}"))
+        cfg, run = params.build(kind, json.loads(form or "{}"))
     except ValueError as e:
         raise HTTPException(400, str(e))
     except json.JSONDecodeError:
@@ -92,8 +102,10 @@ async def api_start(model: UploadFile, form: str = Form("{}"),
     model_path = os.path.join(tmp, safe_name(model.filename))
     with open(model_path, "wb") as f:
         f.write(await model.read())
+    # Заготовка — только у фрезеровки: у точения прокат подбирается сам, по
+    # ряду ГОСТ 2590 от габарита детали и припуска на сторону.
     stock_path = ""
-    if stock is not None and stock.filename:
+    if kind != "lathe" and stock is not None and stock.filename:
         stock_path = os.path.join(tmp, "stock_" + safe_name(stock.filename))
         with open(stock_path, "wb") as f:
             f.write(await stock.read())
@@ -101,7 +113,7 @@ async def api_start(model: UploadFile, form: str = Form("{}"),
     try:
         job = jobs.start(model_path, stock_path, cfg, run,
                          AGENT["llm"], AGENT["llm_model"],
-                         stock_align=bool(cfg.get("STOCK_ALIGN")))
+                         stock_align=bool(cfg.get("STOCK_ALIGN")), kind=kind)
     except RuntimeError as e:
         raise HTTPException(409, str(e))
     return job.state()
