@@ -776,7 +776,23 @@ def generate(prof_data, params):
     doable = []
     for lz in left_zones:
         (second_setup if lz["z_lo"] <= z_end + 1e-6 else doable).append(lz)
-    if doable:
+    # Пути считаются ДО шапки инструмента. Зона из `doable` может отсеяться
+    # (в ней меньше двух точек), и тогда шапка T3 повисала бы без единого
+    # рабочего хода. Это не косметика: при n_left = 0 симулятору сообщается
+    # «левого нет», ISV не создаёт T3 в револьвере, стойка встаёт на смене
+    # несуществующего инструмента и НЕ СОХРАНЯЕТ IPW вовсе. Замерено на наборе
+    # с 55°-чистовым: установ 2 падал именно так.
+    paths = []
+    for lz in doable:
+        pts = sorted([(z, r) for z, r in part_raw
+                      if lz["z_lo"] - 1e-9 <= z <= lz["z_hi"] + 1e-9],
+                     key=lambda t: t[0])          # по возрастанию z: идём в +Z
+        if len(pts) < 2:
+            continue
+        paths.append(compensate_nose_left(
+            pts, nose_r, params.get("tip_offset", (1.0, -1.0)))
+            if nose_r else pts)
+    if paths:
         g.append(f"G0 {X(retract_r)} Z{z_top + clear:.3f}")
         g.append("M5")
         g.append(f"T{params.get('left_tool_number', 3)}")
@@ -784,14 +800,7 @@ def generate(prof_data, params):
         g.append(f"G97 S{rpm} M3")
         g.append("(Tool T%d: left-hand turning insert, cuts towards +Z)"
                  % params.get("left_tool_number", 3))
-    for lz in doable:
-        pts = sorted([(z, r) for z, r in part_raw
-                      if lz["z_lo"] - 1e-9 <= z <= lz["z_hi"] + 1e-9],
-                     key=lambda t: t[0])          # по возрастанию z: идём в +Z
-        if len(pts) < 2:
-            continue
-        path = (compensate_nose_left(pts, nose_r, params.get("tip_offset", (1.0, -1.0)))
-                if nose_r else pts)
+    for path in paths:
         n_left += 1
         op(f"LeftTurn{n_left}")
         # подход радиально в том z, где правый резец уже снял материал до профиля

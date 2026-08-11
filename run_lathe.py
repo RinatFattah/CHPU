@@ -33,9 +33,22 @@ for _s in (sys.stdout, sys.stderr):
 def main():
     ap = argparse.ArgumentParser(
         description="Тело вращения → токарная управляющая программа (G-Code)")
-    ap.add_argument("model", help="деталь: .step/.stp/.iges/.brep или .prt (нужен NX)")
+    ap.add_argument("model", nargs="?",
+                    help="деталь: .step/.stp/.iges/.brep или .prt (нужен NX)")
     ap.add_argument("gcode", nargs="?", help="куда писать G-Code")
     ap.add_argument("--config", metavar="FILE", help="YAML-конфиг")
+    ap.add_argument("--tools", metavar="IDS",
+                    help="какие инструменты ДОСТУПНЫ генератору: id через "
+                         "запятую (см. --list-tools). Программа строится "
+                         "только из них; работу, которую делать нечем, "
+                         "генератор не делает и выносит в «не обработано». "
+                         "Роли — черновая, чистовая — он раскладывает сам")
+    ap.add_argument("--list-tools", action="store_true",
+                    help="показать парк инструмента и выйти")
+    ap.add_argument("--report", metavar="FILE",
+                    help="выгрузить итог прогона машиночитаемым JSON: активный "
+                         "набор инструмента, статистика обеих программ, сверка. "
+                         "Это ВХОД АГЕНТНОЙ ПЕТЛИ (auto_fix_lathe.py)")
     ap.add_argument("--depth-of-cut", type=float, help="глубина резания за проход, мм")
     ap.add_argument("--allowance", type=float,
                     help="припуск на чистовую по радиусу, мм (дефолт 0.2)")
@@ -146,6 +159,18 @@ def main():
         config.load(args.config)
         print(f"[config] {args.config}")
 
+    if args.list_tools:
+        from lathe import lathe_tools
+        cat = lathe_tools.catalog(getattr(config, "LATHE_TOOLS", None))
+        print(f"{'id':<14} {'тип':<10} {'φ₁':>6}  что это")
+        for t in cat.values():
+            f1 = f"{lathe_tools.phi1(t):.1f}°" if t["type"] == "turning" else ""
+            print(f"{t['id']:<14} {t['type']:<10} {f1:>6}  {t['desc']}")
+        print(f"\nвсего в парке: {len(cat)}; по умолчанию доступен весь")
+        return
+    if not args.model:
+        ap.error("нужен файл детали (или --list-tools)")
+
     if not os.path.exists(args.model):
         print(f"❌ Файл не найден: {args.model}")
         sys.exit(1)
@@ -246,6 +271,52 @@ def main():
                       and getattr(config, "LATHE_NOSE_COMP", True)),
         "tip_offset": tuple(getattr(config, "LATHE_TIP_OFFSET", (1.0, -1.0))),
     }
+
+    # ── ДОСТУПНЫЙ ИНСТРУМЕНТ ──
+    # Генератор получает СПИСОК инструментов и раскладывает работы по нему сам
+    # (lathe_tools.plan): чистовым идёт проходной с наибольшим φ₁, черновым —
+    # самый жёсткий, а если проходной один, он делает и то, и другое. Ролей в
+    # парке нет: «черновой» и «чистовой» — это применение, а не свойство резца.
+    # Без --tools доступен весь парк, и раскладка совпадает с прежними
+    # дефолтами config.py.
+    from lathe import lathe_tools
+    extra_tools = getattr(config, "LATHE_TOOLS", None)
+    available = ([s.strip() for s in args.tools.split(",") if s.strip()]
+                 if args.tools
+                 else getattr(config, "LATHE_AVAILABLE_TOOLS", None))
+    try:
+        tool_params, sim_tools, tools_assigned = lathe_tools.plan(
+            available, extra=extra_tools,
+            log=lambda m: print(f"Инструмент: {m}"))
+    except ValueError as e:
+        print(f"❌ {e}")
+        sys.exit(1)
+    p.update(tool_params)
+    # Явные --no-* перекрывают каталог, но ТОЛЬКО в сторону выключения:
+    # флаг не может добавить инструмент, которого в наборе нет.
+    for flag, key in ((args.no_finish_tool, "finish_tool"),
+                      (args.no_groove_tool, "groove_tool"),
+                      (args.no_left_tool, "left_tool"),
+                      (args.no_drill, "drill"),
+                      (args.no_center_drill, "center_drill"),
+                      (args.no_partoff, "partoff")):
+        if flag:
+            p[key] = False
+    if args.groove_width is not None:          # ручная ширина пластины сильнее каталога
+        p["groove_width"] = args.groove_width
+
+    # Копилка машиночитаемого отчёта (--report). Пишется по ходу прогона и
+    # выгружается в конце: агентной петле нужен ровно этот срез — что выдали
+    # генератору, что он сделал и что показала сверка.
+    rep = {"model": os.path.abspath(args.model), "gcode": os.path.abspath(gcode),
+           # ПАРК — что есть в цехе; ДОСТУПНО — что выдали генератору;
+           # РАСКЛАДКА — что он из этого сделал, это уже его решение
+           "tools": {"pool": sorted(lathe_tools.all_ids(extra_tools)),
+                     "available": sorted(available if available is not None
+                                         else lathe_tools.all_ids(extra_tools)),
+                     "assigned": tools_assigned},
+           "setups": [], "sim": {}, "diff": {}}
+
     stock_radial = (args.stock_radial if args.stock_radial is not None
                     else getattr(config, "LATHE_STOCK_RADIAL", 1.0))
 
@@ -336,6 +407,8 @@ def main():
                              f"parts off at Z{z_end - face_allow:.2f}"))
         prof = prof1
         gcode2 = os.path.splitext(gcode)[0] + "_2" + os.path.splitext(gcode)[1]
+        rep["z_split"] = round(z_split, 3)
+        rep["z_end"] = round(z_end, 3)
         print(f"Два установа: передача работы на z {z_split:.1f} "
               f"(зажим {grip:g} мм, припуск на подрезку {face_allow:g} мм)")
         print(f"   установ 1: z {0.0:.1f}..{z_split:.1f} + отверстие до z "
@@ -347,7 +420,23 @@ def main():
             print(f"   ⚠  резьба Ø{th['d']} на z {th['z_from']}..{th['z_to']} "
                   f"пересекает границу установов — оставлена первому целиком")
 
+    def setup_row(n, path, st):
+        """Строка установа для --report: что генератор сделал этим набором."""
+        return {"setup": n, "gcode": os.path.abspath(path),
+                "lines": st.get("lines"), "ops": st.get("ops", []),
+                "arcs": st.get("arcs", 0),
+                "uncut_mm3": round(st.get("uncut_mm3", 0.0), 1),
+                "blade_mm": st.get("blade"),
+                "blade_tight": bool(st.get("blade_tight")),
+                "grooves": st.get("grooves", 0),
+                "groove_volume_mm3": round(st.get("groove_volume_mm3", 0.0), 1),
+                "left_passes": st.get("left_passes", 0),
+                "left_volume_mm3": round(st.get("left_volume_mm3", 0.0), 1),
+                "finish_tool": st.get("finish_tool") or 0,
+                "pre_finish": st.get("pre_finish", 0)}
+
     stats = lathe_gcode.write(prof, p, gcode)
+    rep["setups"].append(setup_row(1, gcode, stats))
     print(f"✅ Программа: {stats['lines']} строк → {gcode} "
           f"({os.path.getsize(gcode):,} байт)")
     print(f"   операции: {', '.join(stats['ops'][:8])}"
@@ -395,6 +484,7 @@ def main():
 
     if prof2 is not None:
         stats2 = lathe_gcode.write(prof2, p2, gcode2)
+        rep["setups"].append(setup_row(2, gcode2, stats2))
         print(f"✅ Программа установа 2: {stats2['lines']} строк → {gcode2} "
               f"({os.path.getsize(gcode2):,} байт)")
         print(f"   операции: {', '.join(stats2['ops'][:8])}"
@@ -441,20 +531,21 @@ def main():
         from nx import nx_lathe_sim
 
         def sim_kwargs(st):
-            """Инструмент для ISV. Общее — из конфига, своё каждый установ
-            объявляет сам: ширина канавочной пластины и участие левого резца
-            зависят от того, что достаётся именно этой половине детали."""
+            """Инструмент для ISV.
+
+            Геометрия — из АКТИВНОГО НАБОРА (`sim_tools`), одним куском вместе
+            с формой пластины в NX: угол и форма обязаны совпадать, иначе
+            симулятор проверит не ту программу, которую спланировали.
+            Своё каждый установ объявляет сам: ширина канавочной пластины и
+            участие левого резца зависят от того, что досталось именно этой
+            половине детали."""
             return dict(
-                nose_radius=p["nose_radius"], nose_angle=p["nose_angle"],
-                insert_size=p["insert_edge"],
+                sim_tools,
                 groove_width=st.get("blade") or 0.0,
-                groove_tool_number=p["groove_tool_number"],
-                left_tool_number=(p["left_tool_number"]
+                groove_tool_number=p.get("groove_tool_number", 2),
+                left_tool_number=(p.get("left_tool_number", 3)
                                   if st.get("left_passes") else 0),
-                finish_tool_number=st.get("finish_tool") or 0,
-                finish_nose_angle=p["finish_nose_angle"],
-                finish_nose_radius=getattr(config, "LATHE_FINISH_NOSE_RADIUS", 0.4),
-                finish_insert_size=p["finish_insert_edge"])
+                finish_tool_number=st.get("finish_tool") or 0)
 
         def sim_tail(r):
             return ((f"  (машинное время {r['machine_time']}"
@@ -486,12 +577,16 @@ def main():
                                                  out_stem=stem + "_setup1",
                                                  **sim_kwargs(stats))
                     print(f"   установ 1 → {res1['step']}{sim_tail(res1)}")
+                    rep["sim"]["setup1"] = res1["step"]
+                    rep["sim"]["machine_time_1"] = res1.get("machine_time")
                 if which in ("2", "both"):
                     res2 = nx_lathe_sim.simulate(gcode2, stock,
                                                  out_stem=stem + "_setup2",
                                                  **sim_kwargs(stats2))
                     print(f"   установ 2 → {res2['step']}{sim_tail(res2)}"
                           f"   (в раме УСТАНОВА 2, не детали)")
+                    rep["sim"]["setup2"] = res2["step"]
+                    rep["sim"]["machine_time_2"] = res2.get("machine_time")
                 res = res1 or res2
         except Exception as e:
             print(f"⚠  NX-симуляция не удалась: {e}")
@@ -513,6 +608,9 @@ def main():
                     from cam import step_diff
                     d = step_diff.diff(stem + "_part.step", res["step"],
                                        stem + "_nxdiff.json")
+                    rep["sim"]["result"] = res["step"]
+                    rep["diff"] = {"undercut_total_mm3": d["undercut_total_mm3"],
+                                   "overcut_total_mm3": d["overcut_total_mm3"]}
                     print(f"   сверка NX-результата с моделью: "
                           f"недорез {d['undercut_total_mm3']:.1f} мм³, "
                           f"зарез {d['overcut_total_mm3']:.1f} мм³")
@@ -528,6 +626,8 @@ def main():
                 print(f"⚠  итоговая деталь не собралась: {e}")
                 sys.exit(2)
             z0, z1 = a["z_range"]
+            rep["sim"]["full"] = full
+            rep["sim"]["full_volume_mm3"] = round(a["volume"], 1)
             print(f"✅ ИТОГ двух установов → {full}  (солид, объём "
                   f"{a['volume']:.1f} мм³, z {z0:.2f}..{z1:.2f})")
             print(f"   ▶ наложить на деталь: {full}  +  {stem + '_part.step'}")
@@ -541,6 +641,12 @@ def main():
                                        stem + "_nxdiff.json")
                 with open(stem + "_nxdiff.md", "w", encoding="utf-8") as f:
                     f.write(lathe_diff.report(d))
+                rep["diff"] = {k: d.get(k) for k in (
+                    "undercut_total_mm3", "overcut_total_mm3",
+                    "undercut_fixed_mm3", "overcut_fixed_mm3", "film_mm",
+                    "part_volume_mm3", "result_volume_mm3")}
+                rep["diff"]["by_z"] = d.get("by_z", [])
+                rep["diff"]["report_md"] = stem + "_nxdiff.md"
                 print(f"   сверка итога с моделью: недорез "
                       f"{d['undercut_total_mm3']:.1f} мм³, зарез "
                       f"{d['overcut_total_mm3']:.1f} мм³ (сырое)")
@@ -552,6 +658,14 @@ def main():
                       f"(граница установов z {z_split:.2f})")
             except Exception as e:
                 print(f"   (сверка не выполнена: {e})")
+
+
+    if args.report:
+        os.makedirs(os.path.dirname(os.path.abspath(args.report)) or ".",
+                    exist_ok=True)
+        with open(args.report, "w", encoding="utf-8") as f:
+            json.dump(rep, f, ensure_ascii=False, indent=1)
+        print(f"📋 отчёт прогона → {args.report}")
 
 
 if __name__ == "__main__":
