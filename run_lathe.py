@@ -38,12 +38,13 @@ def main():
     ap.add_argument("gcode", nargs="?", help="куда писать G-Code")
     ap.add_argument("--config", metavar="FILE", help="YAML-конфиг")
     ap.add_argument("--tools", metavar="IDS",
-                    help="АКТИВНЫЙ НАБОР инструмента: id через запятую "
-                         "(см. --list-tools). Программа строится только этими "
-                         "инструментами; роли, которых в наборе нет, не "
-                         "выполняются и попадают в «не обработано»")
+                    help="какие инструменты ДОСТУПНЫ генератору: id через "
+                         "запятую (см. --list-tools). Программа строится "
+                         "только из них; работу, которую делать нечем, "
+                         "генератор не делает и выносит в «не обработано». "
+                         "Роли — черновая, чистовая — он раскладывает сам")
     ap.add_argument("--list-tools", action="store_true",
-                    help="показать каталог инструмента и выйти")
+                    help="показать парк инструмента и выйти")
     ap.add_argument("--report", metavar="FILE",
                     help="выгрузить итог прогона машиночитаемым JSON: активный "
                          "набор инструмента, статистика обеих программ, сверка. "
@@ -161,11 +162,11 @@ def main():
     if args.list_tools:
         from lathe import lathe_tools
         cat = lathe_tools.catalog(getattr(config, "LATHE_TOOLS", None))
-        print(f"{'id':<16} {'роль':<8} {'T':>2}  что это")
+        print(f"{'id':<14} {'тип':<10} {'φ₁':>6}  что это")
         for t in cat.values():
-            print(f"{t['id']:<16} {t['role']:<8} {t['number']:>2}  {t['desc']}")
-        print("\nпо умолчанию активны: "
-              + ", ".join(lathe_tools.default_active(cat)))
+            f1 = f"{lathe_tools.phi1(t):.1f}°" if t["type"] == "turning" else ""
+            print(f"{t['id']:<14} {t['type']:<10} {f1:>6}  {t['desc']}")
+        print(f"\nвсего в парке: {len(cat)}; по умолчанию доступен весь")
         return
     if not args.model:
         ap.error("нужен файл детали (или --list-tools)")
@@ -271,18 +272,21 @@ def main():
         "tip_offset": tuple(getattr(config, "LATHE_TIP_OFFSET", (1.0, -1.0))),
     }
 
-    # ── АКТИВНЫЙ НАБОР ИНСТРУМЕНТА ──
-    # Геометрия резцов и наличие ролей берутся из каталога (lathe/lathe_tools.py),
-    # а не из плоских ключей конфига: программа строится ТОЛЬКО тем, что выдано.
-    # Роли, которых в наборе нет, не выполняются — их работа честно попадает
-    # в «не обработано». Умолчание каталога совпадает с дефолтами config.py,
-    # поэтому без --tools поведение прежнее.
+    # ── ДОСТУПНЫЙ ИНСТРУМЕНТ ──
+    # Генератор получает СПИСОК инструментов и раскладывает работы по нему сам
+    # (lathe_tools.plan): чистовым идёт проходной с наибольшим φ₁, черновым —
+    # самый жёсткий, а если проходной один, он делает и то, и другое. Ролей в
+    # парке нет: «черновой» и «чистовой» — это применение, а не свойство резца.
+    # Без --tools доступен весь парк, и раскладка совпадает с прежними
+    # дефолтами config.py.
     from lathe import lathe_tools
-    active = ([s.strip() for s in args.tools.split(",") if s.strip()]
-              if args.tools else getattr(config, "LATHE_ACTIVE_TOOLS", None))
+    extra_tools = getattr(config, "LATHE_TOOLS", None)
+    available = ([s.strip() for s in args.tools.split(",") if s.strip()]
+                 if args.tools
+                 else getattr(config, "LATHE_AVAILABLE_TOOLS", None))
     try:
-        tool_params, sim_tools, tools_chosen = lathe_tools.resolve(
-            active, extra=getattr(config, "LATHE_TOOLS", None),
+        tool_params, sim_tools, tools_assigned = lathe_tools.plan(
+            available, extra=extra_tools,
             log=lambda m: print(f"Инструмент: {m}"))
     except ValueError as e:
         print(f"❌ {e}")
@@ -305,11 +309,12 @@ def main():
     # выгружается в конце: агентной петле нужен ровно этот срез — что выдали
     # генератору, что он сделал и что показала сверка.
     rep = {"model": os.path.abspath(args.model), "gcode": os.path.abspath(gcode),
-           "tools": {"active": sorted(active if active is not None
-                                      else lathe_tools.default_active()),
-                     "chosen": {r: t["id"] for r, t in tools_chosen.items()},
-                     "roles_off": [r for r in lathe_tools.ROLES
-                                   if r not in tools_chosen]},
+           # ПАРК — что есть в цехе; ДОСТУПНО — что выдали генератору;
+           # РАСКЛАДКА — что он из этого сделал, это уже его решение
+           "tools": {"pool": sorted(lathe_tools.all_ids(extra_tools)),
+                     "available": sorted(available if available is not None
+                                         else lathe_tools.all_ids(extra_tools)),
+                     "assigned": tools_assigned},
            "setups": [], "sim": {}, "diff": {}}
 
     stock_radial = (args.stock_radial if args.stock_radial is not None
