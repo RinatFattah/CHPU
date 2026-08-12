@@ -218,8 +218,22 @@ def run_once(model, gcode, active, args, tag):
 
 # ── ПРОМПТ ──────────────────────────────────────────────────────────────────
 
-def build_prompt(rep, sc, history, catalog_desc, ok_dr, failure=None):
+def build_prompt(rep, sc, history, catalog_desc, ok_dr, failure=None,
+                 note=None):
     setups = [{k: v for k, v in s.items() if k != "ops"} for s in rep["setups"]]
+    # ФАКТ, который легко проглядеть в раскладке, а он решает почти всё: если
+    # отдельного чистового резца нет, чистовую ведёт черновой, и остаток в
+    # уступах — следствие именно этого. GigaChat на 14-31A пропустил его и
+    # ушёл разбираться с левым резцом (runs/115).
+    if not any(s.get("finish_tool") for s in rep["setups"]):
+        no_finish = ("\n⚠ ОТДЕЛЬНОГО ЧИСТОВОГО РЕЗЦА В ЭТОМ ПРОГОНЕ НЕТ: чистовую "
+                     "вёл тот же резец, что и черновую. Если в парке есть "
+                     "проходной с БО́ЛЬШИМ φ₁, чем у выданных, начни с него — "
+                     "именно φ₁ решает, насколько близко к стенке уступа "
+                     "подходит резец.")
+    else:
+        no_finish = ""
+    extra_note = f"\n⚠ {note}\n" if note else ""
     bands = [b for b in (rep["diff"].get("by_z") or [])
              if b.get("under_mm3", 0) + b.get("over_mm3", 0) > 1.0]
     fail = ("" if not failure else f"""
@@ -230,7 +244,7 @@ def build_prompt(rep, sc, history, catalog_desc, ok_dr, failure=None):
 провалившегося; смена чистового резца на форму пластины, которой в удачных
 прогонах не было, — вероятная причина отказа симулятора.
 """)
-    return f"""Ты — технолог-программист ЧПУ.{fail} Токарный CAM-пайплайн сам сгенерировал
+    return f"""Ты — технолог-программист ЧПУ.{fail}{extra_note} Токарный CAM-пайплайн сам сгенерировал
 управляющую программу на деталь, прогнал её на виртуальном станке NX ISV со съёмом
 материала и сверил результат с моделью. Твоя задача — решить, КАКИЕ ИНСТРУМЕНТЫ
 ВЫДАТЬ ГЕНЕРАТОРУ.
@@ -248,7 +262,7 @@ def build_prompt(rep, sc, history, catalog_desc, ok_dr, failure=None):
 {json.dumps(catalog_desc, ensure_ascii=False)}
 
 ВЫДАНО ГЕНЕРАТОРУ В ЭТОМ ПРОГОНЕ: {json.dumps(rep['tools']['available'], ensure_ascii=False)}
-КАК ОН ЭТО РАЗЛОЖИЛ: {json.dumps(rep['tools']['assigned'], ensure_ascii=False)}
+КАК ОН ЭТО РАЗЛОЖИЛ: {json.dumps(rep['tools']['assigned'], ensure_ascii=False)}{no_finish}
 Граница установов z = {rep.get('z_split')}, дальний торец детали z = {rep.get('z_end')}.
 
 ЧТО ПОЛУЧИЛОСЬ У ГЕНЕРАТОРА (по установам):
@@ -333,7 +347,7 @@ unfixable — набором инструмента это не лечится, 
 # ── ЗАПРОС К ЛЛМ И ВАЛИДАЦИЯ ОТВЕТА ─────────────────────────────────────────
 
 def ask_next(rep, sc, history, cat_desc, args, cat, journal, entry, active,
-             failure=None):
+             failure=None, note=None, _retry=True):
     """Спросить ЛЛМ новый набор. Возвращает список id или None (остановиться).
 
     Запись в журнал делается здесь же, чтобы след остался у любого исхода.
@@ -342,7 +356,7 @@ def ask_next(rep, sc, history, cat_desc, args, cat, journal, entry, active,
     log(f"спрашиваю ЛЛМ ({args.llm_model or args.llm})...")
     try:
         raw = ask_llm(build_prompt(rep, sc, history, cat_desc,
-                                   args.ok_dr, failure),
+                                   args.ok_dr, failure, note),
                       timeout=900, model=args.llm_model, provider=args.llm)
         ans = extract_json(raw)
     except Exception as e:
@@ -386,13 +400,27 @@ def ask_next(rep, sc, history, cat_desc, args, cat, journal, entry, active,
 
     # Сравниваем РАЗРЕШЁННЫЕ наборы, а не списки id: «добавить второй чистовой,
     # не убрав первый» даёт побитово ту же программу (runs/100, 340 с впустую).
+    # Бесполезный ответ — не повод кончать петлю: переспрашиваем ОДИН раз,
+    # приложив факт. Запрос стоит секунды, потерянный прогон — шесть минут NX.
+    def again(why, hint):
+        if not _retry:
+            return stop(why, f"{hint} — останавливаюсь")
+        log(f"{why}: переспрашиваю с пояснением")
+        entry.setdefault("rejected", []).append({"tools": new, "why": why})
+        return ask_next(rep, sc, history, cat_desc, args, cat, journal, entry,
+                        active, failure, note=hint, _retry=False)
+
     if sig_new == signature(active, extra):
-        return stop("тот же набор по существу",
-                    f"после разрешения ролей набор тот же ({sig_new}) — "
-                    f"программа выйдет прежней, останавливаюсь")
+        return again("тот же набор по существу",
+                     "Твой прошлый ответ после раскладки по ролям даёт ТУ ЖЕ "
+                     "программу, что уже прогнали, — она выйдет байт в байт "
+                     "прежней и ничего не изменит. Назови набор, который меняет "
+                     "РАСКЛАДКУ: добавь инструмент, которого в наборе нет, либо "
+                     "убери тот, что ведёт работу сейчас.")
     if sig_new in [h.get("sig") for h in history]:
-        return stop("повтор набора",
-                    f"набор {sig_new} уже пробовали — останавливаюсь")
+        return again("повтор набора",
+                     "Такой набор уже пробовали на предыдущих итерациях, его "
+                     "результат тебе известен. Предложи другой.")
 
     entry["next_tools"] = new
     entry["next_sig"] = sig_new
