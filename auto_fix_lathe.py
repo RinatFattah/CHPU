@@ -219,13 +219,13 @@ def run_once(model, gcode, active, args, tag):
 # ── ПРОМПТ ──────────────────────────────────────────────────────────────────
 
 def build_prompt(rep, sc, history, catalog_desc, ok_dr, failure=None,
-                 note=None):
+                 note=None, hints=True):
     setups = [{k: v for k, v in s.items() if k != "ops"} for s in rep["setups"]]
     # ФАКТ, который легко проглядеть в раскладке, а он решает почти всё: если
     # отдельного чистового резца нет, чистовую ведёт черновой, и остаток в
     # уступах — следствие именно этого. GigaChat на 14-31A пропустил его и
     # ушёл разбираться с левым резцом (runs/115).
-    if not any(s.get("finish_tool") for s in rep["setups"]):
+    if hints and not any(s.get("finish_tool") for s in rep["setups"]):
         no_finish = ("\n⚠ ОТДЕЛЬНОГО ЧИСТОВОГО РЕЗЦА В ЭТОМ ПРОГОНЕ НЕТ: чистовую "
                      "вёл тот же резец, что и черновую. Если в парке есть "
                      "проходной с БО́ЛЬШИМ φ₁, чем у выданных, начни с него — "
@@ -356,7 +356,8 @@ def ask_next(rep, sc, history, cat_desc, args, cat, journal, entry, active,
     log(f"спрашиваю ЛЛМ ({args.llm_model or args.llm})...")
     try:
         raw = ask_llm(build_prompt(rep, sc, history, cat_desc,
-                                   args.ok_dr, failure, note),
+                                   args.ok_dr, failure, note,
+                                   hints=not getattr(args, "no_hints", False)),
                       timeout=900, model=args.llm_model, provider=args.llm)
         ans = extract_json(raw)
     except Exception as e:
@@ -446,6 +447,10 @@ def main():
                     help="транспорт запроса к агенту (дефолт openrouter)")
     ap.add_argument("--llm-model", default="", metavar="M",
                     help=f"модель; для openrouter дефолт {DEFAULT_MODEL}")
+    ap.add_argument("--no-hints", action="store_true",
+                    help="не подсказывать агенту вычисленные факты (сейчас это "
+                         "«отдельного чистового резца нет»). Для КОНТРОЛЬНЫХ "
+                         "опытов: сам ли агент находит нехватку инструмента")
     ap.add_argument("--stream", action="store_true",
                     help="дублировать вывод прогонов в свой stdout — так за "
                          "петлёй видно снаружи (этим пользуется веб-морда)")
