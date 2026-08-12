@@ -47,16 +47,21 @@ for _s in (sys.stdout, sys.stderr):
 # Агенты: id → (аргументы транспорта, сколько итераций даём, потолок на прогон).
 # Потолок — не про качество, а про очередь: у петли есть собственные стопы
 # (повтор набора, unfixable), потолок ловит только зависание.
+# `--llm-timeout 300` у всех, кто ходит через OpenRouter: там внутри ещё три
+# попытки, и с дефолтными 900 зависший запрос съедает 45 минут. В пакете 110
+# так сгорели два прогона Kimi целиком — ровно по потолку, секунда в секунду.
 AGENTS = {
     "kimi": {"args": ["--llm", "openrouter",
-                      "--llm-model", "moonshotai/kimi-k3"],
+                      "--llm-model", "moonshotai/kimi-k3",
+                      "--llm-timeout", "300"],
              "iters": 5, "cap_min": 45,
              "desc": "Kimi K3 через OpenRouter"},
     "gigachat": {"args": ["--llm", "gigachat"],
                  "iters": 10, "cap_min": 60,
                  "desc": "GigaChat (Сбер)"},
     "deepseek": {"args": ["--llm", "openrouter",
-                          "--llm-model", "deepseek/deepseek-v4-flash-0731"],
+                          "--llm-model", "deepseek/deepseek-v4-flash-0731",
+                          "--llm-timeout", "300"],
                  "iters": 5, "cap_min": 45,
                  "desc": "DeepSeek V4 Flash через OpenRouter"},
     "claude": {"args": ["--llm", "claude"], "iters": 5, "cap_min": 45,

@@ -360,7 +360,8 @@ def ask_next(rep, sc, history, cat_desc, args, cat, journal, entry, active,
                                    hints=(getattr(args, "hints", False)
                                           and not getattr(args, "no_hints",
                                                           False))),
-                      timeout=900, model=args.llm_model, provider=args.llm)
+                      timeout=getattr(args, "llm_timeout", 900),
+                      model=args.llm_model, provider=args.llm)
         ans = extract_json(raw)
     except Exception as e:
         log(f"ЛЛМ не ответила разбираемым JSON: {e}")
@@ -473,6 +474,12 @@ def main():
                          "как контекст")
     ap.add_argument("--timeout", type=int, default=3600, metavar="SEC",
                     help="потолок на одну итерацию, с (дефолт 3600)")
+    # Бюджет ОДНОГО запроса к ЛЛМ. У OpenRouter внутри ещё 3 попытки, то есть
+    # худший случай втрое больше: с дефолтными 900 зависший запрос съедал 45
+    # минут, и в ночном пакете 110 так сгорели два прогона Kimi целиком.
+    ap.add_argument("--llm-timeout", type=int, default=900, metavar="SEC",
+                    help="потолок на один запрос к ЛЛМ, с (дефолт 900; у "
+                         "OpenRouter внутри ещё 3 попытки — worst case ×3)")
     args = ap.parse_args()
     if args.llm == "openrouter" and not args.llm_model:
         args.llm_model = DEFAULT_MODEL
