@@ -264,20 +264,31 @@ def analyse(part_path, result_path, json_path=None, pitch=None, z_bin=None,
     return data
 
 
-def _slope_deg(geo, z0, z1):
-    """Уклон образующей детали к оси внутри пояса, ° (0 — цилиндр, 90 — торец).
+def _slopes(geo, win=0.3):
+    """Уклон образующей к оси В КАЖДОЙ ТОЧКЕ профиля, ° (0 — цилиндр, 90 — торец).
 
-    Берётся по концам участка, а не по соседним точкам: профиль снят шагом
-    0.05 мм, и точка к точке шум наклона больше самого наклона.
+    Окном ±win, а не по соседям: профиль снят шагом 0.05 мм, и точка к точке
+    шум наклона больше самого наклона.
+
+    Поточечно, а не в среднем по поясу: пояс шириной 1 мм часто накрывает и
+    цилиндр, и конус, и средний уклон не годится ни для того, ни для другого.
+    На 14-31A именно такие стыки давали остаточные 0.015 мм.
     """
-    seg = [(z, r) for z, r in geo if z0 <= z <= z1]
-    if len(seg) < 2:
-        return None
-    dz = seg[-1][0] - seg[0][0]
-    dr = seg[-1][1] - seg[0][1]
-    if not dz:
-        return 90.0
-    return math.degrees(math.atan2(abs(dr), abs(dz)))
+    zs = [z for z, _ in geo]
+    out = []
+    n = len(geo)
+    j0 = 0
+    for i, (z, _) in enumerate(geo):
+        while j0 < n and zs[j0] < z - win:
+            j0 += 1
+        j1 = i
+        while j1 + 1 < n and zs[j1 + 1] <= z + win:
+            j1 += 1
+        a, b = geo[max(j0, 0)], geo[min(j1, n - 1)]
+        dz, dr = b[0] - a[0], b[1] - a[1]
+        out.append(90.0 if not dz
+                   else math.degrees(math.atan2(abs(dr), abs(dz))))
+    return out
 
 
 def _add_profile_dr(data):
@@ -304,31 +315,53 @@ def _add_profile_dr(data):
     if not prof:
         return
     film = float(data.get("film_mm") or 0.0)
-    # уклон образующей ДЕТАЛИ — по нему плёнка пересчитывается из нормали в радиус
+    # уклон образующей ДЕТАЛИ — по нему толщина зареза считается по нормали
     geo = sorted((p["z"], p["part_rmax"]) for p in (data.get("profile") or [])
                  if p.get("part_rmax") is not None)
+    slope_at = dict(zip((z for z, _ in geo), _slopes(geo))) if geo else {}
+
+    def _keep(raw_i, z_i, apply_film):
+        """Отклонение точки после порога: зарез тоньше плёнки не в счёт."""
+        if raw_i >= 0 or not apply_film or not film:
+            return raw_i, 0.0
+        th_i = slope_at.get(z_i, 0.0)
+        c = math.cos(math.radians(min(th_i, 75.0)))
+        excess = (-raw_i) * c - film
+        return ((-(excess / c) if excess > 0 else 0.0),
+                min(-raw_i, film / c))
+
     for b in data.get("by_z") or []:
         lo, hi = min(b["z0"], b["z1"]), max(b["z0"], b["z1"])
-        vals = [p["res_rmax"] - p["part_rmax"] for p in prof if lo <= p["z"] <= hi]
+        pts = [p for p in prof if lo <= p["z"] <= hi]
+        vals = [p["res_rmax"] - p["part_rmax"] for p in pts]
         if not vals:
             b["dr_source"] = "воксели"
             continue
         raw = sum(vals) / len(vals)
-        # ПЛЁНКА ЛЕЖИТ ПО НОРМАЛИ, а не по радиусу. Смещение точки отслеживания
-        # резца в ISV (I19) сдвигает срезаемую поверхность вдоль её нормали на
-        # постоянную величину; радиальное отклонение поэтому film/cos θ, где
-        # θ — уклон образующей к оси. Раньше вычиталась константа, и на уклонах
-        # оставался недовычет: 0.041 на конусе 37°, 0.068 на фаске 45° —
-        # ровно то, что читалось «зарезом» (проверено по 32 поясам 14-31A,
-        # средний промах формулы 0.004 мм).
-        th = _slope_deg(geo, lo, hi)
-        b["slope_deg"] = round(th, 1) if th is not None else None
-        k = 1.0
-        if th is not None:
-            k = 1.0 / math.cos(math.radians(min(th, 75.0)))
+        # ПЛЁНКА — ЭТО ЗАРЕЗ, И ЕЁ НЕ ВЫЧИТАЮТ, А НЕ СЧИТАЮТ.
+        #
+        # Смещение точки отслеживания резца в ISV (I19) снимает лишний ровный
+        # слой по ВСЕЙ детали — по нормали к поверхности, а не по радиусу.
+        # Поэтому порог ставится на толщину зареза ПО НОРМАЛИ: |dr|·cos θ, где
+        # θ — уклон образующей к оси. Тоньше порога — не считаем вовсе; толще —
+        # считаем ТОЛЬКО превышение, чтобы настоящий зарез не спрятался.
+        #
+        # Почему порогом, а не прибавкой к dr (как было раньше): прибавка
+        # умеет из зареза сделать НЕДОРЕЗ, если промахнулась. На цилиндрах она
+        # это и делала — +0.003 мм фантомного недореза там, где ровно номинал.
+        # Порог такого не может: недорез он не трогает вовсе.
+        #
+        # Обратная сторона, её надо помнить: там, где металл ОСТАЛСЯ, плёнка
+        # его тоже подъела, и мы этого не восстанавливаем. Недорез читается
+        # заниженным не больше чем на толщину плёнки.
+        sl = [slope_at.get(p["z"], 0.0) for p in pts]
+        b["slope_deg"] = round(sum(sl) / len(sl), 1) if sl else None
         b["dr_prof_mm"] = round(raw, 4)
-        b["dr_prof_fixed_mm"] = round(raw + (film * k if b.get("film_applied")
-                                             else 0.0), 4)
+        kept, ignored = zip(*(_keep(p["res_rmax"] - p["part_rmax"], p["z"],
+                                    b.get("film_applied")) for p in pts))
+        b["dr_prof_fixed_mm"] = round(sum(kept) / len(kept), 4)
+        if any(ignored):
+            b["film_ignored_mm"] = round(sum(ignored) / len(ignored), 4)
         b["dr_source"] = "профиль"
         vox = b.get("dr_fixed_mm")
         if vox is not None:
@@ -451,8 +484,10 @@ def report(data, min_len=0.15, tol=0.02):
             L.append("")
             L.append(f"**ПРИЁМКА ИДЁТ ПО ПОСЛЕДНЕМУ СТОЛБЦУ** — отклонение "
                      f"снято с осевого профиля, а не с вокселей, и плёнка в "
-                     f"нём вычтена ПО НОРМАЛИ к поверхности (film/cos θ по "
-                     f"уклону образующей), а не радиальной константой. "
+                     f"нём НЕ ВЫЧТЕНА, А НЕ ПОСЧИТАНА: зарез тоньше "
+                     f"{data['film_mm']:.3f} мм ПО НОРМАЛИ к поверхности в счёт "
+                     f"не идёт, толще — считается только превышение. Недорез "
+                     f"порогом не трогается вовсе. "
                      f"У воксельной половины на теле вращения систематический "
                      f"сдвиг наружу (сетка {data.get('pitch', 0.1)} мм "
                      f"округляет границу): здесь он "
