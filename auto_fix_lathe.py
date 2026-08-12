@@ -219,7 +219,7 @@ def run_once(model, gcode, active, args, tag):
 # ── ПРОМПТ ──────────────────────────────────────────────────────────────────
 
 def build_prompt(rep, sc, history, catalog_desc, ok_dr, failure=None,
-                 note=None, hints=True):
+                 note=None, hints=False):
     setups = [{k: v for k, v in s.items() if k != "ops"} for s in rep["setups"]]
     # ФАКТ, который легко проглядеть в раскладке, а он решает почти всё: если
     # отдельного чистового резца нет, чистовую ведёт черновой, и остаток в
@@ -357,7 +357,9 @@ def ask_next(rep, sc, history, cat_desc, args, cat, journal, entry, active,
     try:
         raw = ask_llm(build_prompt(rep, sc, history, cat_desc,
                                    args.ok_dr, failure, note,
-                                   hints=not getattr(args, "no_hints", False)),
+                                   hints=(getattr(args, "hints", False)
+                                          and not getattr(args, "no_hints",
+                                                          False))),
                       timeout=900, model=args.llm_model, provider=args.llm)
         ans = extract_json(raw)
     except Exception as e:
@@ -447,10 +449,17 @@ def main():
                     help="транспорт запроса к агенту (дефолт openrouter)")
     ap.add_argument("--llm-model", default="", metavar="M",
                     help=f"модель; для openrouter дефолт {DEFAULT_MODEL}")
+    # ПОДСКАЗКИ ВЫКЛЮЧЕНЫ ПО УМОЛЧАНИЮ. Единственная имеющаяся («отдельного
+    # чистового резца нет») добавлялась под дедлайн после ОДНОГО промаха
+    # GigaChat и оказалась не нужна: без неё резец возвращался в 21 прогоне из
+    # 22 (runs/110 17/17, runs/114 2/2, runs/115 1/2, runs/117 1/1). Агент
+    # выводит этот факт из раскладки сам, а лишняя наводка обесценивает опыт.
+    ap.add_argument("--hints", action="store_true",
+                    help="подсказывать агенту вычисленные из отчёта факты "
+                         "(«отдельного чистового резца нет»). По умолчанию "
+                         "выключено — агент разбирается по сырым данным")
     ap.add_argument("--no-hints", action="store_true",
-                    help="не подсказывать агенту вычисленные факты (сейчас это "
-                         "«отдельного чистового резца нет»). Для КОНТРОЛЬНЫХ "
-                         "опытов: сам ли агент находит нехватку инструмента")
+                    help=argparse.SUPPRESS)   # совместимость: подсказок и так нет
     ap.add_argument("--stream", action="store_true",
                     help="дублировать вывод прогонов в свой stdout — так за "
                          "петлёй видно снаружи (этим пользуется веб-морда)")
