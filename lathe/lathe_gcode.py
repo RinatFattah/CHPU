@@ -1089,6 +1089,18 @@ def generate(prof_data, params):
              "arcs": n_arcs, "grooves": n_groove, "blade": blade,
              "blade_tight": blade_tight,
              "groove_volume_mm3": sum(gr["volume_mm3"] for gr in grooves),
+             # Зоны, отданные канавочному, с их z — и пометкой «пластина сюда
+             # не входит». По ним сверка отделяет НЕДОСТИЖИМОЕ ВЫДАННЫМ НАБОРОМ
+             # от того, что программа обязана была снять и не сняла: первое —
+             # заявка на инструмент, второе — дефект программы, и мерить их
+             # одним числом нельзя.
+             "groove_zones": [{"z_hi": round(gr["z_hi"], 3),
+                               "z_lo": round(gr["z_lo"], 3),
+                               "width_bottom": round(gr["width_bottom"], 3),
+                               "volume_mm3": round(gr["volume_mm3"], 2),
+                               "tight": bool(blade
+                                             and 0 < gr["width_bottom"] < blade)}
+                              for gr in grooves],
              "drills": n_drill, "threads": n_thread,
              "thread_candidates": find_thread_candidates(part_profile),
              "left_passes": n_left,

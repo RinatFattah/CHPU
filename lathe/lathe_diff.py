@@ -167,11 +167,18 @@ def limits_from_gcode(path):
 def analyse(part_path, result_path, json_path=None, pitch=None, z_bin=None,
             angles=6, prof_step=0.05, min_thickness=None, z_limit=None,
             z_limit_bore=None, bore_radius=None, z_shift=0.0, timeout=1800,
-            film=None):
+            film=None, unreachable=None):
     """Возвращает dict с by_z и profile (см. cam/lathe_diff_worker.py).
 
     Умолчания берутся из конфига: `LATHE_DIFF_PITCH`, `LATHE_DIFF_Z_BIN` и общий
     с фрезеровкой допуск `DIFF_MIN_THICKNESS`.
+
+    `unreachable` — [(z_hi, z_lo, «почему»)] в раме ДЕТАЛИ: зоны, которые сама
+    программа объявила недостижимыми выданным набором (канавка уже наличной
+    пластины). Пояса, попавшие в них, помечаются `unreachable` и выносятся из
+    приёмки отдельной строкой. Это не сокрытие: металл там остаётся и на
+    станке, но отвечает за него ЗАКУПКА ИНСТРУМЕНТА, а не траектория, и
+    смешивать это с дефектом программы в одном числе нельзя.
     """
     if pitch is None:
         pitch = float(getattr(config, "LATHE_DIFF_PITCH", 0.25))
@@ -242,12 +249,40 @@ def analyse(part_path, result_path, json_path=None, pitch=None, z_bin=None,
         raise RuntimeError(f"анализ не построился (код {proc.returncode}). {tail}")
     with open(out_json, encoding="utf-8") as f:
         data = json.load(f)
+    if unreachable:
+        _mark_unreachable(data, unreachable)
+        if json_path:                       # пометки должны попасть и в файл
+            with open(out_json, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=1)
     if json_path is None:
         try:
             os.unlink(out_json)
         except OSError:
             pass
     return data
+
+
+def _mark_unreachable(data, zones):
+    """Пометить пояса, попавшие в зоны «недостижимо выданным набором».
+
+    Пояс метится по ПЕРЕСЕЧЕНИЮ с зоной, а не по попаданию центра: канавка
+    бывает уже пояса (на 14-31A — 0.9 мм при поясе 1 мм), и по центру она бы
+    не поймалась.
+    """
+    tot = 0.0
+    for b in data.get("by_z") or []:
+        lo, hi = min(b["z0"], b["z1"]), max(b["z0"], b["z1"])
+        for z_hi, z_lo, *why in zones:
+            zlo, zhi = min(z_hi, z_lo), max(z_hi, z_lo)
+            if hi > zlo and lo < zhi:
+                b["unreachable"] = True
+                b["unreachable_why"] = (why[0] if why else
+                                        "недостижимо выданным набором")
+                tot += float(b.get("under_mm3") or 0) + float(
+                    b.get("over_mm3") or 0)
+                break
+    data["unreachable_mm3"] = round(tot, 1)
+    data["unreachable_zones"] = [list(z) for z in zones]
 
 
 def bands(prof, tol=0.02):
@@ -315,6 +350,15 @@ def report(data, min_len=0.15, tol=0.02):
         L.append(f"Отсечено фильтром толщины вдоль оси "
                  f"({data.get('min_thickness_mm')} мм): "
                  f"{data['thin_film_mm3']:.1f} мм³")
+    if data.get("unreachable_zones"):
+        zs = "; ".join(f"z {min(z[0], z[1]):.2f}..{max(z[0], z[1]):.2f}"
+                       for z in data["unreachable_zones"])
+        L.append(f"**Из них НЕДОСТИЖИМО ВЫДАННЫМ НАБОРОМ: "
+                 f"{data.get('unreachable_mm3', 0):.1f} мм³** — {zs}. "
+                 f"Металл там остаётся и на станке; отвечает за это подбор "
+                 f"инструмента (нужна более узкая канавочная пластина), а не "
+                 f"траектория, поэтому в приёмку это не идёт и считается "
+                 f"отдельно.")
     L.append("")
     L.append("## Пояса по z (воксели)")
     L.append("")
