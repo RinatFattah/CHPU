@@ -34,6 +34,7 @@ API:  lathe_diff.analyse(part, result) -> dict
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -263,6 +264,22 @@ def analyse(part_path, result_path, json_path=None, pitch=None, z_bin=None,
     return data
 
 
+def _slope_deg(geo, z0, z1):
+    """Уклон образующей детали к оси внутри пояса, ° (0 — цилиндр, 90 — торец).
+
+    Берётся по концам участка, а не по соседним точкам: профиль снят шагом
+    0.05 мм, и точка к точке шум наклона больше самого наклона.
+    """
+    seg = [(z, r) for z, r in geo if z0 <= z <= z1]
+    if len(seg) < 2:
+        return None
+    dz = seg[-1][0] - seg[0][0]
+    dr = seg[-1][1] - seg[0][1]
+    if not dz:
+        return 90.0
+    return math.degrees(math.atan2(abs(dr), abs(dz)))
+
+
 def _add_profile_dr(data):
     """Добавить поясам отклонение по радиусу, СНЯТОЕ С ПРОФИЛЯ.
 
@@ -287,6 +304,9 @@ def _add_profile_dr(data):
     if not prof:
         return
     film = float(data.get("film_mm") or 0.0)
+    # уклон образующей ДЕТАЛИ — по нему плёнка пересчитывается из нормали в радиус
+    geo = sorted((p["z"], p["part_rmax"]) for p in (data.get("profile") or [])
+                 if p.get("part_rmax") is not None)
     for b in data.get("by_z") or []:
         lo, hi = min(b["z0"], b["z1"]), max(b["z0"], b["z1"])
         vals = [p["res_rmax"] - p["part_rmax"] for p in prof if lo <= p["z"] <= hi]
@@ -294,8 +314,20 @@ def _add_profile_dr(data):
             b["dr_source"] = "воксели"
             continue
         raw = sum(vals) / len(vals)
+        # ПЛЁНКА ЛЕЖИТ ПО НОРМАЛИ, а не по радиусу. Смещение точки отслеживания
+        # резца в ISV (I19) сдвигает срезаемую поверхность вдоль её нормали на
+        # постоянную величину; радиальное отклонение поэтому film/cos θ, где
+        # θ — уклон образующей к оси. Раньше вычиталась константа, и на уклонах
+        # оставался недовычет: 0.041 на конусе 37°, 0.068 на фаске 45° —
+        # ровно то, что читалось «зарезом» (проверено по 32 поясам 14-31A,
+        # средний промах формулы 0.004 мм).
+        th = _slope_deg(geo, lo, hi)
+        b["slope_deg"] = round(th, 1) if th is not None else None
+        k = 1.0
+        if th is not None:
+            k = 1.0 / math.cos(math.radians(min(th, 75.0)))
         b["dr_prof_mm"] = round(raw, 4)
-        b["dr_prof_fixed_mm"] = round(raw + (film if b.get("film_applied")
+        b["dr_prof_fixed_mm"] = round(raw + (film * k if b.get("film_applied")
                                              else 0.0), 4)
         b["dr_source"] = "профиль"
         vox = b.get("dr_fixed_mm")
@@ -418,10 +450,12 @@ def report(data, min_len=0.15, tol=0.02):
                     if b.get("dr_halves_gap_mm") is not None]
             L.append("")
             L.append(f"**ПРИЁМКА ИДЁТ ПО ПОСЛЕДНЕМУ СТОЛБЦУ** — отклонение "
-                     f"снято с осевого профиля, а не с вокселей. У воксельной "
-                     f"половины на теле вращения систематический сдвиг наружу "
-                     f"(сетка {data.get('pitch', 0.1)} мм округляет границу): "
-                     f"здесь он "
+                     f"снято с осевого профиля, а не с вокселей, и плёнка в "
+                     f"нём вычтена ПО НОРМАЛИ к поверхности (film/cos θ по "
+                     f"уклону образующей), а не радиальной константой. "
+                     f"У воксельной половины на теле вращения систематический "
+                     f"сдвиг наружу (сетка {data.get('pitch', 0.1)} мм "
+                     f"округляет границу): здесь он "
                      f"{sum(gaps) / len(gaps):.3f} мм в среднем по поясам, "
                      f"максимум {max(gaps):.3f}. Воксели остаются за объёмами "
                      f"и зонами; на фасетном теле профиль не снимается, тогда "
