@@ -174,7 +174,13 @@ def summarise_run(journal, missing):
             v = "ПРОГОН УПАЛ"
         if v:
             verdict = v
+    # Вернуть инструмент мало — надо его УДЕРЖАТЬ. Отдельная колонка не
+    # придирка: в ночном пакете 110 Kimi трижды возвращала 35°-резец на второй
+    # итерации и снимала его на третьей, наводя порядок в наборе, — и результат
+    # откатывался ровно к первой итерации.
+    last = (its[-1].get("tools") or []) if its else []
     return {"iters": len(its), "drs": drs, "fixed_at": fixed_at,
+            "kept": bool(missing) and missing in last,
             "verdict": verdict, "wall_s": round(wall),
             "best": min((abs(d) for d in drs), default=None)}
 
@@ -187,10 +193,11 @@ def write_summary(batch_dir, parts, agents, missing, ok_dr):
     lines += [f"Старт без инструмента `{missing}`. Вопрос опыта: увидит ли "
               f"агент по сверке, что набор плохой, и вернёт ли недостающий "
               f"резец. Допуск приёмки {ok_dr} мм по радиусу.", "",
-              "| деталь | агент | итер. | вернул инструмент | max\\|Δr\\| по "
-              "итерациям, мм | лучшее | вердикт | время |",
-              "|---|---|---:|---|---|---:|---|---:|"]
-    stats = {a: {"runs": 0, "fixed": 0, "iters": 0, "wall": 0} for a in agents}
+              "| деталь | агент | итер. | вернул инструмент | удержал | "
+              "max\\|Δr\\| по итерациям, мм | лучшее | вердикт | время |",
+              "|---|---|---:|---|---|---|---:|---|---:|"]
+    stats = {a: {"runs": 0, "fixed": 0, "kept": 0, "iters": 0, "wall": 0}
+             for a in agents}
     for part_name, _ in parts:
         for agent in agents:
             jp = os.path.join(batch_dir, part_name, agent, "out_loop.json")
@@ -204,20 +211,24 @@ def write_summary(batch_dir, parts, agents, missing, ok_dr):
             st["wall"] += s["wall_s"]
             if s["fixed_at"]:
                 st["fixed"] += 1
+            if s["kept"]:
+                st["kept"] += 1
             traj = " → ".join(f"{d:+.3f}" for d in s["drs"]) or "—"
             fixed = (f"да, на итер. {s['fixed_at']}" if s["fixed_at"] else
                      "**нет**")
+            kept = "да" if s["kept"] else ("**снял обратно**" if s["fixed_at"]
+                                           else "—")
             best = f"{s['best']:.3f}" if s["best"] is not None else "—"
             lines.append(f"| {part_name} | {agent} | {s['iters']} | {fixed} | "
-                         f"{traj} | {best} | {s['verdict'] or '—'} | "
+                         f"{kept} | {traj} | {best} | {s['verdict'] or '—'} | "
                          f"{s['wall_s'] // 60} мин |")
     lines += ["", "## Итого по агентам", "",
-              "| агент | прогонов | вернул инструмент | итераций всего | "
-              "время |", "|---|---:|---:|---:|---:|"]
+              "| агент | прогонов | вернул инструмент | удержал до конца | "
+              "итераций всего | время |", "|---|---:|---:|---:|---:|---:|"]
     for agent in agents:
         st = stats[agent]
         lines.append(f"| {agent} | {st['runs']} | {st['fixed']} | "
-                     f"{st['iters']} | {st['wall'] // 60} мин |")
+                     f"{st['kept']} | {st['iters']} | {st['wall'] // 60} мин |")
     done = {(p, a) for p, _ in parts for a in agents
             if os.path.exists(os.path.join(batch_dir, p, a, "out_loop.json"))}
     todo = [(p, a) for p, _ in parts for a in agents if (p, a) not in done]
@@ -254,6 +265,8 @@ def main():
                     help="допуск приёмки, мм по радиусу (в сводку)")
     ap.add_argument("--dry-run", action="store_true",
                     help="показать очередь и выйти")
+    ap.add_argument("--summary-only", action="store_true",
+                    help="только пересобрать itog.md по готовым журналам")
     a = ap.parse_args()
 
     agents = [s.strip() for s in a.agents.split(",") if s.strip()]
@@ -302,6 +315,10 @@ def main():
         print("\n".join(plan_txt))
         for p, m in parts:
             print(f"   {p:<24} {m}")
+        return
+    if a.summary_only:
+        write_summary(batch_dir, parts, agents, a.tools_without, a.ok_dr)
+        print(f"сводка пересобрана → {os.path.join(batch_dir, 'itog.md')}")
         return
 
     for line in plan_txt:
