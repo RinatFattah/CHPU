@@ -249,17 +249,58 @@ def analyse(part_path, result_path, json_path=None, pitch=None, z_bin=None,
         raise RuntimeError(f"анализ не построился (код {proc.returncode}). {tail}")
     with open(out_json, encoding="utf-8") as f:
         data = json.load(f)
+    _add_profile_dr(data)
     if unreachable:
         _mark_unreachable(data, unreachable)
-        if json_path:                       # пометки должны попасть и в файл
-            with open(out_json, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=1)
+    if json_path:                           # пометки должны попасть и в файл
+        with open(out_json, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
     if json_path is None:
         try:
             os.unlink(out_json)
         except OSError:
             pass
     return data
+
+
+def _add_profile_dr(data):
+    """Добавить поясам отклонение по радиусу, СНЯТОЕ С ПРОФИЛЯ.
+
+    Зачем, если воксельное уже есть. У воксельной половины систематический
+    сдвиг: сетка 0.1 мм, граница тела попадает между плоскостями, и парность
+    луча округляет наружу. На 14-31A это ровные +0.030 мм на КАЖДОМ поясе —
+    воксели дают сырое −0.191 там, где профиль даёт −0.161. После поправки на
+    плёнку моста (0.164) профиль показывает +0.003, то есть номинал, а воксели
+    −0.027, и эти три сотых по всей поверхности набирали 90 мм³ «зареза»,
+    которого нет.
+
+    Поэтому приёмку по радиусу считаем по профилю — он на теле вращения точнее
+    на порядок. Воксели остаются за объёмами и зонами: там, где профиля нет
+    (фасетное тело — осевое сечение на нём не строится, см. I15), возвращаемся
+    к ним, и это честно помечено полем `dr_source`.
+
+    Правило проекта: обе половины на теле вращения обязаны сходиться. Расхождение
+    между ними кладётся в `dr_halves_gap_mm` — по нему видно, когда метод врёт.
+    """
+    prof = [p for p in (data.get("profile") or [])
+            if p.get("res_rmax") is not None and p.get("part_rmax") is not None]
+    if not prof:
+        return
+    film = float(data.get("film_mm") or 0.0)
+    for b in data.get("by_z") or []:
+        lo, hi = min(b["z0"], b["z1"]), max(b["z0"], b["z1"])
+        vals = [p["res_rmax"] - p["part_rmax"] for p in prof if lo <= p["z"] <= hi]
+        if not vals:
+            b["dr_source"] = "воксели"
+            continue
+        raw = sum(vals) / len(vals)
+        b["dr_prof_mm"] = round(raw, 4)
+        b["dr_prof_fixed_mm"] = round(raw + (film if b.get("film_applied")
+                                             else 0.0), 4)
+        b["dr_source"] = "профиль"
+        vox = b.get("dr_fixed_mm")
+        if vox is not None:
+            b["dr_halves_gap_mm"] = round(b["dr_prof_fixed_mm"] - float(vox), 4)
 
 
 def _mark_unreachable(data, zones):
@@ -371,11 +412,30 @@ def report(data, min_len=0.15, tol=0.02):
                  f"({data['film_mm']:.3f} мм). Прочерк — поправка к поясу не "
                  f"применялась: грани под ключ, торец/уступ (там расхождение "
                  f"осевое) или отверстие (у расточного своя привязка).")
+        if any(b.get("dr_prof_fixed_mm") is not None
+               for b in data.get("by_z") or []):
+            gaps = [abs(b["dr_halves_gap_mm"]) for b in data["by_z"]
+                    if b.get("dr_halves_gap_mm") is not None]
+            L.append("")
+            L.append(f"**ПРИЁМКА ИДЁТ ПО ПОСЛЕДНЕМУ СТОЛБЦУ** — отклонение "
+                     f"снято с осевого профиля, а не с вокселей. У воксельной "
+                     f"половины на теле вращения систематический сдвиг наружу "
+                     f"(сетка {data.get('pitch', 0.1)} мм округляет границу): "
+                     f"здесь он "
+                     f"{sum(gaps) / len(gaps):.3f} мм в среднем по поясам, "
+                     f"максимум {max(gaps):.3f}. Воксели остаются за объёмами "
+                     f"и зонами; на фасетном теле профиль не снимается, тогда "
+                     f"приёмка возвращается к ним.")
     L.append("")
+    has_prof = any(b.get("dr_prof_fixed_mm") is not None
+                   for b in data.get("by_z") or [])
     hdr = "| z от | z до | r ном. | недорез, мм³ | зарез, мм³ | по радиусу, мм |"
     sep = "|---:|---:|---:|---:|---:|---:|"
     if data.get("film_mm"):
         hdr += " с поправкой, мм |"
+        sep += "---:|"
+    if has_prof:
+        hdr += " **ПО ПРОФИЛЮ, мм** |"
         sep += "---:|"
     L.append(hdr + " |")
     L.append(sep + "---|")
@@ -388,6 +448,9 @@ def report(data, min_len=0.15, tol=0.02):
         if data.get("film_mm"):
             drs += (f" | {b['dr_fixed_mm']:+.3f}" if b.get("film_applied")
                     else " | —")
+        if has_prof:
+            dp = b.get("dr_prof_fixed_mm")
+            drs += f" | **{dp:+.3f}**" if dp is not None else " | —"
         what = []
         if b.get("zone"):
             what.append(b["zone"])

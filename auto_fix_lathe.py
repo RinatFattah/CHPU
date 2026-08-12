@@ -119,7 +119,18 @@ def score(diff, z_end=None):
             why = "крайний пояс (просадка торца в ISV)"
         bu, bo = float(b.get("under_mm3", 0.0)), float(b.get("over_mm3", 0.0))
         dr = float(b.get("dr_under_mm", 0.0)) + float(b.get("dr_over_mm", 0.0))
-        if b.get("film_applied") and b.get("r_nom"):
+        # ПРИЁМКА ПО ПРОФИЛЮ, если он снят: у воксельной половины на теле
+        # вращения систематический сдвиг +0.03 мм (сетка 0.1 мм округляет
+        # границу наружу), и он один по всей детали набирал десятки мм³
+        # несуществующего зареза. Профиль на солиде точнее на порядок; где его
+        # нет (фасетное тело), остаются воксели.
+        dr_prof = b.get("dr_prof_fixed_mm")
+        if dr_prof is not None and b.get("r_nom"):
+            dz = abs(float(b["z1"]) - float(b["z0"]))
+            k = 2.0 * math.pi * float(b["r_nom"]) * dz
+            dr = float(dr_prof)
+            bu, bo = (dr * k, 0.0) if dr >= 0 else (0.0, -dr * k)
+        elif b.get("film_applied") and b.get("r_nom"):
             dz = abs(float(b["z1"]) - float(b["z0"]))
             k = 2.0 * math.pi * float(b["r_nom"]) * dz
             dr = float(b.get("dr_fixed_mm", 0.0))
