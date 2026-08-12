@@ -359,7 +359,16 @@ def _add_profile_dr(data):
         b["dr_prof_mm"] = round(raw, 4)
         kept, ignored = zip(*(_keep(p["res_rmax"] - p["part_rmax"], p["z"],
                                     b.get("film_applied")) for p in pts))
-        b["dr_prof_fixed_mm"] = round(sum(kept) / len(kept), 4)
+        dr_band = sum(kept) / len(kept)
+        # ПОЛ РАЗРЕШЕНИЯ. Профиль снят шагом 0.05 мм с фасетного тела, у
+        # которого своя хорда: отличить 0.015 мм от нуля метод не может. Всё,
+        # что мельче пола, и есть ноль — иначе метрика показывает шум, а агент
+        # начинает его чинить (runs/114: Kimi ради -0.0155 мм сняла исправный
+        # чистовой резец и получила -0.397).
+        res = float(getattr(config, "LATHE_DIFF_RESOLUTION", 0.03) or 0.0)
+        if res and abs(dr_band) < res:
+            dr_band = 0.0
+        b["dr_prof_fixed_mm"] = round(dr_band, 4)
         if any(ignored):
             b["film_ignored_mm"] = round(sum(ignored) / len(ignored), 4)
         b["dr_source"] = "профиль"
