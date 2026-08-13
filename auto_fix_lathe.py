@@ -31,10 +31,11 @@ auto_fix_lathe.py — агентная петля для ТОЧЕНИЯ: под�
     в ISV на ~0.8 мм, воспроизводится на обоих концах с точностью 0.001 мм.
 Вычтенное печатается каждой итерацией — молча пол не прячется.
 
-Транспорт ЛЛМ — OpenRouter (ключ в `.openrouter_key`, файл в .gitignore),
-общий с фрезерной петлёй: `auto_fix.ask_openrouter` уже умеет обходить
-строки-«пульс» перед телом ответа и повторять запрос, когда у рассуждающей
-модели ответ умирает на стороне провайдера.
+Транспорт ЛЛМ общий с фрезерной петлёй (`auto_fix.ask_llm`): по умолчанию
+OpenRouter (ключ в `.openrouter_key`, файл в .gitignore) — он уже умеет
+обходить строки-«пульс» перед телом ответа и повторять запрос, когда у
+рассуждающей модели ответ умирает на стороне провайдера. `--llm claude` и
+`--llm gigachat` работают через тот же диспетчер.
 
 CLI:
   python auto_fix_lathe.py деталь.prt --gcode runs/N/out.gcode \
@@ -47,11 +48,12 @@ import math
 import os
 import subprocess
 import sys
+import threading
 import time
 
 import config
 from lathe import lathe_tools
-from auto_fix import ask_openrouter, extract_json     # общий транспорт и парсер
+from auto_fix import ask_llm, extract_json            # общий транспорт и парсер
 
 for _s in (sys.stdout, sys.stderr):
     if (getattr(_s, "encoding", "") or "").lower().replace("-", "") != "utf8":
@@ -108,11 +110,27 @@ def score(diff, z_end=None):
             why = "грани под ключ"
         elif b.get("face"):
             why = "торец/уступ"
+        elif b.get("unreachable"):
+            # зона, которую программа сама объявила недостижимой выданным
+            # набором: остаток отдан канавочному, а он уже наличной пластины.
+            # Это заявка на инструмент, а не дефект траектории
+            why = b.get("unreachable_why") or "недостижимо выданным набором"
         elif z0 - 1e-6 <= z_hi <= z1 + 1e-6 or z0 - 1e-6 <= z_lo <= z1 + 1e-6:
             why = "крайний пояс (просадка торца в ISV)"
         bu, bo = float(b.get("under_mm3", 0.0)), float(b.get("over_mm3", 0.0))
         dr = float(b.get("dr_under_mm", 0.0)) + float(b.get("dr_over_mm", 0.0))
-        if b.get("film_applied") and b.get("r_nom"):
+        # ПРИЁМКА ПО ПРОФИЛЮ, если он снят: у воксельной половины на теле
+        # вращения систематический сдвиг +0.03 мм (сетка 0.1 мм округляет
+        # границу наружу), и он один по всей детали набирал десятки мм³
+        # несуществующего зареза. Профиль на солиде точнее на порядок; где его
+        # нет (фасетное тело), остаются воксели.
+        dr_prof = b.get("dr_prof_fixed_mm")
+        if dr_prof is not None and b.get("r_nom"):
+            dz = abs(float(b["z1"]) - float(b["z0"]))
+            k = 2.0 * math.pi * float(b["r_nom"]) * dz
+            dr = float(dr_prof)
+            bu, bo = (dr * k, 0.0) if dr >= 0 else (0.0, -dr * k)
+        elif b.get("film_applied") and b.get("r_nom"):
             dz = abs(float(b["z1"]) - float(b["z0"]))
             k = 2.0 * math.pi * float(b["r_nom"]) * dz
             dr = float(b.get("dr_fixed_mm", 0.0))
@@ -136,6 +154,37 @@ def score(diff, z_end=None):
 
 # ── ОДНА ИТЕРАЦИЯ ───────────────────────────────────────────────────────────
 
+def _run_logged(cmd, log_path, timeout, stream=False):
+    """Запуск прогона с логом. При stream=True вывод дублируется в свой stdout.
+
+    Дублирование нужно тому, кто смотрит за петлёй снаружи (веб-морда): вехи
+    прогона печатает run_lathe.py, и без пересылки страница пять минут
+    показывала бы «генерация», пока идут два прогона в ISV.
+    """
+    with open(log_path, "w", encoding="utf-8") as lf:
+        if not stream:
+            return subprocess.run(cmd, cwd=ROOT, stdout=lf,
+                                  stderr=subprocess.STDOUT, text=True,
+                                  encoding="utf-8", errors="replace",
+                                  timeout=timeout)
+        proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True,
+                                encoding="utf-8", errors="replace", bufsize=1)
+        # Таймаут своими руками: чтение из трубы блокирует, и на зависшем
+        # прогоне communicate(timeout=…) сюда уже не добраться.
+        killer = threading.Timer(timeout, proc.kill)
+        killer.start()
+        try:
+            for line in proc.stdout:
+                lf.write(line)
+                lf.flush()
+                print(line.rstrip(), flush=True)
+            proc.wait()
+        finally:
+            killer.cancel()
+        return proc
+
+
 def run_once(model, gcode, active, args, tag):
     """Запускает run_lathe.py заданным набором и возвращает его отчёт (dict)."""
     out_dir = os.path.dirname(os.path.abspath(gcode))
@@ -149,10 +198,7 @@ def run_once(model, gcode, active, args, tag):
     if args.sim_setup:
         cmd += ["--sim-setup", args.sim_setup]
     t0 = time.perf_counter()
-    with open(log_path, "w", encoding="utf-8") as lf:
-        proc = subprocess.run(cmd, cwd=ROOT, stdout=lf, stderr=subprocess.STDOUT,
-                              text=True, encoding="utf-8", errors="replace",
-                              timeout=args.timeout)
+    proc = _run_logged(cmd, log_path, args.timeout, stream=args.stream)
     wall = round(time.perf_counter() - t0, 1)
     if not os.path.exists(rep_path):
         tail = ""
@@ -172,8 +218,22 @@ def run_once(model, gcode, active, args, tag):
 
 # ── ПРОМПТ ──────────────────────────────────────────────────────────────────
 
-def build_prompt(rep, sc, history, catalog_desc, ok_dr, failure=None):
+def build_prompt(rep, sc, history, catalog_desc, ok_dr, failure=None,
+                 note=None, hints=False):
     setups = [{k: v for k, v in s.items() if k != "ops"} for s in rep["setups"]]
+    # ФАКТ, который легко проглядеть в раскладке, а он решает почти всё: если
+    # отдельного чистового резца нет, чистовую ведёт черновой, и остаток в
+    # уступах — следствие именно этого. GigaChat на 14-31A пропустил его и
+    # ушёл разбираться с левым резцом (runs/115).
+    if hints and not any(s.get("finish_tool") for s in rep["setups"]):
+        no_finish = ("\n⚠ ОТДЕЛЬНОГО ЧИСТОВОГО РЕЗЦА В ЭТОМ ПРОГОНЕ НЕТ: чистовую "
+                     "вёл тот же резец, что и черновую. Если в парке есть "
+                     "проходной с БО́ЛЬШИМ φ₁, чем у выданных, начни с него — "
+                     "именно φ₁ решает, насколько близко к стенке уступа "
+                     "подходит резец.")
+    else:
+        no_finish = ""
+    extra_note = f"\n⚠ {note}\n" if note else ""
     bands = [b for b in (rep["diff"].get("by_z") or [])
              if b.get("under_mm3", 0) + b.get("over_mm3", 0) > 1.0]
     fail = ("" if not failure else f"""
@@ -184,7 +244,7 @@ def build_prompt(rep, sc, history, catalog_desc, ok_dr, failure=None):
 провалившегося; смена чистового резца на форму пластины, которой в удачных
 прогонах не было, — вероятная причина отказа симулятора.
 """)
-    return f"""Ты — технолог-программист ЧПУ.{fail} Токарный CAM-пайплайн сам сгенерировал
+    return f"""Ты — технолог-программист ЧПУ.{fail}{extra_note} Токарный CAM-пайплайн сам сгенерировал
 управляющую программу на деталь, прогнал её на виртуальном станке NX ISV со съёмом
 материала и сверил результат с моделью. Твоя задача — решить, КАКИЕ ИНСТРУМЕНТЫ
 ВЫДАТЬ ГЕНЕРАТОРУ.
@@ -202,7 +262,7 @@ def build_prompt(rep, sc, history, catalog_desc, ok_dr, failure=None):
 {json.dumps(catalog_desc, ensure_ascii=False)}
 
 ВЫДАНО ГЕНЕРАТОРУ В ЭТОМ ПРОГОНЕ: {json.dumps(rep['tools']['available'], ensure_ascii=False)}
-КАК ОН ЭТО РАЗЛОЖИЛ: {json.dumps(rep['tools']['assigned'], ensure_ascii=False)}
+КАК ОН ЭТО РАЗЛОЖИЛ: {json.dumps(rep['tools']['assigned'], ensure_ascii=False)}{no_finish}
 Граница установов z = {rep.get('z_split')}, дальний торец детали z = {rep.get('z_end')}.
 
 ЧТО ПОЛУЧИЛОСЬ У ГЕНЕРАТОРА (по установам):
@@ -213,7 +273,13 @@ def build_prompt(rep, sc, history, catalog_desc, ok_dr, failure=None):
   что нужна пластина УЖЕ самой узкой наличной, и дно канавки останется недорезанным;
   left_passes — сколько проходов делает левый резец.
 
-СВЕРКА С МОДЕЛЬЮ (NX ISV, воксельная, поправка на плёнку моста уже снята):
+СВЕРКА С МОДЕЛЬЮ (результат прогона в NX ISV против CAD-модели):
+  Отклонение снято с осевого профиля детали. Равномерный тонкий зарез по всей
+  поверхности — известная особенность СИМУЛЯТОРА, а не программы: модель резца
+  в NX ISV привязана не к той точке пластины и срезает лишние 0.164 мм по
+  нормали. Он в счёт НЕ ИДЁТ (порог), считается только превышение над ним.
+  Поэтому остаточные единицы мм³ зареза при отклонении в сотые доли мм — это
+  разрешение метода, а не дефект: чинить там нечего.
   ХУДШЕЕ ОТКЛОНЕНИЕ ПО РАДИУСУ: {sc['max_dr']:+.3f} мм — это и есть приёмка
   объём по существу: недорез {sc['under']} мм³, зарез {sc['over']} мм³
   не в счёт (точением не лечится): {sc['floor_under'] + sc['floor_over']:.0f} мм³ —
@@ -230,8 +296,11 @@ def build_prompt(rep, sc, history, catalog_desc, ok_dr, failure=None):
   фрезерная операция, и в целевую функцию они уже не входят;
 - торцы в ISV срезаются на ~0.8 мм глубже программы, это известная особенность
   симулятора, а не программы;
-- остаточная плёнка 0.1–0.2 мм по радиусу — смещённая точка отсчёта у модели резца
-  в NX ISV, она снята поправкой;
+- равномерный тонкий зарез по всей детали — смещённая точка отсчёта у модели резца
+  в NX ISV; порогом он уже не в счёт, остаток в сотые доли мм чинить не надо;
+- зоны, помеченные «недостижимо выданным набором», из приёмки вынесены: там
+  остаток отдан канавочному, а наличная пластина в него не входит. Это заявка на
+  инструмент — если считаешь, что нужен другой набор, скажи об этом прямо;
 - резьба нарезается только по явному объявлению, шаг из модели не выводится.
 
 ЧТО ТЫ МОЖЕШЬ СДЕЛАТЬ: выдать генератору ДРУГОЙ НАБОР ИНСТРУМЕНТА — список id
@@ -248,6 +317,14 @@ def build_prompt(rep, sc, history, catalog_desc, ok_dr, failure=None):
   выдай подходящий инструмент;
 - инструмент выдан, но ничего не делает (left_passes=0, канавок нет) — можно
   убрать: меньше смен инструмента, короче программа.
+
+КОГДА ИСПРАВЛЕНИЕ УДАЛОСЬ — ОСТАНОВИСЬ. Если недорез 0 и отклонение в сотых
+долях мм, деталь готова: это разрешение метода и артефакты симулятора, а не
+дефект. Правильный ответ — verdict=ok, набор повторить без изменений. Гоняться
+за сотыми ЗАПРЕЩЕНО: убирать инструмент, который работает, ради этого нельзя.
+И ОТДЕЛЬНО ЗАПРЕЩЕНО убирать инструмент ради того, чтобы работа ушла в
+«недостижимо набором» и перестала считаться, — это подгонка отчёта, а не
+обработка детали.
 
 ТРЕБОВАНИЕ К РЕЗУЛЬТАТУ, жёсткое и не на твоё усмотрение:
 ДОПУСК ПО РАДИУСУ {ok_dr} мм. Сейчас худшее отклонение {sc['max_dr']:+.3f} мм, то есть
@@ -270,17 +347,21 @@ unfixable — набором инструмента это не лечится, 
 # ── ЗАПРОС К ЛЛМ И ВАЛИДАЦИЯ ОТВЕТА ─────────────────────────────────────────
 
 def ask_next(rep, sc, history, cat_desc, args, cat, journal, entry, active,
-             failure=None):
+             failure=None, note=None, _retry=True):
     """Спросить ЛЛМ новый набор. Возвращает список id или None (остановиться).
 
     Запись в журнал делается здесь же, чтобы след остался у любого исхода.
     """
     extra = getattr(config, "LATHE_TOOLS", None)
-    log(f"спрашиваю ЛЛМ ({args.llm_model})...")
+    log(f"спрашиваю ЛЛМ ({args.llm_model or args.llm})...")
     try:
-        raw = ask_openrouter(build_prompt(rep, sc, history, cat_desc,
-                                          args.ok_dr, failure),
-                             timeout=900, model=args.llm_model)
+        raw = ask_llm(build_prompt(rep, sc, history, cat_desc,
+                                   args.ok_dr, failure, note,
+                                   hints=(getattr(args, "hints", False)
+                                          and not getattr(args, "no_hints",
+                                                          False))),
+                      timeout=getattr(args, "llm_timeout", 900),
+                      model=args.llm_model, provider=args.llm)
         ans = extract_json(raw)
     except Exception as e:
         log(f"ЛЛМ не ответила разбираемым JSON: {e}")
@@ -323,13 +404,27 @@ def ask_next(rep, sc, history, cat_desc, args, cat, journal, entry, active,
 
     # Сравниваем РАЗРЕШЁННЫЕ наборы, а не списки id: «добавить второй чистовой,
     # не убрав первый» даёт побитово ту же программу (runs/100, 340 с впустую).
+    # Бесполезный ответ — не повод кончать петлю: переспрашиваем ОДИН раз,
+    # приложив факт. Запрос стоит секунды, потерянный прогон — шесть минут NX.
+    def again(why, hint):
+        if not _retry:
+            return stop(why, f"{hint} — останавливаюсь")
+        log(f"{why}: переспрашиваю с пояснением")
+        entry.setdefault("rejected", []).append({"tools": new, "why": why})
+        return ask_next(rep, sc, history, cat_desc, args, cat, journal, entry,
+                        active, failure, note=hint, _retry=False)
+
     if sig_new == signature(active, extra):
-        return stop("тот же набор по существу",
-                    f"после разрешения ролей набор тот же ({sig_new}) — "
-                    f"программа выйдет прежней, останавливаюсь")
+        return again("тот же набор по существу",
+                     "Твой прошлый ответ после раскладки по ролям даёт ТУ ЖЕ "
+                     "программу, что уже прогнали, — она выйдет байт в байт "
+                     "прежней и ничего не изменит. Назови набор, который меняет "
+                     "РАСКЛАДКУ: добавь инструмент, которого в наборе нет, либо "
+                     "убери тот, что ведёт работу сейчас.")
     if sig_new in [h.get("sig") for h in history]:
-        return stop("повтор набора",
-                    f"набор {sig_new} уже пробовали — останавливаюсь")
+        return again("повтор набора",
+                     "Такой набор уже пробовали на предыдущих итерациях, его "
+                     "результат тебе известен. Предложи другой.")
 
     entry["next_tools"] = new
     entry["next_sig"] = sig_new
@@ -350,8 +445,25 @@ def main():
                     help="максимум итераций (дефолт 3; итерация ~6 минут)")
     ap.add_argument("--tools", metavar="IDS",
                     help="стартовый набор (по умолчанию — заводской комплект)")
-    ap.add_argument("--llm-model", default=DEFAULT_MODEL, metavar="M",
-                    help=f"модель OpenRouter (дефолт {DEFAULT_MODEL})")
+    ap.add_argument("--llm", default="openrouter",
+                    choices=("openrouter", "claude", "gigachat"),
+                    help="транспорт запроса к агенту (дефолт openrouter)")
+    ap.add_argument("--llm-model", default="", metavar="M",
+                    help=f"модель; для openrouter дефолт {DEFAULT_MODEL}")
+    # ПОДСКАЗКИ ВЫКЛЮЧЕНЫ ПО УМОЛЧАНИЮ. Единственная имеющаяся («отдельного
+    # чистового резца нет») добавлялась под дедлайн после ОДНОГО промаха
+    # GigaChat и оказалась не нужна: без неё резец возвращался в 21 прогоне из
+    # 22 (runs/110 17/17, runs/114 2/2, runs/115 1/2, runs/117 1/1). Агент
+    # выводит этот факт из раскладки сам, а лишняя наводка обесценивает опыт.
+    ap.add_argument("--hints", action="store_true",
+                    help="подсказывать агенту вычисленные из отчёта факты "
+                         "(«отдельного чистового резца нет»). По умолчанию "
+                         "выключено — агент разбирается по сырым данным")
+    ap.add_argument("--no-hints", action="store_true",
+                    help=argparse.SUPPRESS)   # совместимость: подсказок и так нет
+    ap.add_argument("--stream", action="store_true",
+                    help="дублировать вывод прогонов в свой stdout — так за "
+                         "петлёй видно снаружи (этим пользуется веб-морда)")
     ap.add_argument("--sim-setup", choices=("1", "2", "both"),
                     help="гнать в ISV только один установ — вдвое дешевле, "
                          "для отладки самой петли")
@@ -362,7 +474,15 @@ def main():
                          "как контекст")
     ap.add_argument("--timeout", type=int, default=3600, metavar="SEC",
                     help="потолок на одну итерацию, с (дефолт 3600)")
+    # Бюджет ОДНОГО запроса к ЛЛМ. У OpenRouter внутри ещё 3 попытки, то есть
+    # худший случай втрое больше: с дефолтными 900 зависший запрос съедал 45
+    # минут, и в ночном пакете 110 так сгорели два прогона Kimi целиком.
+    ap.add_argument("--llm-timeout", type=int, default=900, metavar="SEC",
+                    help="потолок на один запрос к ЛЛМ, с (дефолт 900; у "
+                         "OpenRouter внутри ещё 3 попытки — worst case ×3)")
     args = ap.parse_args()
+    if args.llm == "openrouter" and not args.llm_model:
+        args.llm_model = DEFAULT_MODEL
 
     if args.config:
         config.load(args.config)
@@ -375,7 +495,7 @@ def main():
 
     stem = os.path.splitext(os.path.abspath(args.gcode))[0]
     journal_path = stem + "_loop.json"
-    journal = {"model": os.path.abspath(args.model), "llm": "openrouter",
+    journal = {"model": os.path.abspath(args.model), "llm": args.llm,
                "llm_model": args.llm_model, "iterations": []}
     history = []
     last_ok = None            # (rep, sc) последнего УДАЧНОГО прогона

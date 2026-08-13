@@ -34,6 +34,7 @@ API:  lathe_diff.analyse(part, result) -> dict
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -167,11 +168,18 @@ def limits_from_gcode(path):
 def analyse(part_path, result_path, json_path=None, pitch=None, z_bin=None,
             angles=6, prof_step=0.05, min_thickness=None, z_limit=None,
             z_limit_bore=None, bore_radius=None, z_shift=0.0, timeout=1800,
-            film=None):
+            film=None, unreachable=None):
     """Возвращает dict с by_z и profile (см. cam/lathe_diff_worker.py).
 
     Умолчания берутся из конфига: `LATHE_DIFF_PITCH`, `LATHE_DIFF_Z_BIN` и общий
     с фрезеровкой допуск `DIFF_MIN_THICKNESS`.
+
+    `unreachable` — [(z_hi, z_lo, «почему»)] в раме ДЕТАЛИ: зоны, которые сама
+    программа объявила недостижимыми выданным набором (канавка уже наличной
+    пластины). Пояса, попавшие в них, помечаются `unreachable` и выносятся из
+    приёмки отдельной строкой. Это не сокрытие: металл там остаётся и на
+    станке, но отвечает за него ЗАКУПКА ИНСТРУМЕНТА, а не траектория, и
+    смешивать это с дефектом программы в одном числе нельзя.
     """
     if pitch is None:
         pitch = float(getattr(config, "LATHE_DIFF_PITCH", 0.25))
@@ -242,12 +250,154 @@ def analyse(part_path, result_path, json_path=None, pitch=None, z_bin=None,
         raise RuntimeError(f"анализ не построился (код {proc.returncode}). {tail}")
     with open(out_json, encoding="utf-8") as f:
         data = json.load(f)
+    _add_profile_dr(data)
+    if unreachable:
+        _mark_unreachable(data, unreachable)
+    if json_path:                           # пометки должны попасть и в файл
+        with open(out_json, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
     if json_path is None:
         try:
             os.unlink(out_json)
         except OSError:
             pass
     return data
+
+
+def _slopes(geo, win=0.3):
+    """Уклон образующей к оси В КАЖДОЙ ТОЧКЕ профиля, ° (0 — цилиндр, 90 — торец).
+
+    Окном ±win, а не по соседям: профиль снят шагом 0.05 мм, и точка к точке
+    шум наклона больше самого наклона.
+
+    Поточечно, а не в среднем по поясу: пояс шириной 1 мм часто накрывает и
+    цилиндр, и конус, и средний уклон не годится ни для того, ни для другого.
+    На 14-31A именно такие стыки давали остаточные 0.015 мм.
+    """
+    zs = [z for z, _ in geo]
+    out = []
+    n = len(geo)
+    j0 = 0
+    for i, (z, _) in enumerate(geo):
+        while j0 < n and zs[j0] < z - win:
+            j0 += 1
+        j1 = i
+        while j1 + 1 < n and zs[j1 + 1] <= z + win:
+            j1 += 1
+        a, b = geo[max(j0, 0)], geo[min(j1, n - 1)]
+        dz, dr = b[0] - a[0], b[1] - a[1]
+        out.append(90.0 if not dz
+                   else math.degrees(math.atan2(abs(dr), abs(dz))))
+    return out
+
+
+def _add_profile_dr(data):
+    """Добавить поясам отклонение по радиусу, СНЯТОЕ С ПРОФИЛЯ.
+
+    Зачем, если воксельное уже есть. У воксельной половины систематический
+    сдвиг: сетка 0.1 мм, граница тела попадает между плоскостями, и парность
+    луча округляет наружу. На 14-31A это ровные +0.030 мм на КАЖДОМ поясе —
+    воксели дают сырое −0.191 там, где профиль даёт −0.161. После поправки на
+    плёнку моста (0.164) профиль показывает +0.003, то есть номинал, а воксели
+    −0.027, и эти три сотых по всей поверхности набирали 90 мм³ «зареза»,
+    которого нет.
+
+    Поэтому приёмку по радиусу считаем по профилю — он на теле вращения точнее
+    на порядок. Воксели остаются за объёмами и зонами: там, где профиля нет
+    (фасетное тело — осевое сечение на нём не строится, см. I15), возвращаемся
+    к ним, и это честно помечено полем `dr_source`.
+
+    Правило проекта: обе половины на теле вращения обязаны сходиться. Расхождение
+    между ними кладётся в `dr_halves_gap_mm` — по нему видно, когда метод врёт.
+    """
+    prof = [p for p in (data.get("profile") or [])
+            if p.get("res_rmax") is not None and p.get("part_rmax") is not None]
+    if not prof:
+        return
+    film = float(data.get("film_mm") or 0.0)
+    # уклон образующей ДЕТАЛИ — по нему толщина зареза считается по нормали
+    geo = sorted((p["z"], p["part_rmax"]) for p in (data.get("profile") or [])
+                 if p.get("part_rmax") is not None)
+    slope_at = dict(zip((z for z, _ in geo), _slopes(geo))) if geo else {}
+
+    def _keep(raw_i, z_i, apply_film):
+        """Отклонение точки после порога: зарез тоньше плёнки не в счёт."""
+        if raw_i >= 0 or not apply_film or not film:
+            return raw_i, 0.0
+        th_i = slope_at.get(z_i, 0.0)
+        c = math.cos(math.radians(min(th_i, 75.0)))
+        excess = (-raw_i) * c - film
+        return ((-(excess / c) if excess > 0 else 0.0),
+                min(-raw_i, film / c))
+
+    for b in data.get("by_z") or []:
+        lo, hi = min(b["z0"], b["z1"]), max(b["z0"], b["z1"])
+        pts = [p for p in prof if lo <= p["z"] <= hi]
+        vals = [p["res_rmax"] - p["part_rmax"] for p in pts]
+        if not vals:
+            b["dr_source"] = "воксели"
+            continue
+        raw = sum(vals) / len(vals)
+        # ПЛЁНКА — ЭТО ЗАРЕЗ, И ЕЁ НЕ ВЫЧИТАЮТ, А НЕ СЧИТАЮТ.
+        #
+        # Смещение точки отслеживания резца в ISV (I19) снимает лишний ровный
+        # слой по ВСЕЙ детали — по нормали к поверхности, а не по радиусу.
+        # Поэтому порог ставится на толщину зареза ПО НОРМАЛИ: |dr|·cos θ, где
+        # θ — уклон образующей к оси. Тоньше порога — не считаем вовсе; толще —
+        # считаем ТОЛЬКО превышение, чтобы настоящий зарез не спрятался.
+        #
+        # Почему порогом, а не прибавкой к dr (как было раньше): прибавка
+        # умеет из зареза сделать НЕДОРЕЗ, если промахнулась. На цилиндрах она
+        # это и делала — +0.003 мм фантомного недореза там, где ровно номинал.
+        # Порог такого не может: недорез он не трогает вовсе.
+        #
+        # Обратная сторона, её надо помнить: там, где металл ОСТАЛСЯ, плёнка
+        # его тоже подъела, и мы этого не восстанавливаем. Недорез читается
+        # заниженным не больше чем на толщину плёнки.
+        sl = [slope_at.get(p["z"], 0.0) for p in pts]
+        b["slope_deg"] = round(sum(sl) / len(sl), 1) if sl else None
+        b["dr_prof_mm"] = round(raw, 4)
+        kept, ignored = zip(*(_keep(p["res_rmax"] - p["part_rmax"], p["z"],
+                                    b.get("film_applied")) for p in pts))
+        dr_band = sum(kept) / len(kept)
+        # ПОЛ РАЗРЕШЕНИЯ. Профиль снят шагом 0.05 мм с фасетного тела, у
+        # которого своя хорда: отличить 0.015 мм от нуля метод не может. Всё,
+        # что мельче пола, и есть ноль — иначе метрика показывает шум, а агент
+        # начинает его чинить (runs/114: Kimi ради -0.0155 мм сняла исправный
+        # чистовой резец и получила -0.397).
+        res = float(getattr(config, "LATHE_DIFF_RESOLUTION", 0.03) or 0.0)
+        if res and abs(dr_band) < res:
+            dr_band = 0.0
+        b["dr_prof_fixed_mm"] = round(dr_band, 4)
+        if any(ignored):
+            b["film_ignored_mm"] = round(sum(ignored) / len(ignored), 4)
+        b["dr_source"] = "профиль"
+        vox = b.get("dr_fixed_mm")
+        if vox is not None:
+            b["dr_halves_gap_mm"] = round(b["dr_prof_fixed_mm"] - float(vox), 4)
+
+
+def _mark_unreachable(data, zones):
+    """Пометить пояса, попавшие в зоны «недостижимо выданным набором».
+
+    Пояс метится по ПЕРЕСЕЧЕНИЮ с зоной, а не по попаданию центра: канавка
+    бывает уже пояса (на 14-31A — 0.9 мм при поясе 1 мм), и по центру она бы
+    не поймалась.
+    """
+    tot = 0.0
+    for b in data.get("by_z") or []:
+        lo, hi = min(b["z0"], b["z1"]), max(b["z0"], b["z1"])
+        for z_hi, z_lo, *why in zones:
+            zlo, zhi = min(z_hi, z_lo), max(z_hi, z_lo)
+            if hi > zlo and lo < zhi:
+                b["unreachable"] = True
+                b["unreachable_why"] = (why[0] if why else
+                                        "недостижимо выданным набором")
+                tot += float(b.get("under_mm3") or 0) + float(
+                    b.get("over_mm3") or 0)
+                break
+    data["unreachable_mm3"] = round(tot, 1)
+    data["unreachable_zones"] = [list(z) for z in zones]
 
 
 def bands(prof, tol=0.02):
@@ -315,6 +465,15 @@ def report(data, min_len=0.15, tol=0.02):
         L.append(f"Отсечено фильтром толщины вдоль оси "
                  f"({data.get('min_thickness_mm')} мм): "
                  f"{data['thin_film_mm3']:.1f} мм³")
+    if data.get("unreachable_zones"):
+        zs = "; ".join(f"z {min(z[0], z[1]):.2f}..{max(z[0], z[1]):.2f}"
+                       for z in data["unreachable_zones"])
+        L.append(f"**Из них НЕДОСТИЖИМО ВЫДАННЫМ НАБОРОМ: "
+                 f"{data.get('unreachable_mm3', 0):.1f} мм³** — {zs}. "
+                 f"Металл там остаётся и на станке; отвечает за это подбор "
+                 f"инструмента (нужна более узкая канавочная пластина), а не "
+                 f"траектория, поэтому в приёмку это не идёт и считается "
+                 f"отдельно.")
     L.append("")
     L.append("## Пояса по z (воксели)")
     L.append("")
@@ -327,11 +486,34 @@ def report(data, min_len=0.15, tol=0.02):
                  f"({data['film_mm']:.3f} мм). Прочерк — поправка к поясу не "
                  f"применялась: грани под ключ, торец/уступ (там расхождение "
                  f"осевое) или отверстие (у расточного своя привязка).")
+        if any(b.get("dr_prof_fixed_mm") is not None
+               for b in data.get("by_z") or []):
+            gaps = [abs(b["dr_halves_gap_mm"]) for b in data["by_z"]
+                    if b.get("dr_halves_gap_mm") is not None]
+            L.append("")
+            L.append(f"**ПРИЁМКА ИДЁТ ПО ПОСЛЕДНЕМУ СТОЛБЦУ** — отклонение "
+                     f"снято с осевого профиля, а не с вокселей, и плёнка в "
+                     f"нём НЕ ВЫЧТЕНА, А НЕ ПОСЧИТАНА: зарез тоньше "
+                     f"{data['film_mm']:.3f} мм ПО НОРМАЛИ к поверхности в счёт "
+                     f"не идёт, толще — считается только превышение. Недорез "
+                     f"порогом не трогается вовсе. "
+                     f"У воксельной половины на теле вращения систематический "
+                     f"сдвиг наружу (сетка {data.get('pitch', 0.1)} мм "
+                     f"округляет границу): здесь он "
+                     f"{sum(gaps) / len(gaps):.3f} мм в среднем по поясам, "
+                     f"максимум {max(gaps):.3f}. Воксели остаются за объёмами "
+                     f"и зонами; на фасетном теле профиль не снимается, тогда "
+                     f"приёмка возвращается к ним.")
     L.append("")
+    has_prof = any(b.get("dr_prof_fixed_mm") is not None
+                   for b in data.get("by_z") or [])
     hdr = "| z от | z до | r ном. | недорез, мм³ | зарез, мм³ | по радиусу, мм |"
     sep = "|---:|---:|---:|---:|---:|---:|"
     if data.get("film_mm"):
         hdr += " с поправкой, мм |"
+        sep += "---:|"
+    if has_prof:
+        hdr += " **ПО ПРОФИЛЮ, мм** |"
         sep += "---:|"
     L.append(hdr + " |")
     L.append(sep + "---|")
@@ -344,6 +526,9 @@ def report(data, min_len=0.15, tol=0.02):
         if data.get("film_mm"):
             drs += (f" | {b['dr_fixed_mm']:+.3f}" if b.get("film_applied")
                     else " | —")
+        if has_prof:
+            dp = b.get("dr_prof_fixed_mm")
+            drs += f" | **{dp:+.3f}**" if dp is not None else " | —"
         what = []
         if b.get("zone"):
             what.append(b["zone"])

@@ -16,7 +16,7 @@
 <main>
   <!-- ЛЕВАЯ КОЛОНКА: что обрабатываем -->
   <section class="card" id="setup">
-    <h2>1. Что обрабатываем</h2>
+    <h2>1. Деталь</h2>
 
     <div class="files">
       <label class="file" id="drop-model">
@@ -34,7 +34,12 @@
       </label>
     </div>
 
-    <h2>2. Параметры</h2>
+    <!-- Вид обработки — свойство ДЕТАЛИ, а не установки: тело вращения точат,
+         корпусную деталь фрезеруют. От выбора зависят и параметры, и петля. -->
+    <h2>2. Вид обработки</h2>
+    <div class="kinds" id="kinds"></div>
+
+    <h2>3. Параметры</h2>
     <p class="note">Подставлены дефолты пайплайна. Меняйте только то, что нужно —
       остальное уйдёт как есть.</p>
     <div id="params"></div>
@@ -55,48 +60,16 @@
       <div class="meta"><span id="iter"></span><span id="elapsed"></span></div>
     </div>
 
-    <!-- Схема процесса. Он ЦИКЛ, а не цепочка: правки агента возвращают
-         в генерацию, и так до «в допуске» либо до лимита итераций. -->
-    <div class="pipeline">
-      <div class="once">
-        <span class="chip" data-phase="prepare">подготовка</span>
-        <span class="arr">→</span>
-        <span class="chip" data-phase="convert">.prt → STEP</span>
-        <span class="arr">→</span>
-      </div>
-
-      <div class="cycle" id="cycle">
-        <div class="cycle-head">итерация <span id="cyc-iter">—</span></div>
-        <div class="cycle-row">
-          <span class="chip" data-phase="generate">генерация</span>
-          <span class="arr">→</span>
-          <span class="chip" data-phase="simulate">симуляция NX</span>
-          <span class="arr">→</span>
-          <span class="chip" data-phase="diff">сверка</span>
-          <span class="arr">→</span>
-          <span class="chip" data-phase="llm">агент</span>
-        </div>
-        <div class="cycle-back" data-phase="apply">
-          <span class="back-label">правки — и заново</span>
-        </div>
-      </div>
-
-      <div class="exit">
-        <span class="exit-why">в допуске<br>или лимит</span>
-        <span class="arr">→</span>
-        <span class="chip" data-phase="compare">сборка</span>
-        <span class="arr">→</span>
-        <span class="chip" data-phase="done">готово</span>
-      </div>
-    </div>
+    <!-- Схема процесса строится по этапам своего вида обработки: он ЦИКЛ, а не
+         цепочка — правки агента возвращают в генерацию, и так до «в допуске»
+         либо до лимита итераций. У точения в цикле два прогона ISV. -->
+    <div class="pipeline" id="pipeline"></div>
 
     <div id="metrics-box" hidden>
       <h3>Расхождение с моделью по итерациям</h3>
-      <table class="metrics"><thead><tr>
-        <th>итер.</th><th>недорез, мм³</th><th>зарез, мм³</th><th>вердикт агента</th>
-      </tr></thead><tbody id="metrics"></tbody></table>
-      <p class="note">Недорез — металл остался там, где его быть не должно.
-        Зарез — срезано лишнее, это брак: восстановить нельзя.</p>
+      <table class="metrics"><thead id="metrics-head"></thead>
+        <tbody id="metrics"></tbody></table>
+      <p class="note" id="metrics-note"></p>
     </div>
 
     <div class="fail" id="fail" hidden>
@@ -114,8 +87,7 @@
     <div id="result" hidden>
       <h3>Результат</h3>
       <div id="files"></div>
-      <p class="note">Скачайте <b>_compare.prt</b> и откройте в NX: слой 1 —
-        модель детали, слой 2 — то, что реально вырезалось.</p>
+      <p class="note" id="result-note"></p>
     </div>
 
     <div class="actions">

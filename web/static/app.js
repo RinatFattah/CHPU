@@ -1,14 +1,65 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
-// Порядок этапов. Внимание: это НЕ прямая — «apply» (правки агента) возвращает
-// в «generate», и цикл повторяется до «в допуске» либо до лимита итераций.
-const PHASES = ["prepare", "convert", "generate", "simulate", "diff", "llm",
-                "apply", "compare", "done"];
-const CYCLE = ["generate", "simulate", "diff", "llm", "apply"];
-let SPEC = null, JOB = null, ES = null, TIMER = null;
+// SPEC — ответ /api/params целиком: спецификации ОБОИХ видов обработки и их
+// этапы. Форма переключается между видами без похода на сервер.
+let SPEC = null, KIND = "mill", JOB = null, ES = null, TIMER = null;
+
+const kindSpec = (k) => SPEC.kinds[k || KIND];
+const phases = (k) => SPEC.phases[k || KIND];
+const phaseIds = (k) => phases(k).map((p) => p.id);
+const cycleIds = (k) => phases(k).filter((p) => p.where === "cycle")
+                                 .map((p) => p.id);
+const escapeHtml = (s) => String(s).replace(/[&<>]/g,
+  (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+
+// ── вид обработки ────────────────────────────────────────────────────────────
+function renderKinds() {
+  $("kinds").innerHTML = Object.entries(SPEC.kinds).map(([id, k]) =>
+    `<label class="kind ${id === KIND ? "on" : ""}" data-kind="${id}">
+       <input type="radio" name="kind" value="${id}" ${id === KIND ? "checked" : ""}>
+       <span class="kind-title">${escapeHtml(k.title)}</span>
+       <span class="kind-sub">${escapeHtml(k.sub)}</span>
+       <span class="kind-about">${escapeHtml(k.about)}</span>
+     </label>`).join("");
+  $("kinds").querySelectorAll("input[name=kind]").forEach((el) =>
+    el.addEventListener("change", () => selectKind(el.value)));
+}
+
+function selectKind(kind) {
+  KIND = kind;
+  $("kinds").querySelectorAll(".kind").forEach((el) =>
+    el.classList.toggle("on", el.dataset.kind === kind));
+  // Заготовка — только у фрезеровки: у точения прокат подбирается сам, по ряду
+  // ГОСТ от габарита детали и припуска на сторону.
+  const useStock = kindSpec().stock;
+  $("drop-stock").hidden = !useStock;
+  if (!useStock) $("stock").value = "";
+  renderParams();
+}
 
 // ── параметры ────────────────────────────────────────────────────────────────
+function toolsHtml(f) {
+  const pool = kindSpec().tool_pool || [];
+  const on = new Set(f.value || []);
+  const rows = pool.map((t) => {
+    const tag = t.phi1 !== undefined ? `φ₁ ${t.phi1}°`
+              : t.width !== undefined ? `${t.width} мм` : "";
+    return `<label class="tool"><input type="checkbox" data-tool="${t.id}"
+              ${on.has(t.id) ? "checked" : ""}>
+      <span class="tool-id">${t.id}</span>
+      <span class="tool-tag">${tag}</span>
+      <span class="tool-desc">${escapeHtml(t.desc)}</span></label>`;
+  }).join("");
+  return `<div class="field wide" id="p_${f.name}">
+      <label>${f.label}
+        <span class="tool-all"><a href="#" data-all="1">все</a> ·
+          <a href="#" data-all="0">снять</a></span></label>
+      <div class="hint">${f.hint || ""}</div>
+      <div class="tools">${rows}</div></div>`;
+}
+
 function fieldHtml(f) {
+  if (f.type === "tools") return toolsHtml(f);
   const id = "p_" + f.name;
   let input;
   if (f.type === "bool") {
@@ -30,26 +81,40 @@ function fieldHtml(f) {
     (f.hint ? `<div class="hint">${f.hint}</div>` : "") + "</div>";
 }
 
-function renderParams(spec) {
-  SPEC = spec;
+function renderParams() {
+  const spec = kindSpec();
   const open = new Set(["Инструмент", "Черновая обработка"]);
-  $("params").innerHTML = spec.params.groups.map((g, i) =>
+  $("params").innerHTML = spec.groups.map((g) =>
     `<details class="group" ${open.has(g.group) ? "open" : ""}>` +
     `<summary>${g.group}</summary>` +
     g.fields.map(fieldHtml).join("") + "</details>").join("")
     + `<details class="group" open><summary>Петля</summary>`
-    + spec.params.run.map(fieldHtml).join("") + "</details>";
-  $("agent").textContent = "агент: " + spec.agent.llm +
-    (spec.agent.llm_model ? " / " + spec.agent.llm_model : "");
+    + spec.run.map(fieldHtml).join("") + "</details>";
+  // «все / снять» у набора инструмента: набор перебирают целыми пачками, и
+  // отщёлкивать десяток галочек мышью — лишняя работа.
+  $("params").querySelectorAll(".tool-all a").forEach((a) =>
+    a.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      a.closest(".field").querySelectorAll("input[data-tool]").forEach(
+        (el) => { el.checked = a.dataset.all === "1"; });
+    }));
+  $("agent").textContent = "агент: " + SPEC.agent.llm +
+    (SPEC.agent.llm_model ? " / " + SPEC.agent.llm_model : "");
 }
 
 function collect() {
+  const spec = kindSpec();
   const out = {};
-  const all = SPEC.params.groups.flatMap((g) => g.fields).concat(SPEC.params.run);
+  const all = spec.groups.flatMap((g) => g.fields).concat(spec.run);
   for (const f of all) {
     const el = $("p_" + f.name);
     if (!el) continue;
-    out[f.name] = f.type === "bool" ? el.checked : el.value;
+    if (f.type === "tools") {
+      out[f.name] = [...el.querySelectorAll("input[data-tool]:checked")]
+        .map((x) => x.dataset.tool);
+    } else {
+      out[f.name] = f.type === "bool" ? el.checked : el.value;
+    }
   }
   return out;
 }
@@ -77,12 +142,34 @@ function wireFile(inputId, nameId, emptyText) {
   show();
 }
 
-// ── прогресс ─────────────────────────────────────────────────────────────────
+// ── схема процесса ───────────────────────────────────────────────────────────
+function renderPipeline(kind) {
+  const p = phases(kind);
+  const chip = (x) => `<span class="chip" data-phase="${x.id}">${x.chip}</span>`;
+  const row = (list) => list.map(chip).join('<span class="arr">→</span>');
+  const once = p.filter((x) => x.where === "once");
+  const cyc = p.filter((x) => x.where === "cycle");
+  const back = p.find((x) => x.where === "back");
+  const exit = p.filter((x) => x.where === "exit");
+  $("pipeline").innerHTML =
+    `<div class="once">${row(once)}<span class="arr">→</span></div>
+     <div class="cycle" id="cycle">
+       <div class="cycle-head">итерация <span id="cyc-iter">—</span></div>
+       <div class="cycle-row">${row(cyc)}</div>
+       ${back ? `<div class="cycle-back" data-phase="${back.id}">
+          <span class="back-label">${back.chip}</span></div>` : ""}
+     </div>
+     <div class="exit"><span class="exit-why">в допуске<br>или лимит</span>
+       <span class="arr">→</span>${row(exit)}</div>`;
+}
+
 function renderSteps(state) {
-  const phase = state.phase, at = PHASES.indexOf(phase);
-  const inCycle = CYCLE.indexOf(phase);
+  const kind = state.kind || KIND;
+  const order = phaseIds(kind), cyc = cycleIds(kind);
+  const phase = state.phase, at = order.indexOf(phase);
+  const inCycle = cyc.indexOf(phase);
   document.querySelectorAll(".pipeline [data-phase]").forEach((el) => {
-    const p = el.dataset.phase, i = PHASES.indexOf(p), c = CYCLE.indexOf(p);
+    const p = el.dataset.phase, i = order.indexOf(p), c = cyc.indexOf(p);
     el.classList.toggle("now", p === phase);
     // «Пройдено» внутри цикла считается ОТ НАЧАЛА ТЕКУЩЕЙ ИТЕРАЦИИ: на второй
     // итерации генерация снова впереди, а не позади.
@@ -106,22 +193,55 @@ function addFeed(ev) {
   if (stick) feed.scrollTop = feed.scrollHeight;
 }
 
-const escapeHtml = (s) => s.replace(/[&<>]/g,
-  (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+// ── расхождения ──────────────────────────────────────────────────────────────
+// У фрезеровки приёмка — ОБЪЁМ (зарез обязан быть нулём), у точения — ДОПУСК
+// ПО РАДИУСУ: объём там зависит от размера детали и идёт как контекст.
+const METRICS = {
+  mill: {
+    head: ["итер.", "недорез, мм³", "зарез, мм³", "вердикт агента"],
+    note: "Недорез — металл остался там, где его быть не должно. " +
+          "Зарез — срезано лишнее, это брак: восстановить нельзя.",
+    row: (m) => `<td class="${m.undercut > 1 ? "bad" : "ok"}">${m.undercut}</td>` +
+                `<td class="${m.overcut > 0 ? "bad" : "ok"}">${m.overcut}</td>`,
+  },
+  lathe: {
+    head: ["итер.", "макс. |Δr|, мм", "недорез, мм³", "зарез, мм³",
+           "вердикт агента"],
+    note: "Приёмка — худшее отклонение по радиусу: с ним сверяется допуск. " +
+          "Объёмы даны по существу, без того, что точением не лечится " +
+          "(лыски шестигранника, просадка торцов в симуляторе).",
+    row: (m) => `<td>${m.dr > 0 ? "+" : ""}${m.dr}</td>` +
+                `<td>${m.undercut}</td><td>${m.overcut}</td>`,
+  },
+};
+
+function renderMetricsHead(kind) {
+  const t = METRICS[kind] || METRICS.mill;
+  $("metrics-head").innerHTML = "<tr>" +
+    t.head.map((h) => `<th>${h}</th>`).join("") + "</tr>";
+  $("metrics-note").textContent = t.note;
+}
 
 function renderMetrics(state) {
   if (!state.metrics.length) return;
+  const t = METRICS[state.kind] || METRICS.mill;
   $("metrics-box").hidden = false;
   const v = {};
   for (const x of state.verdicts) v[x.iter] = x;
   $("metrics").innerHTML = state.metrics.map((m) => {
     const ver = v[m.iter];
-    return `<tr><td>${m.iter}</td>` +
-      `<td class="${m.undercut > 1 ? "bad" : "ok"}">${m.undercut}</td>` +
-      `<td class="${m.overcut > 0 ? "bad" : "ok"}">${m.overcut}</td>` +
+    return `<tr><td>${m.iter}</td>${t.row(m)}` +
       `<td>${ver ? escapeHtml(ver.verdict) : "—"}</td></tr>`;
   }).join("");
 }
+
+const RESULT_NOTE = {
+  mill: "Скачайте <b>_compare.prt</b> и откройте в NX: слой 1 — модель детали, " +
+        "слой 2 — то, что реально вырезалось.",
+  lathe: "Смотреть глазами: откройте <b>out_full.step</b> и <b>out_part.step</b> " +
+         "в одной сцене — это результат обоих установов и модель в одной " +
+         "системе координат. Числа по поясам — в <b>out_nxdiff.md</b>.",
+};
 
 function renderResult(state) {
   const done = state.status !== "running";
@@ -143,6 +263,7 @@ function renderResult(state) {
   }
   if (!state.outputs.length) return;
   $("result").hidden = false;
+  $("result-note").innerHTML = RESULT_NOTE[state.kind] || "";
   $("files").innerHTML = state.outputs.map((f) =>
     `<a class="${f.primary ? "primary-file" : ""}" download
         href="/api/jobs/${state.id}/files/${encodeURIComponent(f.name)}">
@@ -176,6 +297,10 @@ function follow(state) {
   $("feed").innerHTML = "";
   $("fail").hidden = true;
   $("form-error").hidden = true;
+  // Схема и таблица — по виду обработки ЗАДАЧИ, а не выбранного в форме: при
+  // возврате на страницу к уже идущей задаче они могут не совпадать.
+  renderPipeline(state.kind);
+  renderMetricsHead(state.kind);
   tick(state);
   startClock(state);
 
@@ -183,7 +308,7 @@ function follow(state) {
   ES = new EventSource(`/api/jobs/${state.id}/events?start=0`);
   ES.onmessage = (e) => {
     const ev = JSON.parse(e.data);
-    tick(ev);
+    tick({ ...ev, kind: state.kind });
     addFeed(ev);
     if (ev.kind === "metric" || ev.kind === "verdict")
       fetch(`/api/jobs/${JOB}`).then((r) => r.json()).then(renderMetrics);
@@ -209,7 +334,9 @@ async function start() {
   $("form-error").hidden = true;
   const fd = new FormData();
   fd.append("model", $("model").files[0]);
-  if ($("stock").files[0]) fd.append("stock", $("stock").files[0]);
+  fd.append("kind", KIND);
+  if (kindSpec().stock && $("stock").files[0])
+    fd.append("stock", $("stock").files[0]);
   fd.append("form", JSON.stringify(collect()));
   $("start").disabled = true;
   try {
@@ -225,16 +352,21 @@ async function start() {
 }
 
 // ── старт страницы ───────────────────────────────────────────────────────────
+async function load(keepKind) {
+  SPEC = await (await fetch("/api/params")).json();
+  if (!keepKind || !SPEC.kinds[KIND]) KIND = SPEC.default;
+  renderKinds();
+  selectKind(KIND);
+  return SPEC;
+}
+
 (async function init() {
-  const spec = await (await fetch("/api/params")).json();
-  renderParams(spec);
+  await load(false);
   wireFile("model", "model-name", "файл не выбран");
   wireFile("stock", "stock-name", "не выбрана: бокс от габарита детали");
 
   $("start").addEventListener("click", start);
-  $("reset").addEventListener("click", async () => {
-    renderParams(await (await fetch("/api/params")).json());
-  });
+  $("reset").addEventListener("click", () => load(true));
   $("stop").addEventListener("click", async () => {
     if (JOB) await fetch(`/api/jobs/${JOB}/stop`, { method: "POST" });
   });
@@ -247,5 +379,5 @@ async function start() {
     $("feed").classList.toggle("raw", $("raw").checked);
   });
 
-  if (spec.active && spec.active.status === "running") follow(spec.active);
+  if (SPEC.active && SPEC.active.status === "running") follow(SPEC.active);
 })();

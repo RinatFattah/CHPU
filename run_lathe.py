@@ -254,7 +254,9 @@ def main():
         "finish_nose_angle": getattr(config, "LATHE_FINISH_NOSE_ANGLE", 35.0),
         "finish_insert_edge": getattr(config, "LATHE_FINISH_INSERT_SIZE", 6.35),
         "nose_angle": getattr(config, "LATHE_NOSE_ANGLE", 55.0),
-        "approach_angle": getattr(config, "LATHE_APPROACH_ANGLE", 107.5),
+        # угол в плане приходит из парка (lathe_tools.plan); здесь — только
+        # запасное значение на случай, если парк его не дал
+        "approach_angle": 93.0,
         "insert_edge": getattr(config, "LATHE_INSERT_SIZE", 6.35),
         # канавочный резец T2
         "groove_tool": (not args.no_groove_tool
@@ -304,6 +306,15 @@ def main():
             p[key] = False
     if args.groove_width is not None:          # ручная ширина пластины сильнее каталога
         p["groove_width"] = args.groove_width
+    # Угол в плане: парк — источник истины, конфиг — ручной override на все
+    # проходные разом (None = не вмешиваться). Держим ОДНО место, где решается
+    # угол: раньше он лежал и в конфиге, и в парке, побеждал парк, а всё
+    # объяснение было написано в конфиге.
+    _appr = getattr(config, "LATHE_APPROACH_ANGLE", None)
+    if _appr is not None:
+        p["approach_angle"] = float(_appr)
+        print(f"Инструмент: угол в плане навязан конфигом: φ = {_appr}° "
+              f"(в парке {tool_params.get('approach_angle')}°)")
 
     # Копилка машиночитаемого отчёта (--report). Пишется по ходу прогона и
     # выгружается в конце: агентной петле нужен ровно этот срез — что выдали
@@ -428,6 +439,9 @@ def main():
                 "uncut_mm3": round(st.get("uncut_mm3", 0.0), 1),
                 "blade_mm": st.get("blade"),
                 "blade_tight": bool(st.get("blade_tight")),
+                # ГДЕ именно тесно: агенту мало флага blade_tight, ему нужно
+                # место, чтобы связать это с поясами сверки
+                "groove_zones": st.get("groove_zones", []),
                 "grooves": st.get("grooves", 0),
                 "groove_volume_mm3": round(st.get("groove_volume_mm3", 0.0), 1),
                 "left_passes": st.get("left_passes", 0),
@@ -635,10 +649,33 @@ def main():
             # пояса пересчитываются в радиус и снимается плёнка моста ISV
             # (см. lathe/lathe_diff.py). Границы установа не задаём — деталь
             # обработана целиком, за неё отвечают оба.
+            # Зоны, которые САМА ПРОГРАММА объявила недостижимыми выданным
+            # набором: остаток отдан канавочному, а он уже наличной пластины.
+            # Второй установ пишет их в своей раме (z' = −z + z_end) — переводим
+            # в раму детали, сверка идёт там.
+            def _unreach(st, flip=False):
+                w = st.get("blade") or 0.0
+                out = []
+                for g in st.get("groove_zones", []) or []:
+                    if not g.get("tight"):
+                        continue
+                    z_hi, z_lo = g["z_hi"], g["z_lo"]
+                    if flip:
+                        z_hi, z_lo = z_end - z_hi, z_end - z_lo
+                    out.append((z_hi, z_lo,
+                                f"канавка {g['width_bottom']:.2f} мм — уже "
+                                f"наличной пластины {w:.2f} мм"))
+                return out
+
+            unreach = _unreach(stats) + _unreach(stats2, flip=True)
+            if unreach:
+                print(f"   ⓘ недостижимо выданным набором: {len(unreach)} "
+                      f"зон(а) — в приёмку не пойдут, см. отчёт")
             try:
                 from lathe import lathe_diff
                 d = lathe_diff.analyse(stem + "_part.step", full,
-                                       stem + "_nxdiff.json")
+                                       stem + "_nxdiff.json",
+                                       unreachable=unreach)
                 with open(stem + "_nxdiff.md", "w", encoding="utf-8") as f:
                     f.write(lathe_diff.report(d))
                 rep["diff"] = {k: d.get(k) for k in (
