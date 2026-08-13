@@ -133,6 +133,10 @@ def main():
                     help="не выделять канавки отдельному резцу T2 — всё одним "
                          "проходным (прежнее поведение; проходной резец в канавку "
                          "физически не лезет и подрезает стенку позади)")
+    ap.add_argument("--left-always", action="store_true",
+                    help="выпускать проход левого резца T3 всегда, даже когда он "
+                         "снимает слой тоньше порога (прежнее поведение; в NX ISV "
+                         "левый резец шаблона зарезает стенку над проходом)")
     ap.add_argument("--groove-width", type=float, metavar="MM",
                     help="ширина канавочной пластины, мм (дефолт 3.0; под более "
                          "узкую канавку подбирается автоматически)")
@@ -272,6 +276,9 @@ def main():
         "nose_comp": (not args.no_nose_comp
                       and getattr(config, "LATHE_NOSE_COMP", True)),
         "tip_offset": tuple(getattr(config, "LATHE_TIP_OFFSET", (1.0, -1.0))),
+        # порог окупаемости прохода левого резца, мм по радиусу (см. lathe_gcode)
+        "left_min_dr": (0.0 if args.left_always
+                        else float(getattr(config, "LATHE_LEFT_MIN_DR", 0.12))),
     }
 
     # ── ДОСТУПНЫЙ ИНСТРУМЕНТ ──
@@ -478,6 +485,11 @@ def main():
         print(f"   T3 левый проходной: {stats['left_passes']} проход(а), "
               f"{stats['left_volume_mm3']:.0f} мм³ — правому резцу за уступ "
               f"не зайти")
+    for s in stats.get("left_skipped") or []:
+        print(f"   ⓘ проход левого резца ПРОПУЩЕН: z {s['z_hi']:.2f}.."
+              f"{s['z_lo']:.2f}, {s['volume_mm3']:.1f} мм³ = {s['dr_mm']:.3f} мм "
+              f"по радиусу — тоньше допуска, а сам проход зарезает стенку выше "
+              f"(--left-always вернёт)")
     if stats.get("uncut_mm3"):
         print(f"   ⚠  НЕ ОБРАБОТАНО: {stats['uncut_mm3']:.0f} мм³ "
               f"(второй установ + недобранные донья канавок)")
