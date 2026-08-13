@@ -168,11 +168,18 @@ def limits_from_gcode(path):
 def analyse(part_path, result_path, json_path=None, pitch=None, z_bin=None,
             angles=6, prof_step=0.05, min_thickness=None, z_limit=None,
             z_limit_bore=None, bore_radius=None, z_shift=0.0, timeout=1800,
-            film=None, unreachable=None):
+            film=None, unreachable=None, film_zones=None):
     """Возвращает dict с by_z и profile (см. cam/lathe_diff_worker.py).
 
     Умолчания берутся из конфига: `LATHE_DIFF_PITCH`, `LATHE_DIFF_Z_BIN` и общий
     с фрезеровкой допуск `DIFF_MIN_THICKNESS`.
+
+    `film_zones` — [(z_hi, z_lo, film_mm, «чем резали»)] в раме ДЕТАЛИ: участки,
+    где плёнка моста ОТЛИЧАЕТСЯ от общей, потому что их резал другой инструмент.
+    Плёнку задаёт не траектория, а то, какую точку пластины программной называет
+    ISV, и у левого резца она другая (tp = 3 против 4 у правого) — вплоть до
+    ЗНАКА. Без этого поправка на его поверхностях не просто мажет, а работает
+    наоборот. Пересекающиеся зоны: побеждает последняя.
 
     `unreachable` — [(z_hi, z_lo, «почему»)] в раме ДЕТАЛИ: зоны, которые сама
     программа объявила недостижимыми выданным набором (канавка уже наличной
@@ -250,6 +257,8 @@ def analyse(part_path, result_path, json_path=None, pitch=None, z_bin=None,
         raise RuntimeError(f"анализ не построился (код {proc.returncode}). {tail}")
     with open(out_json, encoding="utf-8") as f:
         data = json.load(f)
+    if film_zones:                          # ДО расчёта: пороги считаются по ним
+        _mark_film_zones(data, film_zones)
     _add_profile_dr(data)
     if unreachable:
         _mark_unreachable(data, unreachable)
@@ -320,15 +329,39 @@ def _add_profile_dr(data):
                  if p.get("part_rmax") is not None)
     slope_at = dict(zip((z for z, _ in geo), _slopes(geo))) if geo else {}
 
-    def _keep(raw_i, z_i, apply_film):
-        """Отклонение точки после порога: зарез тоньше плёнки не в счёт."""
-        if raw_i >= 0 or not apply_film or not film:
+    # Плёнка бывает СВОЯ там, где резал другой инструмент. Назначается
+    # ПОТОЧЕЧНО, а не по поясу: зона левого резца короче пояса (на 22-13A
+    # 0.44 мм при поясе 1 мм) и ложится на границу двух. По поясу её пришлось бы
+    # красить целиком — вместе со стенкой НАД проходом, которую левый резец не
+    # режет, а только волочит по ней вспомогательной кромкой. Замерено: так
+    # зарез в соседнем поясе читался −0.310 вместо −0.133.
+    fzones = data.get("film_zones") or []
+
+    def film_at(z_i):
+        for z_hi, z_lo, mm, *_ in fzones:
+            if min(z_hi, z_lo) <= z_i <= max(z_hi, z_lo):
+                return float(mm)
+        return film
+
+    def _keep(raw_i, z_i, apply_film, film_b):
+        """Отклонение точки после порога: расхождение тоньше плёнки не в счёт.
+
+        ЗНАК `film_b` выбирает сторону. Плюс — ISV срезает лишнее, гасим ЗАРЕЗ
+        (правый резец, tp = 4). Минус — ISV оставляет металл, гасим НЕДОРЕЗ
+        (левый, tp = 3). Сторона именно та, куда врёт симулятор: погасить
+        противоположную значило бы спрятать настоящий дефект.
+        """
+        if not apply_film or not film_b:
             return raw_i, 0.0
+        sgn = 1.0 if film_b > 0 else -1.0
+        if raw_i * sgn >= 0:                # расхождение с другой стороны
+            return raw_i, 0.0
+        mag = abs(film_b)
         th_i = slope_at.get(z_i, 0.0)
         c = math.cos(math.radians(min(th_i, 75.0)))
-        excess = (-raw_i) * c - film
-        return ((-(excess / c) if excess > 0 else 0.0),
-                min(-raw_i, film / c))
+        excess = abs(raw_i) * c - mag
+        return ((-sgn * (excess / c) if excess > 0 else 0.0),
+                min(abs(raw_i), mag / c))
 
     for b in data.get("by_z") or []:
         lo, hi = min(b["z0"], b["z1"]), max(b["z0"], b["z1"])
@@ -358,7 +391,8 @@ def _add_profile_dr(data):
         b["slope_deg"] = round(sum(sl) / len(sl), 1) if sl else None
         b["dr_prof_mm"] = round(raw, 4)
         kept, ignored = zip(*(_keep(p["res_rmax"] - p["part_rmax"], p["z"],
-                                    b.get("film_applied")) for p in pts))
+                                    b.get("film_applied"), film_at(p["z"]))
+                              for p in pts))
         dr_band = sum(kept) / len(kept)
         # ПОЛ РАЗРЕШЕНИЯ. Профиль снят шагом 0.05 мм с фасетного тела, у
         # которого своя хорда: отличить 0.015 мм от нуля метод не может. Всё,
@@ -375,6 +409,30 @@ def _add_profile_dr(data):
         vox = b.get("dr_fixed_mm")
         if vox is not None:
             b["dr_halves_gap_mm"] = round(b["dr_prof_fixed_mm"] - float(vox), 4)
+
+
+def _mark_film_zones(data, zones):
+    """Проставить поясам СВОЮ плёнку там, где резал не основной инструмент.
+
+    Плёнку моста задаёт не траектория, а точка пластины, которую ISV считает
+    программной. У левого резца она другая (tp = 3 против 4 у правого), и
+    поправка на его поверхностях иначе работает НАОБОРОТ — гасит зарез там, где
+    симулятор металл оставил.
+
+    Зона НЕ расширяется. Пробовал добавить радиус при вершине с обеих сторон —
+    padding уехал на стенку над проходом, где левый резец не режет, а волочит,
+    и её зарез перестал считаться (−0.310 вместо −0.133 в отчёте). Сама
+    поправка применяется поточечно, см. `_add_profile_dr`; здесь только пометка
+    поясов для отчёта.
+    """
+    for b in data.get("by_z") or []:
+        lo, hi = min(b["z0"], b["z1"]), max(b["z0"], b["z1"])
+        for z_hi, z_lo, mm, *why in zones:
+            zlo, zhi = min(z_hi, z_lo), max(z_hi, z_lo)
+            if hi > zlo and lo < zhi:
+                b["film_mm"] = float(mm)
+                b["film_why"] = why[0] if why else "другой инструмент"
+    data["film_zones"] = [list(z) for z in zones]
 
 
 def _mark_unreachable(data, zones):
@@ -496,8 +554,19 @@ def report(data, min_len=0.15, tol=0.02):
                      f"нём НЕ ВЫЧТЕНА, А НЕ ПОСЧИТАНА: зарез тоньше "
                      f"{data['film_mm']:.3f} мм ПО НОРМАЛИ к поверхности в счёт "
                      f"не идёт, толще — считается только превышение. Недорез "
-                     f"порогом не трогается вовсе. "
-                     f"У воксельной половины на теле вращения систематический "
+                     f"порогом не трогается вовсе. ")
+            if data.get("film_zones"):
+                fz = data["film_zones"]
+                L.append("")
+                L.append(f"**У {len(fz)} участк(ов) плёнка СВОЯ** — их резал "
+                         f"другой инструмент, а величину плёнки задаёт не "
+                         f"траектория, а то, какую точку пластины программной "
+                         f"считает ISV. У левого резца это положение 3 против 4 "
+                         f"у правого, поэтому там гасится НЕДОРЕЗ "
+                         f"({fz[0][2]:+.3f} мм), а не зарез. Пояса помечены в "
+                         f"последнем столбце.")
+            L.append("")
+            L.append(f"У воксельной половины на теле вращения систематический "
                      f"сдвиг наружу (сетка {data.get('pitch', 0.1)} мм "
                      f"округляет границу): здесь он "
                      f"{sum(gaps) / len(gaps):.3f} мм в среднем по поясам, "
@@ -536,6 +605,8 @@ def report(data, min_len=0.15, tol=0.02):
             what.append("грани под ключ")
         if b.get("face"):
             what.append("торец/уступ — величина не радиальная")
+        if b.get("film_why"):
+            what.append(f"{b['film_why']}: плёнка {b['film_mm']:+.3f}")
         L.append(f"| {b['z0']:.1f} | {b['z1']:.1f} | {rn} | {b['under_mm3']:.2f} "
                  f"| {b['over_mm3']:.2f} | {drs} | {', '.join(what)} |")
     L.append("")

@@ -668,6 +668,27 @@ def main():
                 return out
 
             unreach = _unreach(stats) + _unreach(stats2, flip=True)
+
+            # Плёнка моста у ЛЕВОГО резца своя и ДРУГОГО ЗНАКА: ISV называет
+            # программной другую точку пластины (tp = 3 против 4 у правого,
+            # замерено зондом). Общая поправка на его поверхностях работала бы
+            # наоборот, поэтому его проходы получают собственную величину.
+            def _film_left(st, flip=False):
+                f = getattr(config, "LATHE_DIFF_FILM_FACTOR_LEFT", None)
+                if f is None or not getattr(config, "LATHE_DIFF_FILM", True):
+                    return []
+                mm = float(f) * float(getattr(config, "LATHE_NOSE_RADIUS", 0.4))
+                out = []
+                for z_hi, z_lo in st.get("left_zones", []) or []:
+                    if flip:
+                        z_hi, z_lo = z_end - z_hi, z_end - z_lo
+                    out.append((z_hi, z_lo, mm, "левый резец T3"))
+                return out
+
+            film_zones = _film_left(stats) + _film_left(stats2, flip=True)
+            if film_zones:
+                print(f"   ⓘ проходов левого резца: {len(film_zones)} — у них "
+                      f"своя плёнка моста {film_zones[0][2]:+.3f} мм")
             if unreach:
                 print(f"   ⓘ недостижимо выданным набором: {len(unreach)} "
                       f"зон(а) — в приёмку не пойдут, см. отчёт")
@@ -675,7 +696,8 @@ def main():
                 from lathe import lathe_diff
                 d = lathe_diff.analyse(stem + "_part.step", full,
                                        stem + "_nxdiff.json",
-                                       unreachable=unreach)
+                                       unreachable=unreach,
+                                       film_zones=film_zones)
                 with open(stem + "_nxdiff.md", "w", encoding="utf-8") as f:
                     f.write(lathe_diff.report(d))
                 rep["diff"] = {k: d.get(k) for k in (

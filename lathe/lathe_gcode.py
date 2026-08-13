@@ -783,12 +783,17 @@ def generate(prof_data, params):
     # несуществующего инструмента и НЕ СОХРАНЯЕТ IPW вовсе. Замерено на наборе
     # с 55°-чистовым: установ 2 падал именно так.
     paths = []
+    left_cut = []            # участки ПОВЕРХНОСТИ, отданные левому резцу
     for lz in doable:
         pts = sorted([(z, r) for z, r in part_raw
                       if lz["z_lo"] - 1e-9 <= z <= lz["z_hi"] + 1e-9],
                      key=lambda t: t[0])          # по возрастанию z: идём в +Z
         if len(pts) < 2:
             continue
+        # Границы берём ПО НОМИНАЛУ, а не по готовому пути: компенсация сдвигает
+        # программную точку вдоль оси (на 22-13A — на 0.67 мм), и по её
+        # координатам участок поверхности определился бы не там.
+        left_cut.append((max(z for z, _ in pts), min(z for z, _ in pts)))
         paths.append(compensate_nose_left(
             pts, nose_r, params.get("tip_offset", (1.0, -1.0)))
             if nose_r else pts)
@@ -1105,6 +1110,12 @@ def generate(prof_data, params):
              "thread_candidates": find_thread_candidates(part_profile),
              "left_passes": n_left,
              "left_volume_mm3": sum(lz["volume_mm3"] for lz in doable),
+             # Участки ПОВЕРХНОСТИ, которые режет левый резец, в номинальной
+             # раме. Нужны анализатору: у левого своя точка отслеживания в ISV
+             # (tp = 3 против 4 у правого), и плёнка на его поверхностях
+             # получается другого ЗНАКА. Только зоны, дошедшие до программы:
+             # зона меньше двух точек отсеивается и прохода не даёт.
+             "left_zones": left_cut,
              "second_setup": [(lz["z_hi"], lz["z_lo"], lz["volume_mm3"])
                               for lz in second_setup],
              "finish_tool": t_fin if fin_tool else 0,
