@@ -69,7 +69,36 @@ def hf(v):
     return str(int(round(v))) if abs(v - round(v)) < 1e-6 else f"{v:.1f}"
 
 
-def convert(src_lines, name="PROG", tol=0.01):
+_PART = re.compile(r"\(Part:\s*[\d.]+\s*x\s*[\d.]+\s*x\s*([\d.]+)\s*mm")
+
+
+def z_shift_for(src_lines, mode):
+    """Сдвиг по Z под НОЛЬ ЗАКАЗЧИКА. Возвращает (сдвиг, пояснение).
+
+    Наш генератор ставит ноль по ВЕРХУ детали (`ORIGIN = corner-top`), КнААЗ —
+    по НИЗУ, то есть по плоскости вакуумного стола. Прочитано с их карты
+    эскизов КЭ №2: ось Z построена от нижней плоскости вверх, от неё отложены
+    высота детали 21 и высота заготовки 45.
+
+    Подтверждено их же программами: у всех шести ход по Z лежит целиком в
+    плюсе (+1.312…48.000), у наших — в минусе (−20.516…28.984). По X диапазоны
+    совпадают, по Y совпадают центры, так что расходится ТОЛЬКО Z.
+
+    Сдвиг равен высоте детали и берётся из шапки G-кода, а не задаётся руками:
+    у каждой детали она своя.
+    """
+    if mode != "bottom":
+        return 0.0, ""
+    for ln in src_lines:
+        m = _PART.search(ln)
+        if m:
+            h = float(m.group(1))
+            return h, f"ноль перенесён на низ детали: Z += {h:g} мм"
+    return 0.0, ("в G-коде нет строки «(Part: …)» — высоту детали взять неоткуда, "
+                 "ноль ОСТАВЛЕН по верху")
+
+
+def convert(src_lines, name="PROG", tol=0.01, z_datum="top"):
     """Строки grbl → строки диалога Heidenhain (без номеров блоков).
 
     `tol` — допуск линеаризации дуг, мм. 0.01 выбрано по замеру: вырожденные
@@ -80,6 +109,9 @@ def convert(src_lines, name="PROG", tol=0.01):
     out, warn = [], []
     stock = None
     rpm = None
+    dz, note = z_shift_for(src_lines, z_datum)
+    if note:
+        warn.append(note)
     for ln in src_lines:                       # шапка живёт в комментариях
         m = _STOCK.search(ln)
         if m:
@@ -87,6 +119,9 @@ def convert(src_lines, name="PROG", tol=0.01):
         m = _SPINDLE.search(ln)
         if m and rpm is None:
             rpm = int(m.group(1))
+    if stock:
+        stock[4] += dz                          # заготовка едет вместе с нулём
+        stock[5] += dz
 
     out.append(f"BEGIN PGM {name} MM")
     if stock:
@@ -114,7 +149,8 @@ def convert(src_lines, name="PROG", tol=0.01):
         code = int(g.group(1)) if g else None
         if code in (0, 1, 2, 3):
             words = dict(re.findall(r"([XYZIJF])" + _NUM, ln))
-            tgt = {a: float(words[a]) if a in words else pos[a]
+            tgt = {a: float(words[a]) + (dz if a == "Z" else 0.0)
+                   if a in words else pos[a]
                    for a in "XYZ"}
             if code in (2, 3):
                 if pos["X"] is None or pos["Y"] is None:
@@ -137,7 +173,10 @@ def convert(src_lines, name="PROG", tol=0.01):
                 # на столько отрезков, чтобы она нигде не отходила от хорды
                 # дальше tol. У вырожденной выходит ровно один отрезок.
                 rad = math.hypot(pos["X"] - cx, pos["Y"] - cy)
-                dz = 0.0 if tgt["Z"] is None or pos["Z"] is None \
+                # ИМЯ ВАЖНО: `dz` снаружи — это сдвиг нуля детали. Одноимённая
+                # локальная переменная затирала его после первой же дуги, и
+                # дальше программа шла без переноса нуля.
+                arc_dz = 0.0 if tgt["Z"] is None or pos["Z"] is None \
                     else tgt["Z"] - pos["Z"]
                 a0 = math.atan2(pos["Y"] - cy, pos["X"] - cx)
                 a1 = math.atan2(tgt["Y"] - cy, tgt["X"] - cx)
@@ -149,12 +188,12 @@ def convert(src_lines, name="PROG", tol=0.01):
                     while sweep <= 0:
                         sweep += 2 * math.pi
                 sag = rad * (1 - math.cos(abs(sweep) / 2))   # стрелка прогиба
-                if abs(dz) > 1e-6 or sag < tol:
+                if abs(arc_dz) > 1e-6 or sag < tol:
                     n = 1 if sag < tol else max(
                         2, int(math.ceil(abs(sweep) /
                                          (2 * math.acos(max(-1.0, min(
                                              1.0, 1 - tol / rad)))))))
-                    if abs(dz) > 1e-6:
+                    if abs(arc_dz) > 1e-6:
                         warn.append("винтовая дуга разложена на отрезки "
                                     "(блок `C` подъём по Z не несёт)")
                     for k in range(1, n + 1):
@@ -162,7 +201,7 @@ def convert(src_lines, name="PROG", tol=0.01):
                         ang = a0 + sweep * t
                         px, py = cx + rad * math.cos(ang), cy + rad * math.sin(
                             ang)
-                        pz = None if pos["Z"] is None else pos["Z"] + dz * t
+                        pz = None if pos["Z"] is None else pos["Z"] + arc_dz * t
                         seg = {"X": px, "Y": py, "Z": pz}
                         if k == n:
                             seg = tgt                # конец — точно как в G-коде
@@ -223,6 +262,10 @@ def main():
     ap.add_argument("--name", help="имя программы (по умолчанию — имя файла)")
     ap.add_argument("--tol", type=float, default=0.01, metavar="MM",
                     help="допуск линеаризации дуг, мм (дефолт 0.01)")
+    ap.add_argument("--z-datum", choices=("top", "bottom"), default="top",
+                    help="где ноль по Z: top — по верху детали, как считает наш "
+                         "генератор (дефолт); bottom — по низу, как на КнААЗ "
+                         "(сдвиг = высота детали из шапки G-кода)")
     a = ap.parse_args()
 
     dst = a.dst or os.path.splitext(a.src)[0] + ".h"
@@ -233,7 +276,7 @@ def main():
 
     with open(a.src, encoding="utf-8", errors="replace") as f:
         src = f.read().splitlines()
-    body, warn = convert(src, name, a.tol)
+    body, warn = convert(src, name, a.tol, a.z_datum)
 
     parent = os.path.dirname(os.path.abspath(dst))
     if parent:
