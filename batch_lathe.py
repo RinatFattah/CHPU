@@ -31,6 +31,8 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
+import socket
 import subprocess
 import sys
 import time
@@ -78,6 +80,58 @@ def log(batch_dir, msg):
     with open(os.path.join(batch_dir, "batch.log"), "a",
               encoding="utf-8") as f:
         f.write(line + "\n")
+
+
+def wait_for_llm(batch_dir, tries=60, pause=60):
+    """Ждать возвращения связи. True — вернулась, False — так и не дождались.
+
+    Проверяется ПРОКСИ из окружения, если он задан: обе модели ходят через
+    него, и умирает обычно он, а не Сбер с OpenRouter разом.
+    """
+    target = ("127.0.0.1", 12334)
+    prox = (os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+            or "")
+    m = re.search(r"//([^:/]+):(\d+)", prox)
+    if m:
+        target = (m.group(1), int(m.group(2)))
+    for i in range(tries):
+        try:
+            socket.create_connection(target, timeout=5).close()
+            if i:
+                log(batch_dir, f"связь вернулась через {i} мин — продолжаю")
+            return True
+        except OSError:
+            if not i:
+                log(batch_dir, f"нет связи ({target[0]}:{target[1]}) — жду, "
+                               f"проверяю раз в минуту до {tries} мин")
+            time.sleep(pause)
+    return False
+
+
+def _is_done(out_dir):
+    """(прогон состоялся?, чем сорвался). Журнала нет → (False, "").
+
+    Наличия журнала МАЛО. В ночь на 14.08 умер локальный прокси, через который
+    ходят обе модели: 29 прогонов из 30 записали журнал с одной итерацией и без
+    единого ответа ЛЛМ, и повтор пакета их бы молча пропустил. Состоявшимся
+    считаем прогон, где петля дошла до вердикта ИЛИ модель хоть раз ответила.
+    """
+    p = os.path.join(out_dir, "out_loop.json")
+    if not os.path.exists(p):
+        return False, ""
+    try:
+        with open(p, encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return False, "журнал не читается"
+    its = d.get("iterations") or []
+    if not its:
+        return False, "нет ни одной итерации"
+    if any(e.get("verdict") for e in its):
+        return True, ""
+    if any(e.get("llm") for e in its):
+        return True, ""
+    return False, "ЛЛМ не ответила ни разу"
 
 
 def find_parts(parts_dir):
@@ -332,10 +386,14 @@ def main():
     for part_name, model in parts:
         for agent in agents:
             out_dir = os.path.join(batch_dir, part_name, agent)
-            if os.path.exists(os.path.join(out_dir, "out_loop.json")):
+            done, why = _is_done(out_dir)
+            if done:
                 log(batch_dir, f"{part_name}/{agent}: уже есть журнал — "
                                f"пропускаю")
                 continue
+            if why:                       # журнал есть, но прогон не состоялся
+                log(batch_dir, f"{part_name}/{agent}: прошлый прогон сорвался "
+                               f"({why}) — переделываю")
             if deadline and dt.datetime.now() >= deadline:
                 log(batch_dir, f"дедлайн {deadline:%H:%M} — новых прогонов не "
                                f"начинаю")
@@ -366,6 +424,15 @@ def main():
                            + (f", {note}" if note else "")
                            + (f" | {tail}" if tail else ""))
             write_summary(batch_dir, parts, agents, a.tools_without, a.ok_dr)
+
+            # Связь пропала — ЖДЁМ, а не гоним остаток пакета в стену. В ночь
+            # на 14.08 умер локальный прокси, и 29 прогонов из 30 отработали
+            # вхолостую за два часа: каждый считал геометрию (по 3 минуты) и
+            # спотыкался на первом же запросе к модели.
+            if not _is_done(out_dir)[0] and not wait_for_llm(batch_dir):
+                log(batch_dir, "связи с моделями нет — останавливаю пакет; "
+                               "повтор той же командой продолжит с этого места")
+                return
 
     write_summary(batch_dir, parts, agents, a.tools_without, a.ok_dr)
     log(batch_dir, f"пакет закончен, сводка → "
