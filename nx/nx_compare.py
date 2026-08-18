@@ -10,6 +10,9 @@ CLI (одна пара):
   python nx/nx_compare.py деталь_part.step результат_sim.stp [выход_compare.prt]
 API (пакетно, один запуск NX на все пары):
   nx_compare.compare_many([{"part": ..., "sim": ..., "out_prt": ...}, ...])
+Больше двух тел (например 1 = модель, 2 = заводская программа, 3 = наша):
+  nx_compare.compare_many([{"bodies": [{"path": ..., "layer": 1}, ...],
+                            "out_prt": ...}])
 """
 
 import json
@@ -39,16 +42,21 @@ def compare_many(jobs: list, timeout: int | None = None) -> list:
     tdir = tempfile.gettempdir()
 
     # все пути — через временные ASCII-файлы (кириллица + 8.3-обрезка .step)
-    prepared, moves = [], []
+    prepared, moves, tmps = [], [], []
     for i, job in enumerate(jobs, 1):
-        part_tmp = os.path.join(tdir, f"nxcmp_{i}_part.stp")
-        sim_tmp = os.path.join(tdir, f"nxcmp_{i}_sim.stp")
         out_tmp = os.path.join(tdir, f"nxcmp_{i}_compare.prt")
-        shutil.copyfile(job["part"], part_tmp)
-        shutil.copyfile(job["sim"], sim_tmp)
         if os.path.exists(out_tmp):
             os.unlink(out_tmp)
-        prepared.append({"part": part_tmp, "sim": sim_tmp, "out_prt": out_tmp})
+        # общая форма — список тел со слоями; пара part/sim это её частный случай
+        items = job.get("bodies") or [{"path": job["part"], "layer": 1},
+                                      {"path": job["sim"], "layer": 2}]
+        copied = []
+        for k, it in enumerate(items):
+            tmp = os.path.join(tdir, f"nxcmp_{i}_{k}.stp")
+            shutil.copyfile(it["path"], tmp)
+            tmps.append(tmp)
+            copied.append({"path": tmp, "layer": it["layer"]})
+        prepared.append({"bodies": copied, "out_prt": out_tmp})
         moves.append((out_tmp, job["out_prt"]))
 
     log_path = os.path.join(tdir, "nx_compare_journal.log")
@@ -88,12 +96,11 @@ def compare_many(jobs: list, timeout: int | None = None) -> list:
         if os.path.exists(src) and os.path.getsize(src) > 0:
             shutil.move(src, dst)
             out.append(dst)
-    for job in prepared:   # подчистить временные входы
-        for k in ("part", "sim"):
-            try:
-                os.unlink(job[k])
-            except OSError:
-                pass
+    for tmp in tmps:       # подчистить временные входы
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
     return out
 
 
