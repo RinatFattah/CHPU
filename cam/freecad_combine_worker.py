@@ -38,6 +38,19 @@ def main():
     for item in p["inputs"]:
         shape = Part.Shape()
         shape.read(item["path"])
+        # ФАСЕТНЫЙ STEP (результат съёма из NX ISV) OCCT читает В ПУСТОТУ, но
+        # НЕ молчит про это по-честному: возвращает Shells=1, Faces=1 при
+        # Solids=0, Edges=0, Vertexes=0 — то есть непустой на вид объект, из
+        # которого при экспорте не выходит ничего. Раньше такой вход просто
+        # исчезал из склейки, и файл сравнения выглядел готовым, имея на тело
+        # меньше. Поэтому проверяем СОЛИДЫ, а не «хоть что-нибудь».
+        if not shape.Solids:
+            raise RuntimeError(
+                f"{os.path.basename(item['path'])}: OCCT прочитал 0 твёрдых тел "
+                f"(shells={len(shape.Shells)}, faces={len(shape.Faces)}, "
+                f"edges={len(shape.Edges)}) — почти наверняка это фасетный STEP "
+                f"(результат ISV). Фасеты OCCT не берёт; такие тела складывайте "
+                f"через nx/nx_compare.py (.prt со слоями)")
         feat = doc.addObject("Part::Feature", item.get("label", "Body"))
         feat.Shape = shape
         feat.Label = item.get("label", "Body")
