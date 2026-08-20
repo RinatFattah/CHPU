@@ -59,6 +59,48 @@ def main():
     n_best, best = max(good, key=lambda t: t[0])
     log(f"результат: тело с {n_best} треугольниками")
 
+    # Опциональный поворот фасетного тела в другую раму (токарка: результат
+    # рождается на оси СТАНКА X, возвращаем на ось ДЕТАЛИ Z). OCCT фасет так не
+    # умеет, а NX — через вершины (uf.Facet). Вершины ОБЩИЕ между фасетами,
+    # поэтому строго два прохода: снимок оригиналов, затем применяем поворот из
+    # снимка (общая вершина получает одно значение — идемпотентно; в один
+    # проход была бы повторная прокрутка и каша).
+    rot_axis = p.get("rot_axis")
+    rot_angle = float(p.get("rot_angle", 0.0) or 0.0)
+    if rot_axis and abs(rot_angle) > 1e-9:
+        import math
+        ax, ay, az = float(rot_axis[0]), float(rot_axis[1]), float(rot_axis[2])
+        nrm = math.sqrt(ax * ax + ay * ay + az * az) or 1.0
+        ax, ay, az = ax / nrm, ay / nrm, az / nrm
+        th = math.radians(rot_angle)
+        c, s = math.cos(th), math.sin(th)
+
+        def _rot(x, y, z):                       # формула Родрига
+            dot = ax * x + ay * y + az * z
+            cx, cy, cz = ay * z - az * y, az * x - ax * z, ax * y - ay * x
+            return [x * c + cx * s + ax * dot * (1 - c),
+                    y * c + cy * s + ay * dot * (1 - c),
+                    z * c + cz * s + az * dot * (1 - c)]
+
+        model = best.Tag
+        null_f = getattr(NXOpen.UF.Facet, "NullFacetId", -1)
+        snap = []
+        fid = uf.Facet.CycleFacets(model, null_f)
+        while fid != null_f and fid is not None:
+            res = uf.Facet.AskVerticesOfFacet(model, fid)
+            verts = res[1] if isinstance(res, tuple) else res
+            snap.append((fid, [tuple(verts[i]) for i in range(3)]))
+            fid = uf.Facet.CycleFacets(model, fid)
+        for fid, vs in snap:
+            for i, (x, y, z) in enumerate(vs):
+                uf.Facet.SetVertexOfFacet(model, fid, i, _rot(x, y, z))
+        uf.Facet.ModelEditsDone(model)
+        sv = part.Save(NXOpen.BasePart.SaveComponents.TrueValue,
+                       NXOpen.BasePart.CloseAfterSave.FalseValue)
+        sv.Dispose()
+        log(f"фасет повёрнут в раму детали: {len(snap)} фасетов, "
+            f"{rot_angle:g}° вокруг оси")
+
     # скрыть всё, кроме результата: PROCESS_HIDDEN_OBJECTS=No в def-файле
     # не пускает скрытое в экспорт
     hide = [b for b in wp.Bodies]
