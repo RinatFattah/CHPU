@@ -106,9 +106,18 @@ def convert(src_lines, name="PROG", tol=0.01, z_datum="top"):
     пороге 5 мкм формально остаются «точнее прямой» и проходят в стойку дугами
     радиусом 15 метров. Для фрезеровки с допусками в сотые это лишняя экзотика.
     """
+    src_lines = list(src_lines)          # проходим дважды: паспорта и тело
     out, warn = [], []
     stock = None
     rpm = None
+    # Паспорт фрезы, который воркер печатает у смены инструмента:
+    # «(Tool T1: <имя> D=12.00 R=0.50 FL=20 H=70 L=125)». Завод пишет его так же
+    # — комментарием в той же строке, что TOOL CALL, — поэтому переносим туда же.
+    passports = {}
+    for _l in src_lines:
+        _m = re.match(r"\s*\(Tool T(\d+):\s*(.*?)\)\s*$", _l)
+        if _m:
+            passports[int(_m.group(1))] = _m.group(2).strip()
     dz, note = z_shift_for(src_lines, z_datum)
     if note:
         warn.append(note)
@@ -139,7 +148,10 @@ def convert(src_lines, name="PROG", tol=0.01, z_datum="top"):
         ln = raw.strip()
         m = _TOOLCH.search(ln)
         if m:
-            out.append(f"TOOL CALL {int(m.group(1))} Z DR+0.0")
+            _num = int(m.group(1))
+            _psp = passports.get(_num)
+            out.append(f"TOOL CALL {_num} Z DR+0.0"
+                       + (f"  ; Tool: {_psp}" if _psp else ""))
             if rpm:
                 out.append(f"TOOL CALL S{rpm}")
             continue

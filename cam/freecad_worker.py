@@ -1229,6 +1229,53 @@ def make_layered_ops(doc, job, tc, shape, p):
     return ops
 
 
+def tool_passport(num, diam, catalog):
+    """Комментарий с паспортом фрезы для строки вызова инструмента.
+
+    Требование ОЭЦМ: по программе должно быть видно, ЧЕМ она написана —
+    диаметр, радиус при вершине, длина режущей части, вылет из оправки и длина
+    сборки. Неизвестное печатаем как «?»: пробел в паспорте наладчик заметит,
+    а молча пропущенный параметр — нет.
+    """
+    # Каталог приходит из JSON, где ключи словаря ВСЕГДА строки: искать по
+    # float(diam) бессмысленно, паспорт молча выйдет пустым («R=? FL=?»).
+    e = {}
+    for k, val in (catalog or {}).items():
+        try:
+            if abs(float(k) - float(diam)) < 1e-6:
+                e = val or {}
+                break
+        except (TypeError, ValueError):
+            continue
+
+    def v(key, fmt="{:g}"):
+        x = e.get(key)
+        return fmt.format(x) if x is not None else "?"
+
+    name = e.get("name") or "D{:g}".format(diam)
+    return ("(Tool T{}: {} D={:.2f} R={} FL={} H={} L={})"
+            .format(num, name, diam, v("r", "{:.2f}"), v("fl"), v("h"), v("l")))
+
+
+def insert_tool_passports(gcode, tools, catalog):
+    """Дописывает паспорт после каждой смены инструмента `( M6 T<n> )`.
+
+    grbl_post печатает смену комментарием, поэтому и паспорт идёт комментарием
+    рядом — так он переживает любой постпроцессор и не мешает стойке.
+    """
+    import re as _re
+    by_num = {int(n): float(d) for n, d in tools.items()}
+    out = []
+    for line in gcode.splitlines(True):
+        out.append(line)
+        m = _re.search(r"\(\s*M0?6\s+T(\d+)\s*\)", line)
+        if m:
+            n = int(m.group(1))
+            if n in by_num:
+                out.append(tool_passport(n, by_num[n], catalog) + "\n")
+    return "".join(out)
+
+
 def mill(doc, feat, p, stock_solid=None):
     """Последовательная обработка: черновая по этапам (отверстия → грани →
     периметр). → текст G-Code.
@@ -1381,7 +1428,11 @@ def mill(doc, feat, p, stock_solid=None):
             for t in allt) + ")")
 
     # порядок операций = порядок выполнения
-    return p["_gcode_header"] + export_gcode(job, ops, p["postprocessor"])
+    tools_map = {getattr(t, "ToolNumber", 0): t.Tool.Diameter.Value
+                 for t in ([tc] + list(used.values()))}
+    body = export_gcode(job, ops, p["postprocessor"])
+    body = insert_tool_passports(body, tools_map, p.get("tool_catalog"))
+    return p["_gcode_header"] + body
 
 
 def main():

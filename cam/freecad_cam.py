@@ -109,6 +109,8 @@ def generate_gcode_freecad(model_path: str, gcode_path: str) -> int:
         "auto_orient": config.AUTO_ORIENT,          # положить деталь плашмя
         "tool_diameter": config.TOOL_DIAMETER,
         "feed_rate": config.FEED_RATE,
+        "tool_catalog": {float(k): v for k, v in
+                         (getattr(config, "TOOL_CATALOG", None) or {}).items()},
         "spindle_speed": config.SPINDLE_SPEED,
         "safe_height": config.SAFE_HEIGHT,
         "stock_margin": config.STOCK_MARGIN,
