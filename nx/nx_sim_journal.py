@@ -18,8 +18,9 @@ GUI; поэтому запуск идёт через ugraf -auto, а журна�
 деталь, и заготовку; K-компоненты PART/BLANK заполняются явно; MCS не трогаем —
 заготовка уже в координатах программы).
 
-Параметры (env NX_SIM_PARAMS, JSON): stock_step, mpf, machine, tool_diameter,
-tool_number, work_prt, log_path, sim_timeout.
+Параметры (env NX_SIM_PARAMS, JSON): stock_step, mpf (или program — файл
+программы в диалекте стойки станка), machine, tool_diameter, tool_number,
+tools, corner_radius, work_prt, log_path, sim_timeout.
 """
 
 import json
@@ -193,9 +194,28 @@ def main():
                 getattr(tb, prop).Value = val
             except Exception as e:
                 log(f"warn: {prop}={val} не применилось: {e}")
+        cr = float(p.get("corner_radius") or 0.0)
+        if cr:
+            # Имя свойства радиуса при вершине у MillToolBuilder в API не
+            # документировано, а плоская фреза вместо заводской Ø12 R0.5
+            # срежет углы у дна острыми. Перебираем кандидатов и печатаем
+            # сработавшего — молча остаться плоским нельзя.
+            for prop in ("TlCor1RadBuilder", "TlCornerRadiusBuilder",
+                         "TlCorner1RadiusBuilder", "TlLowerRadiusBuilder",
+                         "TlCornerRad1Builder"):
+                try:
+                    getattr(tb, prop).Value = cr
+                    log(f"радиус при вершине {cr:g} принят через {prop}")
+                    break
+                except Exception:
+                    continue
+            else:
+                log(f"warn: радиус при вершине {cr:g} НЕ применился ни одним "
+                    f"из известных свойств — фреза осталась плоской")
         tb.Commit()
         tb.Destroy()
-        log(f"инструмент: фреза Ø{diam:g} в {pocket_name}, T{num}")
+        log(f"инструмент: фреза Ø{diam:g}{f' R{cr:g}' if cr else ''} "
+            f"в {pocket_name}, T{num}")
 
     # ── 6. K-компоненты PART/BLANK ──
     kin = work_part.KinematicConfigurator
@@ -208,7 +228,8 @@ def main():
     pm = kin.CreateNcProgramManagerBuilder()
     src = pm.GetExternalFileSource()
     pm.Destroy()
-    prog = src.AddMainProgram("Main", p["mpf"])
+    program = p.get("program") or p["mpf"]   # .mpf у Sinumerik, .h у TNC
+    prog = src.AddMainProgram("Main", program)
     channels.AssignProgram("Main", prog)
     cpb = kin.CreateIsvControlPanelBuilder(
         NXOpen.SIM.IsvControlPanelBuilder.VisualizationType.MachineCodeSimulateCse,
@@ -262,7 +283,7 @@ def main():
                 _user32.DispatchMessageW(ctypes.byref(msg))
             time.sleep(0.05)
 
-    with open(p["mpf"], encoding="ascii", errors="replace") as f:
+    with open(program, encoding="ascii", errors="replace") as f:
         n_lines = sum(1 for _ in f)
     log(f"исполнение программы ({n_lines} строк)...")
     cpb.PlayForward()

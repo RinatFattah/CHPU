@@ -188,48 +188,99 @@ _EXPORT_JOURNAL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 
 def simulate(gcode_path: str, stock_step_path: str, out_stem: str | None = None) -> dict:
-    """Симулирует G-Code на виртуальном станке NX. Возвращает
-    {"step": ..., "prt": ..., "machine_time": ...}. Бросает RuntimeError."""
-    base = nx_export.find_nx_base()
-    if not base:
-        raise RuntimeError("Siemens NX не найден — симуляция недоступна "
-                           "(укажите NX_BASE_DIR в конфиге)")
+    """Симулирует НАШ G-Code на виртуальном станке NX. Возвращает
+    {"step": ..., "prt": ..., "machine_time": ...}. Бросает RuntimeError.
+
+    Готовит специфику стойки Sinumerik (перевод G-Code в .mpf, таблица
+    инструментов $TC_*), после чего отдаёт работу simulate_program()."""
     machine = getattr(config, "NX_SIM_MACHINE", "sim01_mill_3ax_sinumerik")
     if "sinumerik" not in machine:
-        raise RuntimeError(f"NX_SIM_MACHINE={machine!r}: поддерживаются станки со "
-                           f"стойкой Sinumerik (подготовка программы и таблица "
-                           f"инструментов написаны под неё)")
+        raise RuntimeError(f"NX_SIM_MACHINE={machine!r}: перевод НАШЕГО G-Code "
+                           f"написан под стойку Sinumerik. Готовую программу "
+                           f"чужой стойки гоняйте через simulate_program()")
     mdir = find_machine_dir(machine)
     if not mdir:
         raise RuntimeError(f"станок {machine!r} не найден в библиотеке NX "
                            f"(MACH\\resource\\library\\machine\\installed_machines)")
-    if not os.path.exists(stock_step_path):
-        raise RuntimeError(f"файл заготовки не найден: {stock_step_path} "
-                           f"(его пишет генерация G-Code)")
 
     tools = parse_tools(gcode_path) or {1: float(config.TOOL_DIAMETER)}
-    tool_d = float(config.TOOL_DIAMETER)
     write_to_ini(mdir, tools)
     _log(f"инструментов в программе: {len(tools)} "
          f"({', '.join(f'T{n} Ø{tools[n]:g}' for n in sorted(tools))})")
 
     if out_stem is None:
         out_stem = os.path.splitext(os.path.abspath(gcode_path))[0]
+    mpf_path = os.path.join(tempfile.gettempdir(),
+                            f"{os.path.basename(out_stem)}_sim.mpf")
+    n = gcode_to_mpf(gcode_path, mpf_path, default_tool=min(tools))
+    _log(f"программа для стойки: {n} строк → {os.path.basename(mpf_path)}")
+
+    return simulate_program(mpf_path, stock_step_path, out_stem,
+                            machine=machine, tools=tools)
+
+
+def simulate_program(program_path: str, stock_step_path: str, out_stem: str,
+                     machine: str | None = None, tools: dict | None = None,
+                     corner_radius: float = 0.0) -> dict:
+    """Гоняет ГОТОВУЮ программу стойки на виртуальном станке NX и забирает
+    результат съёма. Возвращает то же, что simulate().
+
+    В отличие от simulate() программа НЕ готовится и НЕ переводится — файл
+    уходит на стойку как есть. Диалект задаёт станок: `.mpf` для
+    sim01_mill_3ax_sinumerik, `.h` для sim01_mill_3ax_tnc. Отсюда и появилась
+    эта точка входа: чужую (заводскую) программу надо исполнять её родной
+    стойкой, а не пропускать через наш конвертер — тогда расхождение с нашей
+    программой это расхождение ТРАЕКТОРИЙ, а не багов импортёра.
+
+    Таблица инструментов $TC_* (TO_INI.SPF) пишется только для Sinumerik: у
+    драйвера heidenhainTNC текстовой таблицы нет вовсе, ToolChange.prg читает
+    номер через `FN 18: SYSREAD ID20`, а геометрию берёт из кармана станка NX.
+
+    tools: {номер: диаметр, мм} — из чужой программы диаметр не выводится,
+    поэтому его задаёт вызывающий. corner_radius: радиус при вершине, мм
+    (заводская фреза Ø12 R0.5 — не плоская; с нулём углы у дна срежутся
+    острыми и разойдутся с настоящим станком)."""
+    base = nx_export.find_nx_base()
+    if not base:
+        raise RuntimeError("Siemens NX не найден — симуляция недоступна "
+                           "(укажите NX_BASE_DIR в конфиге)")
+    if machine is None:
+        machine = getattr(config, "NX_SIM_MACHINE", "sim01_mill_3ax_sinumerik")
+    mdir = find_machine_dir(machine)
+    if not mdir:
+        raise RuntimeError(f"станок {machine!r} не найден в библиотеке NX "
+                           f"(MACH\\resource\\library\\machine\\installed_machines)")
+    if not os.path.exists(program_path):
+        raise RuntimeError(f"файл программы не найден: {program_path}")
+    if not os.path.exists(stock_step_path):
+        raise RuntimeError(f"файл заготовки не найден: {stock_step_path} "
+                           f"(его пишет генерация G-Code)")
+
+    tools = {int(k): float(v) for k, v in
+             (tools or {1: float(config.TOOL_DIAMETER)}).items()}
+    tool_d = tools[min(tools)]
+    _log(f"станок: {machine}; инструментов: {len(tools)} "
+         f"({', '.join(f'T{n} Ø{tools[n]:g}' for n in sorted(tools))}"
+         f"{f', R при вершине {corner_radius:g}' if corner_radius else ''})")
+
+    out_stem = os.path.abspath(out_stem)
     out_step = out_stem + "_sim.stp"
     # рабочие файлы NX — во временной ASCII-папке (кириллица в путях + OCCT/NX)
     tdir = tempfile.gettempdir()
     stem = os.path.basename(out_stem)
-    mpf_path = os.path.join(tdir, f"{stem}_sim.mpf")
     work_prt = os.path.join(tdir, f"{stem}_sim.prt")
     tmp_step = os.path.join(tdir, f"{stem}_sim.stp")
     import glob as _glob
+    import shutil as _shutil
     # старые артефакты (в т.ч. прошлые *_ipw.prt) убрать, чтобы не спутать
     for f in [work_prt, tmp_step] + _glob.glob(os.path.join(tdir, f"{stem}_sim*_ipw.prt")):
         if os.path.exists(f):
             os.unlink(f)
-
-    n = gcode_to_mpf(gcode_path, mpf_path, default_tool=min(tools))
-    _log(f"программа для стойки: {n} строк → {os.path.basename(mpf_path)}")
+    # программу тоже в ASCII-temp: путь прогона обычно с кириллицей
+    ext = os.path.splitext(program_path)[1] or ".mpf"
+    mpf_path = os.path.join(tdir, f"{stem}_sim{ext}")
+    if os.path.abspath(program_path) != mpf_path:
+        _shutil.copyfile(program_path, mpf_path)
 
     from cam.freecad_cam import _ascii_safe
     log_path = os.path.join(tdir, f"{stem}_sim_journal.log")
@@ -237,7 +288,8 @@ def simulate(gcode_path: str, stock_step_path: str, out_stem: str | None = None)
         os.unlink(log_path)
     params = {
         "stock_step": _ascii_safe(os.path.abspath(stock_step_path)),
-        "mpf": mpf_path,
+        "mpf": mpf_path,              # ключ исторический, диалект любой
+        "corner_radius": float(corner_radius),
         "machine": machine,
         "tool_diameter": tool_d,
         "tool_number": 1,
@@ -367,3 +419,47 @@ def _wait_marker(log_path: str, proc, marker: str, timeout: float,
                                f"(код {proc.returncode}). " + "\n".join(lines[-8:]))
         time.sleep(3)
     raise RuntimeError(f"маркер {marker} не появился за {timeout:.0f} с")
+
+
+# ── CLI: прогнать ГОТОВУЮ программу (в т.ч. чужую) ────────────────────────────────
+
+def _main():
+    """python nx/nx_sim.py программа.mpf|.h заготовка.step выходной-стем
+              [--machine sim01_mill_3ax_tnc] [--tools "1:12,2:6"] [--corner-radius 0.5]
+
+    Наш собственный G-Code гоняется не отсюда, а через run_cam.py --simulate:
+    ему нужен перевод в диалект стойки и таблица инструментов. Эта точка входа —
+    для программы, которая УЖЕ написана на языке стойки: заводской .h для
+    Heidenhain TNC, готовый .mpf для Sinumerik."""
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+    args, machine, tools, cr = [], None, None, 0.0
+    i = 1
+    while i < len(sys.argv):
+        a = sys.argv[i]
+        if a == "--machine":
+            machine = sys.argv[i + 1]; i += 2
+        elif a == "--tools":
+            tools = {int(k): float(v) for k, v in
+                     (t.split(":") for t in sys.argv[i + 1].split(","))}; i += 2
+        elif a == "--corner-radius":
+            cr = float(sys.argv[i + 1]); i += 2
+        else:
+            args.append(a); i += 1
+    if len(args) < 3:
+        print(_main.__doc__.strip())
+        sys.exit(1)
+    program, stock, stem = args[0], args[1], args[2]
+    res = simulate_program(program, stock, stem, machine=machine, tools=tools,
+                           corner_radius=cr)
+    print(f"✅ результат: {res['step']}")
+    print(f"   .prt: {res['prt']}")
+    print(f"   машинное время: {res['machine_time']}, "
+          f"треугольников: {res['triangles']}")
+
+
+if __name__ == "__main__":
+    _main()

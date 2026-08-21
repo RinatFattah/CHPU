@@ -31,26 +31,38 @@ _WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 def combine(part_path: str, sim_path: str, out_path: str | None = None) -> str:
     """Склеивает деталь и результат в один STEP. Возвращает путь результата."""
+    if out_path is None:
+        out_path = os.path.splitext(os.path.abspath(sim_path))[0] + "_compare.stp"
+    return combine_many([(part_path, "PART_REF"), (sim_path, "SIM_RESULT")],
+                        out_path)
+
+
+def combine_many(inputs, out_path: str) -> str:
+    """Складывает ЛЮБОЕ число тел в один STEP. inputs: [(путь, метка), ...].
+
+    Больше двух нужно, когда в одной сцене сравниваются РАЗНЫЕ ПРОГРАММЫ на
+    одной детали (эталон + заводская + наша): метки видны в дереве вьюера,
+    тела лежат друг в друге, лишнее гасится галочкой."""
     fc = freecad_cam.find_freecadcmd()
     if not fc:
         raise RuntimeError("freecadcmd не найден (укажите FREECAD_CMD в конфиге)")
-    if out_path is None:
-        out_path = os.path.splitext(os.path.abspath(sim_path))[0] + "_compare.stp"
 
     # входы — во временные ASCII-копии с расширением .stp (кириллица в путях +
-    # 8.3-обрезка «.step» → «.STE», которую OCCT не понимает)
+    # 8.3-обрезка «.step» → «.STE», которую OCCT не понимает).
+    # PID в имени: без него пакетный и ручной прогон писали в одни файлы.
     tdir = tempfile.gettempdir()
-    part_tmp = os.path.join(tdir, "combine_part.stp")
-    sim_tmp = os.path.join(tdir, "combine_sim.stp")
-    out_tmp = os.path.join(tdir, "combine_out.stp")
-    shutil.copyfile(part_path, part_tmp)
-    shutil.copyfile(sim_path, sim_tmp)
+    pid = os.getpid()
+    out_tmp = os.path.join(tdir, f"combine_out_{pid}.stp")
+    items, tmps = [], []
+    for i, (src, label) in enumerate(inputs):
+        if not os.path.exists(src):
+            raise RuntimeError(f"файл не найден: {src}")
+        tmp = os.path.join(tdir, f"combine_{pid}_{i}.stp")
+        shutil.copyfile(src, tmp)
+        tmps.append(tmp)
+        items.append({"path": tmp, "label": label})
 
-    params = {
-        "inputs": [{"path": part_tmp, "label": "PART_REF"},
-                   {"path": sim_tmp, "label": "SIM_RESULT"}],
-        "out_step": out_tmp,
-    }
+    params = {"inputs": items, "out_step": out_tmp}
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
                                      encoding="utf-8") as tmp:
         json.dump(params, tmp)
@@ -70,7 +82,7 @@ def combine(part_path: str, sim_path: str, out_path: str | None = None) -> str:
             timeout=300,
         )
     finally:
-        for _tmp in (params_path, part_tmp, sim_tmp):
+        for _tmp in [params_path] + tmps:
             try:
                 os.unlink(_tmp)
             except OSError:
@@ -92,12 +104,27 @@ def main():
                 stream.reconfigure(encoding="utf-8", errors="replace")
             except (AttributeError, ValueError):
                 pass
-    if len(sys.argv) < 3:
+    args = sys.argv[1:]
+    if len(args) < 3:
         print("использование: python cam/step_combine.py деталь_part.step "
               "результат_sim.stp [выход_compare.stp]")
+        print("               python cam/step_combine.py выход.stp "
+              "тело1.stp=МЕТКА1 тело2.stp=МЕТКА2 ...")
         sys.exit(1)
-    part, sim = sys.argv[1], sys.argv[2]
-    out = sys.argv[3] if len(sys.argv) > 3 else None
+    if "=" in "".join(args[1:]):          # форма с метками: первый файл — выход
+        out, inputs = args[0], []
+        for a in args[1:]:
+            src, _, label = a.partition("=")
+            inputs.append((src, label or os.path.splitext(
+                os.path.basename(src))[0].upper()))
+        for src, _ in inputs:
+            if not os.path.exists(src):
+                print(f"❌ Файл не найден: {src}")
+                sys.exit(1)
+        print(f"✅ файл сравнения: {combine_many(inputs, out)}")
+        return
+    part, sim = args[0], args[1]
+    out = args[2] if len(args) > 2 else None
     for f in (part, sim):
         if not os.path.exists(f):
             print(f"❌ Файл не найден: {f}")

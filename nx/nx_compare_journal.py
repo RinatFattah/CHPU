@@ -9,6 +9,7 @@ nx_compare_journal.py — исполняется ВНУТРИ NX (run_journal.ex
 
 Параметры (env NX_COMPARE_PARAMS, JSON):
   jobs: [{"part": "...stp", "sim": "...stp", "out_prt": "....prt"}, ...]
+        либо {"bodies": [{"path": "...stp", "layer": 1}, ...], "out_prt": ...}
   log_path: файл маркеров (run_journal может глотать stdout)
 Все пути — ASCII (кириллицу NX/транслятор не переваривает).
 """
@@ -90,13 +91,19 @@ def main():
             fs.Destroy()
             work = session.Parts.Work
 
-            part_bodies = import_step(session, work, job["part"])
-            n1 = to_layer(work, part_bodies, 1)   # эталон — слой 1
-            sim_bodies = import_step(session, work, job["sim"])
-            n2 = to_layer(work, sim_bodies, 2)    # вырез — слой 2
-            try:  # оба слоя видимы, рабочий — 1
-                work.Layers.SetState(2, NXOpen.Layer.State.Selectable)
-                work.Layers.SetState(1, NXOpen.Layer.State.WorkLayer)
+            # пара «эталон + вырез» — частный случай; общая форма это список
+            # тел со своими слоями (нужна, когда в одной сцене сравниваются
+            # РАЗНЫЕ ПРОГРАММЫ на одной детали: 1 модель, 2 заводская, 3 наша)
+            items = job.get("bodies") or [{"path": job["part"], "layer": 1},
+                                          {"path": job["sim"], "layer": 2}]
+            counts = []
+            for it in items:
+                bodies = import_step(session, work, it["path"])
+                counts.append((it["layer"], to_layer(work, bodies, it["layer"])))
+            try:  # все слои видимы, рабочий — первый
+                for layer, _ in counts[1:]:
+                    work.Layers.SetState(layer, NXOpen.Layer.State.Selectable)
+                work.Layers.SetState(counts[0][0], NXOpen.Layer.State.WorkLayer)
             except Exception as e:
                 log(f"warn: состояние слоёв: {e}")
 
@@ -105,7 +112,7 @@ def main():
             sv.Dispose()
             done += 1
             log(f"OKJOB {os.path.basename(job['out_prt'])}: "
-                f"слой1={n1} тел, слой2={n2} тел")
+                + ", ".join(f"слой{l}={n} тел" for l, n in counts))
         except Exception as e:
             log(f"FAILJOB {os.path.basename(job.get('out_prt', '?'))}: {e}")
     log(f"DONE jobs={done}/{len(p['jobs'])}")
