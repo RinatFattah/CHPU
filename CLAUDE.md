@@ -109,6 +109,22 @@ the "down in Z, then sideways" pattern, so it is OFF by default. `cam/gcode_stat
 prints the acceptance numbers — programs cannot be compared line by line because
 `Path.Op.Adaptive` varies 0.7 % of cutting length between runs of identical code.
 
+Bulk removal above the part runs FIRST as its own stage (`BULK_ROUGH`,
+`RoughBulk<N>`), mirroring the customer's own program: on part 003 half of the
+factory's entire cutting length (2400 mm of 4891) is one operation, `NK_1_01`,
+that fells the excess of the blank's standing leg with plain passes down Z levels;
+everything else then works on what is left. Without it that work falls to the
+per-face ops, each dragging the whole column of material above its own face —
+three of them cost 19 058 mm of 22 427 on 003. The zone is the stock section over
+the band (no part shadow to subtract: the whole band is above the part), and the
+op is chosen by the zone's mean width 2*Area/Perimeter: a strip narrower than
+2 tool Ø gets a contour pass grown by the tool RADIUS (the tool then straddles the
+strip — this is literally `NK_1_01`), anything wider gets Adaptive grown by a full
+DIAMETER (its helix entry needs ~2 Ø, growing by the radius returns an empty path).
+`local_start` clamps every later op's StartDepth to this stage's floor. Measured on
+003 with the factory's own feed (F2000, read out of `PR_1_01…06`): 22 427 → 8 672 mm
+of cutting, ISV 00:31:01 → 00:05:33, diff still 0/0; factory is 4 891 mm / 00:03:30.
+
 CRITICAL Adaptive gotcha: regions must be explicit planar faces. Passing model faces
 as `Base` yields open projected contours on real parts (`Path.Area: ccurve not closed`)
 and Adaptive silently returns an empty path. Adaptive also needs ~2 tool diameters of

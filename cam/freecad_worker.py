@@ -659,6 +659,99 @@ def make_surface_rough(doc, job, tc, name, model_obj, face_idx, p,
     return op if n > 2 else None
 
 
+def make_bulk_ops(doc, job, tc, shape, p, alw_xy, alw_z, choose):
+    """Съём объёма НАД деталью уровнями — первая стадия заводской программы.
+
+    Разбор `PR_1_01…06` (деталь 003): половину всего рабочего хода завода —
+    2 400 мм из 4 891 — занимает операция `NK_1_01`, и устроена она предельно
+    просто: 75 прямых ходов вдоль Y на 25 уровнях Z. Так сносится лишняя часть
+    стоячей полки уголка. Всё остальное — радиус гиба (568 мм), выборка выреза
+    (402) и контур (894) — работает уже по тому, что осталось.
+
+    У нас этой стадии не было, и объём над деталью снимали операции ПО ГРАНЯМ:
+    `RoughSlope1` тащила на себе весь столб материала над гранью площадью
+    19 мм² и стоила 5 697 мм, `RoughFace1` — 7 896, `RoughSlope2` — 5 465. Три
+    операции по граням давали 19 058 мм из 22 427.
+
+    Здесь снимается ровно то, что лежит ВЫШЕ детали: зона = сечение заготовки в
+    диапазоне, тень детали вычитать не нужно — весь диапазон над ней. Adaptive
+    сам делит его на слои по ROUGH_STEPDOWN. Возвращает (операции, низ стадии);
+    низ отдаётся вызывающему, чтобы операции по граням стартовали от него, а не
+    от верха габарита заготовки.
+    """
+    bb = shape.BoundBox
+    sb = job.Stock.Shape.BoundBox
+    z_top = sb.ZMax
+    z_floor = bb.ZMax + alw_z
+    step = float(p["rough_stepdown"])
+    if z_top - z_floor < step:
+        return [], None                  # над деталью материала нет
+
+    # Сечения заготовки по высоте диапазона — объединением: заготовка не обязана
+    # быть призмой (уголок, отливка), а объединение ошибается в сторону лишнего
+    # холостого хода, а не пропущенного материала.
+    n = max(2, min(8, int((z_top - z_floor) / step) + 1))
+    sec = None
+    for i in range(n):
+        z = z_floor + 0.02 + (z_top - 0.02 - z_floor - 0.02) * i / (n - 1)
+        for fc in _slice_faces(job.Stock.Shape, z):
+            sec = fc if sec is None else sec.fuse(fc)
+    if sec is None:
+        return [], None
+    try:
+        sec = sec.removeSplitter()
+    except Exception:
+        pass
+
+    dia = float(p["tool_diameter"])
+    ops = []
+    faces = _nearest_order([f for f in sec.Faces if f.Area > 1.0],
+                           lambda f: (f.CenterOfMass.x, f.CenterOfMass.y))
+    for i, rf in enumerate(faces, 1):
+        name = f"RoughBulk{i}"
+        tcx, _dx = choose(name, None)
+        # ШИРОКАЯ зона или УЗКАЯ полоса — это разные операции, и завод их тоже
+        # разводит. Признак — средняя ширина 2·площадь/периметр: у стоячей полки
+        # 003 это 1.95 мм, у нормального бруска заготовки — десятки.
+        try:
+            w_eff = 2.0 * rf.Area / max(rf.OuterWire.Length, 1e-6)
+        except Exception:
+            w_eff = dia * 3
+        narrow = w_eff < 2.0 * dia
+
+        # Зона расширяется, иначе фреза в неё не встанет: сечение полки уже
+        # фрезы. Узкой хватает радиуса — тогда контурный обход даёт проход по
+        # самой полке (так и режет `NK_1_01` у завода). Широкой нужен диаметр:
+        # Adaptive требует около двух диаметров на винтовой заход, и заодно у
+        # края заготовки не остаётся кожуры припуска.
+        grow = (dia / 2.0 if narrow else dia) + alw_xy
+        try:
+            zone = rf.makeOffset2D(grow)
+        except Exception as e:
+            log(f"warn: {name}: зона не расширена ({e})")
+            zone = rf
+
+        op = None
+        if not narrow:
+            op = make_adaptive(doc, job, tcx, name, zone, p,
+                               z_top, z_floor, alw_xy)
+        if not op:
+            if not narrow:
+                log(f"{name}: Adaptive пуст — перехожу на контурный проход")
+            op = make_profile(doc, job, tcx, name, zone, p, z_top, z_floor,
+                              alw_xy, side="Inside")
+        if op:
+            ops.append(op)
+            log(f"{name}: ширина зоны {w_eff:.1f} мм "
+                f"({'полоса' if narrow else 'выборка'})")
+        else:
+            log(f"{name}: пустая траектория — объём над деталью не снят")
+    if ops:
+        log(f"съём объёма над деталью: Z {z_top:.1f}..{z_floor:.1f}, "
+            f"{len(ops)} зон, слой {step:g} мм")
+    return ops, (z_floor if ops else None)
+
+
 def make_roughing_ops(doc, job, tc, shape, p):
     """Черновая «по граням» (ROUGH_MODE=stages), порядок техпроцесса:
       1. RoughHole<N>   — сквозные вырезы ЛЮБОЙ формы, по очереди (Adaptive) —
@@ -776,7 +869,13 @@ def make_roughing_ops(doc, job, tc, shape, p):
             m = stock_shape.common(Part.makeCompound(prisms))
             if m.Volume < 0.5:
                 return None
-            return min(m.BoundBox.ZMax, sb.ZMax)
+            top = min(m.BoundBox.ZMax, sb.ZMax)
+            # Если объём над деталью уже снят отдельной стадией (RoughBulk),
+            # стартовать от верха заготовки — значит резать воздух все её слои
+            # заново. Это и была главная статья расхода: операции по граням
+            # тащили на себе весь столб материала над собой.
+            floor = p.get("_bulk_floor")
+            return top if floor is None else min(top, floor)
         except Exception as e:
             log(f"warn: локальный верх зоны не посчитался ({e}) — беру верх заготовки")
             return sb.ZMax
@@ -837,6 +936,18 @@ def make_roughing_ops(doc, job, tc, shape, p):
             ops.append(op2)
         else:
             log(f"{name}: пустая траектория — чистового прохода не будет")
+
+    # ── 0) съём объёма НАД деталью уровнями, ПЕРВЫМ — как `NK_1_01` у завода.
+    #      Без этой стадии её работу делают операции по граням, каждая заново
+    #      проходя весь столб материала над своей гранью. ──
+    p.pop("_bulk_floor", None)
+    if p.get("bulk_rough", True):
+        bulk, bulk_floor = make_bulk_ops(doc, job, tc, shape, p,
+                                         alw_xy, alw_z, choose_tc)
+        if bulk:
+            ops.extend(bulk)
+            p["_bulk_floor"] = bulk_floor
+            write_partial(job, ops, p, "снят объём над деталью")
 
     # ── 1) сквозные вырезы любой формы, ПЕРВЫМИ (деталь ещё жёстко в заготовке) ──
     if sil is None:
@@ -929,7 +1040,11 @@ def make_roughing_ops(doc, job, tc, shape, p):
             log(f"грань Z={fc['z']:.1f} ({fc['area']:.0f} мм²): целиком в мёртвой "
                 f"зоне — пропущена")
             continue
+        # final — дно ЧЕРНОВОЙ (грань + припуск), final0 — сама грань: чистовой
+        # обязан идти до неё, иначе он оставит ровно тот припуск, ради снятия
+        # которого и заведён.
         faces.append({"kind": "planar", "z": fc["z"], "final": fc["z"] + alw_z,
+                      "final0": fc["z"],
                       "region": region, "idx": fc["idx"], "area": fc["area"],
                       "cx": fc["cx"], "cy": fc["cy"]})
     # наклонные/криволинейные грани с восходящей нормалью
@@ -959,6 +1074,7 @@ def make_roughing_ops(doc, job, tc, shape, p):
             FreeCAD.Vector(fbb.XMax, fbb.YMax, 0), FreeCAD.Vector(fbb.XMin, fbb.YMax, 0),
             FreeCAD.Vector(fbb.XMin, fbb.YMin, 0)]))
         faces.append({"kind": "slope", "z": fbb.ZMax, "final": fbb.ZMin + alw_z,
+                      "final0": fbb.ZMin,
                       "rect": rect, "idx": idx, "area": f.Area,
                       "cx": mid.x, "cy": mid.y})
 
@@ -977,6 +1093,14 @@ def make_roughing_ops(doc, job, tc, shape, p):
                 if top is None:
                     log(f"RoughFace (Z={fc['z']:.1f}): материала над гранью нет — "
                         f"пропущено")
+                elif fin and top > fc["final0"] + 1e-6:
+                    # Черновой снимать нечего (стадия съёма объёма дошла ровно
+                    # до припуска), а чистовому есть: припуск на грани остался.
+                    face_n += 1
+                    rfb = fc["region"].BoundBox
+                    finish_surface(f"RoughFace{face_n}", fc["idx"], top,
+                                   fc["final0"],
+                                   min(rfb.XLength, rfb.YLength))
                 continue  # грань вровень с верхом материала — снимать нечего
             face_n += 1
             name = f"RoughFace{face_n}"
@@ -1021,7 +1145,7 @@ def make_roughing_ops(doc, job, tc, shape, p):
             note = f"готова криволинейная грань {slope_n} (Ø{dx:g}, {fc['area']:.0f} мм²)"
         if op:
             ops.append(op)
-            finish_surface(name, fc["idx"], top, fc["final"], fin_width)
+            finish_surface(name, fc["idx"], top, fc["final0"], fin_width)
             write_partial(job, ops, p, note)
         else:
             log(f"{name}: (Z={fc['z']:.1f}) пустая траектория — пропущено")
@@ -1691,25 +1815,43 @@ def optimize_links(gcode, stock_map, vert_feed, clearance=1.0, air_cuts=False,
         return _re.sub(r"^G0*[123]\b", "", h).strip()
 
     def next_cut_track(i, need):
-        """Ломаная ближайшего рабочего хода после кадра i — по ней идёт рампа.
+        """Ломаная будущего реза после кадра i — по ней идёт рампа.
 
-        Прямой ход даёт два узла, дуга (контурные проходы начинаются именно с
-        неё) — частую ломаную по `_arc_track`. Холостой ход прерывает поиск:
-        после него фреза уже не там, где вошла."""
-        for b in blocks[i + 1:i + 4]:
+        Копится по НЕСКОЛЬКИМ ходам подряд, пока не наберётся нужная длина:
+        одного хода не хватает. У контурного прохода первый отрезок после входа
+        бывает длиной 0.16 мм (скругление угла зоны), и рампа по нему не
+        помещалась — вход оставался отвесным. Дуги раскладываются в частую
+        ломаную (`_arc_track`): по хорде фрезу вести нельзя.
+
+        Останавливаемся на холостом ходе (после него фреза уже не там, где
+        вошла) и на ходе, меняющем Z вместе с XY, — он не лежит в плоскости
+        врезания. Чисто отвесные ходы пропускаем."""
+        pts, total = [], 0.0
+        for b in blocks[i + 1:i + 60]:
             if b.get("p0") is None:
                 continue
-            p0, p1 = b["p0"], b["p1"]
-            if b["mode"] == 1:
-                if abs(p1[0] - p0[0]) > 1e-6 or abs(p1[1] - p0[1]) > 1e-6:
-                    return [(p0[0], p0[1]), (p1[0], p1[1])]
-                continue                      # отвесный ход — смотрим дальше
-            if b["mode"] in (2, 3):
-                return _arc_track(p0, p1, b.get("ij", (0.0, 0.0)),
-                                  b["mode"] == 2, need)
             if b["mode"] == 0:
-                return None
-        return None
+                break
+            p0, p1 = b["p0"], b["p1"]
+            flat = abs(p1[0] - p0[0]) > 1e-6 or abs(p1[1] - p0[1]) > 1e-6
+            if abs(p1[2] - p0[2]) > 1e-6:
+                if flat:
+                    break                     # 3D-ход, не наша плоскость
+                continue                      # отвесный — смотрим дальше
+            if not flat:
+                continue
+            if b["mode"] == 1:
+                seg = [(p0[0], p0[1]), (p1[0], p1[1])]
+            else:
+                seg = _arc_track(p0, p1, b.get("ij", (0.0, 0.0)),
+                                 b["mode"] == 2, max(need - total, 0.1))
+                if not seg:
+                    break
+            pts = seg if not pts else pts + seg[1:]
+            total += sum(math.dist(a, c) for a, c in zip(seg, seg[1:]))
+            if total >= need:
+                break
+        return pts if len(pts) >= 2 else None
 
     for i, b in enumerate(blocks):
         if b["mode"] is None or b.get("p0") is None:

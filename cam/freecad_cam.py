@@ -129,6 +129,7 @@ def generate_gcode_freecad(model_path: str, gcode_path: str) -> int:
         "tool_set": [float(d) for d in (getattr(config, "TOOL_SET", None)
                                         or [config.TOOL_DIAMETER])],
         "set_op_tools": dict(getattr(config, "SET_OP_TOOLS", {}) or {}),
+        "bulk_rough": bool(getattr(config, "BULK_ROUGH", True)),
         "rough_mode": config.ROUGH_MODE,
         "rough_allowance": config.ROUGH_ALLOWANCE,
         "rough_allowance_mode": config.ROUGH_ALLOWANCE_MODE,
