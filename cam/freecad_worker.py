@@ -659,6 +659,76 @@ def make_surface_rough(doc, job, tc, name, model_obj, face_idx, p,
     return op if n > 2 else None
 
 
+def median_line(face, tool_d):
+    """Средняя линия узкой зоны — отрезок вдоль её длинной стороны, или None.
+
+    Нужна, чтобы снимать тонкую стоячую полку ОДНИМ проходом на уровень, как
+    заводская `NK_1_01`: фреза шире полки, поэтому вести её надо по середине, а
+    не обводить зону по контуру (обвод даёт два прохода вдоль плюс торцы).
+
+    Считается только для зоны, которая и правда полоса: площадь должна занимать
+    почти весь габаритный прямоугольник. У Г-образного сечения (гнутый лист с
+    двумя полками) отношение мало, и вызывающий останется на обводе — там
+    средняя линия отрезком не описывается.
+    """
+    bbf = face.BoundBox
+    lx, ly = bbf.XLength, bbf.YLength
+    if min(lx, ly) > 2.0 * tool_d:
+        return None                       # не полоса, зону надо выбирать
+    box = lx * ly
+    if box < 1e-9 or face.Area / box < 0.75:
+        return None                       # не прямоугольник: L, дуга, звезда
+    c = face.CenterOfMass
+    z = bbf.ZMin
+    if lx >= ly:
+        a = FreeCAD.Vector(bbf.XMin, c.y, z)
+        b = FreeCAD.Vector(bbf.XMax, c.y, z)
+    else:
+        a = FreeCAD.Vector(c.x, bbf.YMin, z)
+        b = FreeCAD.Vector(c.x, bbf.YMax, z)
+    if a.distanceToPoint(b) < tool_d / 2.0:
+        return None
+    return Part.Wire([Part.makeLine(a, b)])
+
+
+def make_engrave_sweep(doc, job, tc, name, wire, p, start_z, final_z):
+    """Проход ПО ЛИНИИ, слоями StepDown: ось фрезы идёт по самой линии.
+
+    Path Engrave — единственная операция FreeCAD, которая не смещает фрезу от
+    заданной геометрии. Для тонкой полки это и нужно: фреза шире полки и
+    накрывает её, идя серединой.
+    """
+    final_z = max(final_z, p.get("_floor_limit", final_z))
+    feat = doc.addObject("Part::Feature", f"Line{name}")
+    feat.Shape = wire
+    doc.recompute()
+
+    import Path.Op.Engrave as Engrave
+    op = Engrave.Create(name, parentJob=job)
+    op.ToolController = tc
+    op.BaseShapes = [feat]
+    op.setExpression("StepDown", None)
+    set_prop(op, "StepDown", p["rough_stepdown"])
+    op.setExpression("StartDepth", None)
+    op.StartDepth = start_z
+    op.setExpression("FinalDepth", None)
+    op.FinalDepth = final_z
+    op.ClearanceHeight.Value = start_z + p["safe_height"]
+    op.SafeHeight.Value = start_z + 3.0
+    doc.recompute()
+
+    n = len(op.Path.Commands) if op.Path else 0
+    log(f"{name}: {n} команд (проход по средней линии)")
+    if n > 2:
+        return op
+    try:
+        doc.removeObject(op.Name)
+        doc.recompute()
+    except Exception:
+        pass
+    return None
+
+
 def make_bulk_ops(doc, job, tc, shape, p, alw_xy, alw_z, choose):
     """Съём объёма НАД деталью уровнями — первая стадия заводской программы.
 
@@ -719,31 +789,41 @@ def make_bulk_ops(doc, job, tc, shape, p, alw_xy, alw_z, choose):
             w_eff = dia * 3
         narrow = w_eff < 2.0 * dia
 
-        # Зона расширяется, иначе фреза в неё не встанет: сечение полки уже
-        # фрезы. Узкой хватает радиуса — тогда контурный обход даёт проход по
-        # самой полке (так и режет `NK_1_01` у завода). Широкой нужен диаметр:
-        # Adaptive требует около двух диаметров на винтовой заход, и заодно у
-        # края заготовки не остаётся кожуры припуска.
-        grow = (dia / 2.0 if narrow else dia) + alw_xy
-        try:
-            zone = rf.makeOffset2D(grow)
-        except Exception as e:
-            log(f"warn: {name}: зона не расширена ({e})")
-            zone = rf
+        op, how = None, ""
+        # Полоса-прямоугольник — один проход по средней линии на уровень, как
+        # `NK_1_01` у завода. Обвод по контуру той же полосы стоит вдвое: он
+        # идёт вдоль неё дважды плюс торцы.
+        if narrow:
+            line = median_line(rf, dia)
+            if line is not None:
+                op = make_engrave_sweep(doc, job, tcx, name, line, p,
+                                        z_top, z_floor)
+                how = "полоса, средняя линия"
 
-        op = None
-        if not narrow:
-            op = make_adaptive(doc, job, tcx, name, zone, p,
-                               z_top, z_floor, alw_xy)
-        if not op:
+        if op is None:
+            # Зона расширяется, иначе фреза в неё не встанет: сечение полки уже
+            # фрезы. Узкой хватает радиуса, широкой нужен диаметр — Adaptive
+            # требует около двух диаметров на винтовой заход, и заодно у края
+            # заготовки не остаётся кожуры припуска.
+            grow = (dia / 2.0 if narrow else dia) + alw_xy
+            try:
+                zone = rf.makeOffset2D(grow)
+            except Exception as e:
+                log(f"warn: {name}: зона не расширена ({e})")
+                zone = rf
             if not narrow:
-                log(f"{name}: Adaptive пуст — перехожу на контурный проход")
-            op = make_profile(doc, job, tcx, name, zone, p, z_top, z_floor,
-                              alw_xy, side="Inside")
+                op = make_adaptive(doc, job, tcx, name, zone, p,
+                                   z_top, z_floor, alw_xy)
+                how = "выборка"
+            if not op:
+                if not narrow:
+                    log(f"{name}: Adaptive пуст — перехожу на контурный проход")
+                op = make_profile(doc, job, tcx, name, zone, p, z_top, z_floor,
+                                  alw_xy, side="Inside")
+                how = "контурный обход"
         if op:
             ops.append(op)
-            log(f"{name}: ширина зоны {w_eff:.1f} мм "
-                f"({'полоса' if narrow else 'выборка'})")
+            log(f"{name}: ширина зоны {w_eff:.1f} мм ({how})")
         else:
             log(f"{name}: пустая траектория — объём над деталью не снят")
     if ops:
@@ -1476,7 +1556,7 @@ def reorder_first_positioning(gcode):
     lines = gcode.splitlines(True)
     out = []
     armed = True                    # начало программы = та же ситуация
-    pend = None                     # отложенный «G0 только по Z»
+    pend = []                       # отложенные «G0 только по Z», подряд
     nswap = 0
 
     def _axes(code):
@@ -1486,42 +1566,45 @@ def reorder_first_positioning(gcode):
         code = line.split("(")[0].strip()
         if not code:                                   # комментарий
             if _re.search(r"\(\s*M0?6\s+T\d+\s*\)", line):
-                if pend is not None:                   # не потерять отложенное
-                    out.append(pend[0])
-                armed, pend = True, None
+                out.extend(q[0] for q in pend)         # не потерять отложенное
+                armed, pend = True, []
             out.append(line)
             continue
         if not armed or not _re.match(r"\s*G0*0\b(?!\d)", code):
-            if pend is not None:                       # пара не сложилась
-                out.append(pend[0])
-                pend = None
+            out.extend(q[0] for q in pend)             # пара не сложилась
+            pend = []
             armed = armed and not _re.search(r"\b[XYZ]-?[\d.]", code)
             out.append(line)
             continue
 
         ax = _axes(code)
-        if pend is None:
-            if set(ax) == {"Z"}:
-                pend = (line, ax["Z"])
-            else:
-                armed = False
-                out.append(line)
+        if set(ax) == {"Z"}:
+            # Ходов «только по Z» подряд бывает несколько: Path Engrave печатает
+            # подъём на плоскость безопасности дважды. Копим их все, схлопывая
+            # повтор одной и той же высоты, — иначе перестановка на такую пару
+            # не срабатывает и «сначала Z, потом XY» остаётся в программе.
+            if not pend or abs(pend[-1][1] - ax["Z"]) > 1e-6:
+                pend.append((line, ax["Z"]))
+            continue
+        if not pend:
+            armed = False
+            out.append(line)
             continue
 
-        # ждали пару: G0 в XY на той же высоте, что и предыдущий спуск
-        if {"X", "Y"} <= set(ax) and abs(ax.get("Z", pend[1]) - pend[1]) < 1e-6:
+        # ждали пару: G0 в XY на той же высоте, что и последний спуск
+        if ({"X", "Y"} <= set(ax)
+                and abs(ax.get("Z", pend[-1][1]) - pend[-1][1]) < 1e-6):
             # XY идёт первым и БЕЗ Z — фреза едет поперёк на той высоте, где
             # стоит (точка смены инструмента), и только потом опускается.
             out.append(_re.sub(r"\s*Z-?[\d.]+", "", code) + "\n")
-            out.append(pend[0])
+            out.extend(q[0] for q in pend)
             nswap += 1
         else:
-            out.append(pend[0])
+            out.extend(q[0] for q in pend)
             out.append(line)
-        pend, armed = None, False
+        pend, armed = [], False
 
-    if pend is not None:
-        out.append(pend[0])
+    out.extend(q[0] for q in pend)
     if nswap:
         log(f"порядок первых перемещений: XY → Z, исправлено мест: {nswap}")
     return "".join(out)
