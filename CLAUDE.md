@@ -36,8 +36,14 @@ strands a skin at the bottom. Down/side-facing or covered faces are skipped (war
 material unreachable from above (overhangs) is skipped —
 that's a second setup, not something to cut through. Silhouette sections MUST be
 built with `Part.makeFace(wires, "Part::FaceMakerBullseye")` — making a Face per
-wire fills cutouts and the union loses the holes. There is NO finishing pass —
-roughing (staged) is the only output; scallops on slopes/radii are left as-is. Stock = part
+wire fills cutouts and the union loses the holes. A finishing pass is OPT-IN
+(`FINISH` / `--finish`, default off): each roughing op gets a paired finish over the
+same zone with zero allowance — faces via a Single-pass Path Surface straight on the
+surface, cutouts/perimeter via a zero-offset Profile, named `Finish*` next to its
+`Rough*`. This mirrors the customer's own programs (`RADIYS_1_PR0.5` →
+`RADIYS_1_CHIST`) and only makes sense together with an allowance
+(`ROUGH_ALLOWANCE_MODE` xy/all) — without one the roughing already cuts to size.
+Default output stays roughing-only; scallops on slopes/radii are then left as-is. Stock = part
 bbox + margins (`STOCK_MARGIN`, default 12 = 2 tool Ø) OR an arbitrary solid from a
 file (`STOCK_FILE` / `--stock`): the stock file must be in the SAME coordinate
 system as the model — the worker records the part's orient/origin transforms in a
@@ -79,6 +85,23 @@ env vars pointing at its folder. Do NOT use the NXOpen DexManager.StepCreator
 route headless: ObjectTypes default to all-False (SettingsFile does not override
 them) and even with them set the headless export yields a geometry-less STEP
 (views/cameras only). Without NX, the bridge remains manual STEP export from NX.
+
+Three passes run over the posted G-code before it is written (all in
+`freecad_worker.py`, all dialect-independent, all answering ОЭЦМ КнААЗ remarks):
+`insert_tool_passports` (tool passport comment at each change, from `TOOL_CATALOG`),
+`reorder_first_positioning` (`SAFE_START_ORDER`: XY first, then Z down — but ONLY at
+program start and right after a tool change, where the tool sits at the change point),
+and `optimize_links` (`AIR_PLUNGE_RAPID` / `RAMP_ANGLE`). The last one runs on a
+`StockMap` — a 2.5D model of remaining material (height map, lowered as the tool
+cuts), deliberately biased safe: queried over a disc of tool radius + grid step,
+lowered over radius − step. It splits every vertical descent into a rapid down to
+material + a ramp entry zig-zagging along the very cut the tool is about to make
+(arcs are followed by a fine polyline — a chord across a 2 mm arc is 0.18 mm, and on
+an OUTSIDE profile that is inside the part). `AIR_CUTS_RAPID` also converts
+horizontal cuts above material into rapids: −5.5 min on part 003 but it recreates
+the "down in Z, then sideways" pattern, so it is OFF by default. `cam/gcode_stats.py`
+prints the acceptance numbers — programs cannot be compared line by line because
+`Path.Op.Adaptive` varies 0.7 % of cutting length between runs of identical code.
 
 CRITICAL Adaptive gotcha: regions must be explicit planar faces. Passing model faces
 as `Base` yields open projected contours on real parts (`Path.Area: ccurve not closed`)
@@ -260,5 +283,6 @@ good test for ORIGIN normalization); its L-shaped stock:
 - Generated `.stl`/`.gcode` are gitignored; keep them out of commits.
 - `config.yaml` may contain operator-specific settings and is gitignored;
   the committed template is `config.example.yaml`.
-- Don't describe the output as full CAM: 3-axis, roughing only (NO finishing pass),
-  no collision control — README's "Ограничения" section is the honest contract.
+- Don't describe the output as full CAM: 3-axis, roughing by default (finishing is
+  opt-in via `FINISH`), no collision control — README's "Ограничения" section is the
+  honest contract.

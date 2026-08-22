@@ -589,13 +589,18 @@ def make_profile(doc, job, tc, name, region_shape, p, start_z, final_z, allowanc
 
 
 def make_surface_rough(doc, job, tc, name, model_obj, face_idx, p,
-                       start_z, final_z, allowance):
-    """Черновая наклонной/криволинейной грани «террасами»: Path Surface
-    (drop cutter — фреза опускается сверху до поверхности) в режиме Multi-pass:
-    слоями StepDown, с вертикальным смещением DepthOffset = припуск, зона —
-    только эта грань модели (BoundBox=BaseBoundBox). Плоская фреза оставляет
-    на наклоне ступеньки высотой до StepDown (чистовой обработки нет —
-    остаются как есть)."""
+                       start_z, final_z, allowance, single_pass=False,
+                       stepover=None):
+    """Проход по грани: Path Surface (drop cutter — фреза опускается сверху до
+    поверхности), зона — только эта грань модели (BoundBox=BaseBoundBox).
+
+    single_pass=False — ЧЕРНОВОЙ: Multi-pass, слоями StepDown, с вертикальным
+    смещением DepthOffset = припуск. Плоская фреза оставляет на наклоне
+    ступеньки высотой до StepDown.
+    single_pass=True — ЧИСТОВОЙ: один проход прямо по поверхности (DepthOffset
+    задаётся нулевым вызывающим), ступеньки от черновой снимаются. Так устроена
+    заводская программа: у каждого элемента пара «черновая с припуском →
+    чистовая» (`RADIYS_1_PR0.5` → `RADIYS_1_CHIST`)."""
     final_z = max(final_z, p.get("_floor_limit", final_z))  # не ниже стола
     import Path.Op.Surface as Surface
     op = Surface.Create(name, parentJob=job)
@@ -603,7 +608,7 @@ def make_surface_rough(doc, job, tc, name, model_obj, face_idx, p,
     op.Base = [(model_obj, f"Face{face_idx}")]
     set_prop(op, "BoundBox", "BaseBoundBox")
     set_prop(op, "ScanType", "Planar")
-    set_prop(op, "LayerMode", "Multi-pass")
+    set_prop(op, "LayerMode", "Single-pass" if single_pass else "Multi-pass")
     set_prop(op, "CutMode", "Climb")
     # Грань бывает УЖЕ фрезы (радиус гиба, скос), поэтому рисунок ZigZag, а не
     # Offset (тот отступает от границы на радиус и оставляет пусто).
@@ -632,8 +637,9 @@ def make_surface_rough(doc, job, tc, name, model_obj, face_idx, p,
     set_prop(op, "BoundaryEnforcement", keep_in)
     # шаг строчек на наклоне — свой, мельче: гребешки между строчками остаются
     # на самой поверхности детали (чистовой обработки нет)
-    set_prop(op, "StepOver", int(p.get("rough_stepover_slope",
-                                       p["rough_stepover"])))
+    set_prop(op, "StepOver", int(stepover if stepover
+                                 else p.get("rough_stepover_slope",
+                                            p["rough_stepover"])))
     set_prop(op, "SampleInterval",
              FreeCAD.Units.Quantity(f"{max(float(p['rough_tolerance']), 0.2)} mm"))
     set_prop(op, "DepthOffset", FreeCAD.Units.Quantity(f"{allowance} mm"))
@@ -648,7 +654,8 @@ def make_surface_rough(doc, job, tc, name, model_obj, face_idx, p,
     doc.recompute()
 
     n = len(op.Path.Commands) if op.Path else 0
-    log(f"{name}: {n} команд (террасы по поверхности)")
+    log(f"{name}: {n} команд "
+        f"({'чистовой проход' if single_pass else 'террасы по поверхности'})")
     return op if n > 2 else None
 
 
@@ -674,6 +681,14 @@ def make_roughing_ops(doc, job, tc, shape, p):
     mode = p.get("rough_allowance_mode", "none")
     alw_xy = mag if mode in ("xy", "all") else 0.0    # StockToLeave / OffsetExtra
     alw_z = mag if mode == "all" else 0.0             # полы карманов, поверхности
+    # Чистовой проход: у каждого элемента пара «черновая с припуском → чистовая»,
+    # как в заводской программе (`RADIYS_1_PR0.5` → `RADIYS_1_CHIST`). Без
+    # припуска чистовая была бы повтором черновой — предупреждаем и не молчим.
+    fin = bool(p.get("finish", False))
+    fin_stepover = int(p.get("finish_stepover", 25))
+    if fin and mode == "none":
+        log("warn: чистовой проход включён при ROUGH_ALLOWANCE_MODE=none — "
+            "черновая режет начисто, чистовому нечего снимать")
     bb = shape.BoundBox
     sb = job.Stock.Shape.BoundBox
     start_z = sb.ZMax                      # верх заготовки
@@ -788,7 +803,8 @@ def make_roughing_ops(doc, job, tc, shape, p):
         except Exception:
             return None
 
-    def surface_ladder(name, face_idx, top, final_z, width, alw):
+    def surface_ladder(name, face_idx, top, final_z, width, alw,
+                       single_pass=False, stepover=None):
         """3D-проход по грани с перебором фрез от крупной к мелкой. Нужен из-за
         запрета выхода за границу грани: фреза шире грани даёт пустой путь,
         мелкая — нормальный. Возврат: (операция или None, диаметр)."""
@@ -797,12 +813,30 @@ def make_roughing_ops(doc, job, tc, shape, p):
                                   if d < dx0 and name not in overrides]
         for tcx, dx in tries:
             op = make_surface_rough(doc, job, tcx, name, jm, face_idx, p,
-                                    top, final_z, alw)
+                                    top, final_z, alw, single_pass, stepover)
             if op:
                 return op, dx
             if dx != tries[-1][1]:
                 log(f"{name}: фреза Ø{dx:g} не дала траектории — пробую мельче")
         return None, dx0
+
+    def finish_surface(rough_name, face_idx, top, final_z, width):
+        """Чистовой проход по той же грани — пара к черновой, как у завода.
+
+        Черновая оставляет припуск (по стенкам StockToLeave, по поверхности
+        DepthOffset) и ступеньки высотой до StepDown; чистовая идёт одним
+        проходом прямо по поверхности с более мелким шагом строчек."""
+        if not fin:
+            return
+        name = rough_name.replace("Rough", "Finish", 1)
+        if skip(name):
+            return
+        op2, _ = surface_ladder(name, face_idx, top, final_z, width, 0.0,
+                                single_pass=True, stepover=fin_stepover)
+        if op2:
+            ops.append(op2)
+        else:
+            log(f"{name}: пустая траектория — чистового прохода не будет")
 
     # ── 1) сквозные вырезы любой формы, ПЕРВЫМИ (деталь ещё жёстко в заготовке) ──
     if sil is None:
@@ -849,6 +883,14 @@ def make_roughing_ops(doc, job, tc, shape, p):
                 log(f"{name}: фреза Ø{dx:g} не дала траектории — пробую мельче")
         if op:
             ops.append(op)
+            # чистовая стенок выреза — контурный обход изнутри без припуска
+            if fin and not skip(f"FinishHole{i}"):
+                fop = make_profile(doc, job, tcx, f"FinishHole{i}", region, p,
+                                   hole_top, bb.ZMin, 0.0, side="Inside")
+                if fop:
+                    ops.append(fop)
+                else:
+                    log(f"FinishHole{i}: пустая траектория — чистового нет")
             write_partial(job, ops, p, f"готов вырез {i} (Ø{dx:g}, "
                                        f"~{rb.XLength:.0f}x{rb.YLength:.0f} мм)")
         else:
@@ -941,10 +983,11 @@ def make_roughing_ops(doc, job, tc, shape, p):
             if skip(name):
                 continue
             rfb = fc["region"].BoundBox
+            fin_width = min(rfb.XLength, rfb.YLength)
             # плоские грани снимаем 3D-проходом по поверхности (террасы), как и
             # наклонные — по требованию оператора вместо Adaptive-выборки
             op, dx = surface_ladder(name, fc["idx"], top, fc["final"],
-                                    min(rfb.XLength, rfb.YLength), alw_z)
+                                    fin_width, alw_z)
             if not op:
                 log(f"{name}: 3D-проход пуст на всех фрезах — Adaptive-выборкой")
                 tcx, dx = choose_tc(name, min(rfb.XLength, rfb.YLength))
@@ -972,11 +1015,13 @@ def make_roughing_ops(doc, job, tc, shape, p):
                 width = min(width, 2.0 * rcap)
                 log(f"{name}: вогнутый радиус R{rcap:.1f} — фреза не крупнее "
                     f"Ø{2.0 * rcap:.1f}")
+            fin_width = width
             op, dx = surface_ladder(name, fc["idx"], top, fc["final"],
                                     width, alw_z)
             note = f"готова криволинейная грань {slope_n} (Ø{dx:g}, {fc['area']:.0f} мм²)"
         if op:
             ops.append(op)
+            finish_surface(name, fc["idx"], top, fc["final"], fin_width)
             write_partial(job, ops, p, note)
         else:
             log(f"{name}: (Z={fc['z']:.1f}) пустая траектория — пропущено")
@@ -1060,6 +1105,13 @@ def make_roughing_ops(doc, job, tc, shape, p):
                               peri_top, bb.ZMin, alw_xy)
             if op:
                 ops.append(op)
+                if fin and not skip("FinishPerimeter"):
+                    fop = make_profile(doc, job, tcx, "FinishPerimeter", filled,
+                                       p, peri_top, bb.ZMin, 0.0)
+                    if fop:
+                        ops.append(fop)
+                    else:
+                        log("FinishPerimeter: пустая траектория — чистового нет")
                 write_partial(job, ops, p, "готов внешний контур детали")
             else:
                 log("внешний контур: пустая траектория — периметр не прорезан")
@@ -1475,63 +1527,124 @@ def _parse_blocks(gcode):
             out.append({"raw": raw, "mode": None})
             continue
         nx_, ny_, nz_ = ax.get("X", x), ax.get("Y", y), ax.get("Z", z)
+        ijk = {a: float(v) for a, v in _re.findall(r"\b([IJK])(-?[\d.]+)", code)}
         out.append({"raw": raw, "mode": mode, "feed": feed,
                     "p0": None if not have else (x, y, z),
-                    "p1": (nx_, ny_, nz_)})
+                    "p1": (nx_, ny_, nz_),
+                    "ij": (ijk.get("I", 0.0), ijk.get("J", 0.0))})
         x, y, z, have = nx_, ny_, nz_, True
     return out
 
 
-def _ramp(entry, target, nxt, angle_deg, feed, min_len=0.5):
-    """Врезание «змейкой» по отрезку, который фреза всё равно сейчас режет.
+def _arc_track(p0, p1, ijk, cw, need, sag_max=0.005):
+    """Дуга G2/G3 → ломаная от начала дуги, длиной не меньше `need`.
+
+    Ломаная нужна, чтобы врезаться рампой перед контурным проходом: там за
+    входом сразу идёт дуга, а по хорде дуги фрезу вести нельзя — для внешнего
+    контура хорда лежит ВНУТРИ дуги, то есть в теле детали. Поэтому шаг
+    выбирается по стрелке прогиба: sag_max 0.005 мм — на два порядка меньше
+    шага воксельной сверки и любого допуска.
+    """
+    import math as _m
+    cx, cy = p0[0] + ijk[0], p0[1] + ijk[1]
+    r = _m.hypot(p0[0] - cx, p0[1] - cy)
+    if r < 1e-6:
+        return None
+    a0 = _m.atan2(p0[1] - cy, p0[0] - cx)
+    a1 = _m.atan2(p1[1] - cy, p1[0] - cx)
+    da = a1 - a0
+    if cw:
+        while da >= 0:
+            da -= 2 * _m.pi
+    else:
+        while da <= 0:
+            da += 2 * _m.pi
+    step = 2.0 * _m.acos(max(-1.0, min(1.0, 1.0 - sag_max / r)))  # угол на хорду
+    if step < 1e-6:
+        return None
+    n = int(_m.ceil(min(abs(da), (need + step * r) / r) / step))
+    pts = [(p0[0], p0[1])]
+    s = -step if cw else step
+    for k in range(1, n + 1):
+        a = a0 + s * k
+        if (a - a0) / (da if abs(da) > 1e-12 else 1.0) > 1.0:
+            break
+        pts.append((cx + r * _m.cos(a), cy + r * _m.sin(a)))
+    return pts if len(pts) > 1 else None
+
+
+def _ramp(entry, target, track, angle_deg, min_len=0.5):
+    """Врезание «змейкой» по траектории, которую фреза всё равно сейчас режет.
 
     Замечание ОЭЦМ: «опасные вертикальные врезания». Ход вниз заменяется на
     спуск под углом ВДОЛЬ БУДУЩЕГО РЕЗА и обратно, столько раз, сколько нужно
     для глубины. Рампа не выходит за траекторию, которую программа и так
     собиралась пройти, поэтому зарезать ею нечего.
 
-    entry — (x, y, z_сверху), target — z внизу, nxt — конец следующего реза.
-    Возвращает список точек (x, y, z) или None, если рампу негде разместить
-    (следующий ход короткий или это не прямой рез — тогда остаётся отвесный
-    вход на вертикальной подаче).
+    entry — (x, y, z_сверху), target — z внизу, track — ломаная будущего реза,
+    начинающаяся в точке входа (прямой ход = два узла, дуга = `_arc_track`).
+    Возвращает список точек (x, y, z) или None, если рампу негде разместить —
+    тогда остаётся отвесный вход на вертикальной подаче.
     """
     import math as _m
     x0, y0, z0 = entry
-    if nxt is None:
-        return None
-    dx, dy = nxt[0] - x0, nxt[1] - y0
-    seg = _m.hypot(dx, dy)
-    if seg < min_len:
-        return None
     depth = z0 - target
-    if depth <= 0:
+    if not track or len(track) < 2 or depth <= 0:
         return None
-    run = depth / _m.tan(_m.radians(angle_deg))      # длина спуска по горизонтали
-    ux, uy = dx / seg, dy / seg
-    pts = []
-    z = z0
-    pos = 0.0                                        # координата вдоль отрезка
-    direction = 1
-    left = run
-    guard = 0
-    while left > 1e-9 and guard < 200:
+    # длина ломаной нарастающим итогом
+    acc = [0.0]
+    for a, b in zip(track, track[1:]):
+        acc.append(acc[-1] + _m.hypot(b[0] - a[0], b[1] - a[1]))
+    total = acc[-1]
+    if total < min_len:
+        return None
+
+    def at(s):
+        """Точка на ломаной на расстоянии s от начала."""
+        s = max(0.0, min(total, s))
+        for i in range(1, len(acc)):
+            if s <= acc[i] or i == len(acc) - 1:
+                seg = acc[i] - acc[i - 1]
+                t = 0.0 if seg < 1e-12 else (s - acc[i - 1]) / seg
+                a, b = track[i - 1], track[i]
+                return (a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]))
+        return track[-1]
+
+    def leg(pts, a, b, za, zb):
+        """Ход по ломаной от a до b с выдачей ВСЕХ её узлов между ними.
+
+        Без этого рампа по дуге пошла бы хордой: на контурном проходе радиусом
+        2 мм это 0.18 мм внутрь дуги, а у внешнего контура внутри — тело детали.
+        """
+        mid = [s for s in acc if min(a, b) - 1e-9 < s < max(a, b) + 1e-9
+               and abs(s - a) > 1e-9 and abs(s - b) > 1e-9]
+        mid.sort(reverse=(b < a))
+        span = b - a
+        for s in mid + [b]:
+            t = 1.0 if abs(span) < 1e-12 else (s - a) / span
+            px, py = at(s)
+            pts.append((px, py, za + t * (zb - za)))
+
+    tan = _m.tan(_m.radians(angle_deg))
+    pts, z, pos, direction, left, guard = [], z0, 0.0, 1, depth / tan, 0
+    while left > 1e-9 and guard < 400:
         guard += 1
-        room = (seg - pos) if direction > 0 else pos
+        room = (total - pos) if direction > 0 else pos
         if room < 1e-9:
             direction = -direction
             continue
         step = min(left, room)
-        pos += step * direction
-        z = max(target, z - step * _m.tan(_m.radians(angle_deg)))
-        pts.append((x0 + ux * pos, y0 + uy * pos, z))
+        nxt = pos + step * direction
+        nz = max(target, z - step * tan)
+        leg(pts, pos, nxt, z, nz)
+        pos, z = nxt, nz
         left -= step
         direction = -direction
     if not pts:
         return None
-    if abs(pts[-1][0] - x0) > 1e-9 or abs(pts[-1][1] - y0) > 1e-9:
-        pts.append((x0, y0, target))                 # вернуться в точку входа
-    else:
-        pts[-1] = (x0, y0, target)
+    if pos > 1e-9:                                   # вернуться в точку входа
+        leg(pts, pos, 0.0, target, target)
+    pts[-1] = (x0, y0, target)
     return pts
 
 
@@ -1564,15 +1677,24 @@ def optimize_links(gcode, stock_map, vert_feed, clearance=1.0, air_cuts=False,
         h = _re.sub(r"\s*Z-?[\d.]+", "", code.split("F")[0]).strip()
         return _re.sub(r"^G0*[123]\b", "", h).strip()
 
-    def next_cut_end(i):
-        """Конец ближайшего прямого рабочего хода после кадра i."""
+    def next_cut_track(i, need):
+        """Ломаная ближайшего рабочего хода после кадра i — по ней идёт рампа.
+
+        Прямой ход даёт два узла, дуга (контурные проходы начинаются именно с
+        неё) — частую ломаную по `_arc_track`. Холостой ход прерывает поиск:
+        после него фреза уже не там, где вошла."""
         for b in blocks[i + 1:i + 4]:
-            if b["mode"] == 1 and b.get("p0") is not None:
-                p0, p1 = b["p0"], b["p1"]
-                if abs(p1[0] - p0[0]) > 1e-6 or abs(p1[1] - p0[1]) > 1e-6:
-                    return p1
+            if b.get("p0") is None:
                 continue
-            if b["mode"] in (0, 2, 3):
+            p0, p1 = b["p0"], b["p1"]
+            if b["mode"] == 1:
+                if abs(p1[0] - p0[0]) > 1e-6 or abs(p1[1] - p0[1]) > 1e-6:
+                    return [(p0[0], p0[1]), (p1[0], p1[1])]
+                continue                      # отвесный ход — смотрим дальше
+            if b["mode"] in (2, 3):
+                return _arc_track(p0, p1, b.get("ij", (0.0, 0.0)),
+                                  b["mode"] == 2, need)
+            if b["mode"] == 0:
                 return None
         return None
 
@@ -1606,8 +1728,11 @@ def optimize_links(gcode, stock_map, vert_feed, clearance=1.0, air_cuts=False,
                     out.append(_join("G0", head, z_safe, None))
                     n_cut += 1
                     saved += z - z_safe
-                pts = (_ramp((x, y, z_safe), nz_, next_cut_end(i), ramp_angle,
-                             feed) if ramp_angle > 0 else None)
+                pts = None
+                if ramp_angle > 0:
+                    need = (z_safe - nz_) / math.tan(math.radians(ramp_angle))
+                    pts = _ramp((x, y, z_safe), nz_,
+                                next_cut_track(i, need), ramp_angle)
                 if pts:
                     fr = horiz_feed or feed
                     for px, py, pz in pts:

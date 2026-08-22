@@ -137,6 +137,8 @@ def generate_gcode_freecad(model_path: str, gcode_path: str) -> int:
         "rough_stepover_slope": getattr(config, "ROUGH_STEPOVER_SLOPE",
                                         config.ROUGH_STEPOVER),
         "rough_tolerance": config.ROUGH_TOLERANCE,
+        "finish": bool(getattr(config, "FINISH", False)),
+        "finish_stepover": int(getattr(config, "FINISH_STEPOVER", 25)),
         "surface_keep_inside": getattr(config, "SURFACE_KEEP_INSIDE", True),
         "safe_start_order": bool(getattr(config, "SAFE_START_ORDER", True)),
         "air_plunge_rapid": bool(getattr(config, "AIR_PLUNGE_RAPID", True)),

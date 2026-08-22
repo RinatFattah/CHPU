@@ -73,6 +73,12 @@ def main():
                     help="оставлять припуск по стенкам (XY); полы/поверхности — начисто")
     ap.add_argument("--allowance-all", action="store_true",
                     help="оставлять припуск везде (стенки + полы); без флагов — начисто")
+    ap.add_argument("--finish", action="store_true",
+                    help="чистовой проход после каждой черновой (пара "
+                         "«черновая с припуском → чистовая», как в заводских "
+                         "программах); требует припуска — см. --allowance-*")
+    ap.add_argument("--no-finish", action="store_true",
+                    help="без чистового прохода (перекрывает конфиг)")
     ap.add_argument("--rough-mode", choices=["stages", "layers"],
                     help="черновая: stages = по типам фич (дефолт), "
                          "layers = послойно, как Cavity Mill (эксперимент)")
@@ -114,6 +120,10 @@ def main():
         config.ROUGH_ALLOWANCE_MODE = "xy"
     if args.allowance_all:
         config.ROUGH_ALLOWANCE_MODE = "all"
+    if args.finish:
+        config.FINISH = True
+    if args.no_finish:
+        config.FINISH = False
     if args.rough_mode:
         config.ROUGH_MODE = args.rough_mode
     if args.stock_margin is not None:
