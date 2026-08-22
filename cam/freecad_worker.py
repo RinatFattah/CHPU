@@ -1479,9 +1479,12 @@ class StockMap:
         t = np.clip(t, 0.0, 1.0)
         return (gx - (x0 + t * dx)) ** 2 + (gy - (y0 + t * dy)) ** 2
 
-    def top(self, x, y):
-        """Верх материала в радиусе фрезы вокруг (x, y); -inf — материала нет."""
-        r = self.r + self.pitch                      # запрос с запасом наружу
+    def top(self, x, y, tool_r=None):
+        """Верх материала в радиусе фрезы вокруг (x, y); -inf — материала нет.
+
+        tool_r — радиус ТЕКУЩЕЙ фрезы: в многоинструментальной программе радиус
+        меняется по ходу, и брать главную фрезу нельзя (см. `cut`)."""
+        r = (self.r if tool_r is None else tool_r) + self.pitch   # запас наружу
         if not (self.bb.XMin - r <= x <= self.bb.XMax + r
                 and self.bb.YMin - r <= y <= self.bb.YMax + r):
             return float("-inf")
@@ -1491,9 +1494,14 @@ class StockMap:
         vals = sub[d2 <= r * r]
         return float(vals.max()) if vals.size else float("-inf")
 
-    def cut(self, x0, y0, x1, y1, z):
-        """Снять материал вдоль отрезка на уровень z (радиус — с недобором)."""
-        r = max(self.r - self.pitch, 0.0)            # снимаем МЕНЬШЕ, чем фреза
+    def cut(self, x0, y0, x1, y1, z, tool_r=None):
+        """Снять материал вдоль отрезка на уровень z (радиус — с недобором).
+
+        tool_r ОБЯЗАТЕЛЕН в многоинструментальной программе: снять по радиусу
+        главной фрезы там, где работает Ø1, значит стереть в модели материал,
+        которого фреза не касалась, — и следующий подвод уедет холостым в
+        металл. Ошибка в эту сторону единственная опасная во всём пассе."""
+        r = max((self.r if tool_r is None else tool_r) - self.pitch, 0.0)
         i0, i1, j0, j1 = self._window(x0, y0, x1, y1, r)
         if i0 >= i1 or j0 >= j1:
             return
@@ -1649,7 +1657,7 @@ def _ramp(entry, target, track, angle_deg, min_len=0.5):
 
 
 def optimize_links(gcode, stock_map, vert_feed, clearance=1.0, air_cuts=False,
-                   ramp_angle=0.0, horiz_feed=None):
+                   ramp_angle=0.0, horiz_feed=None, tool_radii=None):
     """Подвод и врезание по модели снятого материала.
 
     Замечание ОЭЦМ: «лишние перемещения и опасные вертикальные врезания». У нас
@@ -1672,6 +1680,11 @@ def optimize_links(gcode, stock_map, vert_feed, clearance=1.0, air_cuts=False,
     out = []
     n_cut = n_all = n_air = n_ramp = 0
     saved = 0.0
+    # Радиус фрезы меняется по ходу многоинструментальной программы, а модель
+    # снятого материала обязана считать по ТЕКУЩЕЙ: снять по радиусу главной
+    # там, где работает Ø1, значит стереть материал, которого фреза не касалась.
+    radii = {int(k): float(v) / 2.0 for k, v in (tool_radii or {}).items()}
+    cur_r = None
 
     def head_of(code):
         h = _re.sub(r"\s*Z-?[\d.]+", "", code.split("F")[0]).strip()
@@ -1700,6 +1713,9 @@ def optimize_links(gcode, stock_map, vert_feed, clearance=1.0, air_cuts=False,
 
     for i, b in enumerate(blocks):
         if b["mode"] is None or b.get("p0") is None:
+            m = _re.search(r"\(\s*M0?6\s+T(\d+)\s*\)", b["raw"])
+            if m:
+                cur_r = radii.get(int(m.group(1)), cur_r)
             out.append(b["raw"])
             continue
         x, y, z = b["p0"]
@@ -1714,7 +1730,7 @@ def optimize_links(gcode, stock_map, vert_feed, clearance=1.0, air_cuts=False,
         vertical = (abs(nx_ - x) < 1e-6 and abs(ny_ - y) < 1e-6 and nz_ < z - 1e-6)
 
         if vertical:
-            zt = stock_map.top(x, y)
+            zt = stock_map.top(x, y, cur_r)
             z_safe = min(z, zt + clearance)
             # Спуск целиком по воздуху — и когда материала на вертикали нет
             # вовсе, и когда фреза не доходит до его верха (зазор ещё не
@@ -1742,14 +1758,14 @@ def optimize_links(gcode, stock_map, vert_feed, clearance=1.0, air_cuts=False,
                 else:
                     out.append(_join("G1", head, nz_, vert_feed))
         elif air_cuts and b["mode"] == 1 and min(z, nz_) > clearance + max(
-                stock_map.top(x, y), stock_map.top(nx_, ny_),
-                stock_map.top((x + nx_) / 2.0, (y + ny_) / 2.0)):
+                stock_map.top(x, y, cur_r), stock_map.top(nx_, ny_, cur_r),
+                stock_map.top((x + nx_) / 2.0, (y + ny_) / 2.0, cur_r)):
             out.append(_join("G0", head, nz_, None))  # рабочий ход по воздуху
             n_air += 1
         else:
             out.append(b["raw"])
 
-        stock_map.cut(x, y, nx_, ny_, min(z, nz_))
+        stock_map.cut(x, y, nx_, ny_, min(z, nz_), cur_r)
 
     if n_cut or n_all or n_air or n_ramp:
         log(f"подвод: {n_all} спусков целиком по воздуху, {n_cut} укорочено, "
@@ -1935,7 +1951,7 @@ def mill(doc, feat, p, stock_solid=None):
                 float(p.get("air_plunge_clearance", 1.0)),
                 air_cuts=bool(p.get("air_cuts_rapid", False)),
                 ramp_angle=float(p.get("ramp_angle", 0.0)),
-                horiz_feed=float(feed))
+                horiz_feed=float(feed), tool_radii=tools_map)
         except Exception as e:   # без модели программа валидна, просто длиннее
             log(f"warn: подвод не оптимизирован ({e})")
     return p["_gcode_header"] + body
