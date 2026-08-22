@@ -1840,11 +1840,22 @@ def mill(doc, feat, p, stock_solid=None):
     tc = job.Tools.Group[0]
     feed = float(p["feed_rate"])
     rpm = float(p["spindle_speed"])
-    # набор фрез (мм), по убыванию; главная (черновая) — крупнейшая
-    tset = sorted({round(float(x), 3) for x in
-                   (p.get("tool_set") or [p["tool_diameter"]])}, reverse=True)
-    tool_d = tset[0]
+    # набор фрез (мм), по убыванию; главная (черновая) — крупнейшая ИЗ НАБОРА
+    base_set = sorted({round(float(x), 3) for x in
+                       (p.get("tool_set") or [p["tool_diameter"]])}, reverse=True)
+    tool_d = base_set[0]
     p["tool_diameter"] = tool_d          # шапка/пороги — от главной фрезы
+    # Пофрезные переопределения (SET_OP_TOOLS, действие set_op_tool из auto_fix)
+    # добавляются в набор: choose_tc выбирает БЛИЖАЙШИЙ доступный диаметр, и без
+    # этого просьба «возьми Ø3 на RoughSlope2» молча прилипала бы к единственной
+    # фрезе набора. Для ЛЛМ-петли смена фрезы — первая ступень лестницы правок,
+    # так что вместе с одноинструментальным дефолтом она бы отвалилась.
+    extra = {round(float(v), 3) for v in (p.get("set_op_tools") or {}).values()}
+    tset = sorted(set(base_set) | extra, reverse=True)
+    if extra - set(base_set):
+        log("фрезы из SET_OP_TOOLS добавлены в набор: "
+            + ", ".join("Ø%g" % d for d in sorted(extra - set(base_set),
+                                                  reverse=True)))
 
     def _setup_tc(tcobj, d, num):
         set_prop(tcobj.Tool, "Diameter", FreeCAD.Units.Quantity(f"{d} mm"))

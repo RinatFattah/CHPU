@@ -58,8 +58,14 @@ else the wall hangs as an overhang), orient_wall_to_yz (largest vertical planar 
 normal → X). Narrow through-slots where Adaptive can't helix (slot > tool Ø but
 < 2 Ø) fall back to Path Profile Side=Inside (plunge entry at VertFeed).
 Multi-tool milling: `TOOL_SET` (list of mill Ø, desc) — worker picks per op the
-largest that fits the feature width (SET_OP_TOOLS / LLM set_op_tool overrides per
-op). FreeCAD BUG: `Op.Create` throws `cannot access local variable 'tc'` when
+largest that fits the feature width. **Default is ONE tool since 22-08-2026** (ОЭЦМ
+КнААЗ: their reference programs use a single D12 for the whole part, ours were
+pulling in D4/D1/D0.4); narrow features the main tool cannot enter are then simply
+left (the diff reports them as undercut) — add diameters to get the old behaviour.
+`SET_OP_TOOLS` / the LLM `set_op_tool` action override per op and their diameters
+are ADDED to the set — `choose_tc` snaps an override to the nearest AVAILABLE
+diameter, so without that merge a one-element set would silently swallow every
+override, and set_op_tool is the first rung of the auto_fix remedy ladder. FreeCAD BUG: `Op.Create` throws `cannot access local variable 'tc'` when
 `job.Tools.Group` has >1 controller — so extra TCs are created OUTSIDE the group
 (op.ToolController still assignable/computable), and added to job.Tools only AFTER
 all ops exist, then renumbered T2.. Unused pool TCs are removed. grbl post writes
