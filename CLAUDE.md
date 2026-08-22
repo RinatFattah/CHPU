@@ -199,6 +199,14 @@ and direct runs like `python cam/step_diff.py a.step b.stp` work.
   compare. `nx/nx_compare.py` + `nx/nx_compare_journal.py` - same as a native
   .prt with NX LAYERS (1 = part, 2 = cut result); compare_many() batches all
   pairs in a single run_journal launch.
+- `cam/step_shift.py` / `cam/gcode_shift.py` - the two directions between our zero
+  (part TOP plane) and the customer's (BOTTOM/table plane). Shift the GEOMETRY when
+  the program is someone else's and must run in its own frame; shift the PROGRAM when
+  ours has to go to their machine. `gcode_shift` leaves I/J/K alone — they are offsets
+  from the arc's start, not absolute.
+- `cam/gcode_stats.py` - acceptance numbers for a posted program (feed/rapid length,
+  time estimate, tool changes and their passports, vertical entries into material,
+  "down in Z then sideways"). Several files at once render as a comparison table.
 - `config.py` - parameter defaults + YAML loading (`--config`).
 - `README_CAM.md` - operator-facing parameter reference. **Keep in sync** when
   changing CAM params. `README.md` - main handoff doc.
