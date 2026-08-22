@@ -859,6 +859,15 @@ def make_roughing_ops(doc, job, tc, shape, p):
     # припуска чистовая была бы повтором черновой — предупреждаем и не молчим.
     fin = bool(p.get("finish", False))
     fin_stepover = int(p.get("finish_stepover", 25))
+    # Шаг строчек ЧЕРНОВОГО прохода по граням. Мелкий шаг (ROUGH_STEPOVER_SLOPE)
+    # нужен потому, что гребешки между строчками остаются на самой детали —
+    # чистовой обработки нет. Когда чистовой ЕСТЬ и есть припуск, гребешки
+    # ложатся в припуск и снимаются им; тогда черновой идёт крупным шагом, как
+    # по плоскостям. Замер на 003: шаг 40 → 85 % даёт 3 225 → 1 667 мм на трёх
+    # операциях по граням, сверка не меняется (проверено и с порогом толщины
+    # 0.05 мм: остаток тот же и лежит в тех же местах — это плёнка фасетизации
+    # тела ISV, а не гребешки).
+    rough_slope_so = (int(p["rough_stepover"]) if fin and alw_z > 0 else None)
     if fin and mode == "none":
         log("warn: чистовой проход включён при ROUGH_ALLOWANCE_MODE=none — "
             "черновая режет начисто, чистовому нечего снимать")
@@ -1191,7 +1200,7 @@ def make_roughing_ops(doc, job, tc, shape, p):
             # плоские грани снимаем 3D-проходом по поверхности (террасы), как и
             # наклонные — по требованию оператора вместо Adaptive-выборки
             op, dx = surface_ladder(name, fc["idx"], top, fc["final"],
-                                    fin_width, alw_z)
+                                    fin_width, alw_z, stepover=rough_slope_so)
             if not op:
                 log(f"{name}: 3D-проход пуст на всех фрезах — Adaptive-выборкой")
                 tcx, dx = choose_tc(name, min(rfb.XLength, rfb.YLength))
@@ -1221,7 +1230,7 @@ def make_roughing_ops(doc, job, tc, shape, p):
                     f"Ø{2.0 * rcap:.1f}")
             fin_width = width
             op, dx = surface_ladder(name, fc["idx"], top, fc["final"],
-                                    width, alw_z)
+                                    width, alw_z, stepover=rough_slope_so)
             note = f"готова криволинейная грань {slope_n} (Ø{dx:g}, {fc['area']:.0f} мм²)"
         if op:
             ops.append(op)

@@ -43,7 +43,11 @@ surface, cutouts/perimeter via a zero-offset Profile, named `Finish*` next to it
 `Rough*`. This mirrors the customer's own programs (`RADIYS_1_PR0.5` →
 `RADIYS_1_CHIST`) and only makes sense together with an allowance
 (`ROUGH_ALLOWANCE_MODE` xy/all) — without one the roughing already cuts to size.
-Default output stays roughing-only; scallops on slopes/radii are then left as-is. Stock = part
+Default output stays roughing-only; scallops on slopes/radii are then left as-is —
+which is why `ROUGH_STEPOVER_SLOPE` (40 %) is finer than `ROUGH_STEPOVER` (85 %).
+With `FINISH` and an allowance those scallops land in the allowance instead, so the
+roughing pass over faces switches to the coarse stepover (003: 3 225 → 1 667 mm over
+the three face ops, ISV 00:06:15 → 00:05:14, diff unchanged at 0/0). Stock = part
 bbox + margins (`STOCK_MARGIN`, default 12 = 2 tool Ø) OR an arbitrary solid from a
 file (`STOCK_FILE` / `--stock`): the stock file must be in the SAME coordinate
 system as the model — the worker records the part's orient/origin transforms in a
