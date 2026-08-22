@@ -138,6 +138,11 @@ def generate_gcode_freecad(model_path: str, gcode_path: str) -> int:
                                         config.ROUGH_STEPOVER),
         "rough_tolerance": config.ROUGH_TOLERANCE,
         "surface_keep_inside": getattr(config, "SURFACE_KEEP_INSIDE", True),
+        "safe_start_order": bool(getattr(config, "SAFE_START_ORDER", True)),
+        "air_plunge_rapid": bool(getattr(config, "AIR_PLUNGE_RAPID", True)),
+        "air_plunge_clearance": float(getattr(config, "AIR_PLUNGE_CLEARANCE", 1.0)),
+        "air_cuts_rapid": bool(getattr(config, "AIR_CUTS_RAPID", False)),
+        "ramp_angle": float(getattr(config, "RAMP_ANGLE", 0.0)),
         "postprocessor": config.POSTPROCESSOR,
         "nx_export": config.NX_EXPORT,   # экспорт STEP деталь/заготовка в СК G-кода (для NX)
     }

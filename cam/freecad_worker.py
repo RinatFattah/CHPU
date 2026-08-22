@@ -1276,6 +1276,372 @@ def insert_tool_passports(gcode, tools, catalog):
     return "".join(out)
 
 
+def reorder_first_positioning(gcode):
+    """После смены инструмента — сначала XY, потом опускание по Z.
+
+    Замечание ОЭЦМ: «после строки с выбором инструмента происходит потенциально
+    опасное перемещение — сначала опускание по оси Z, а затем в плоскости XY».
+    Так и есть: FreeCAD открывает операцию парой
+
+        G0 Z28.984
+        G0 X31.171 Y23.695 Z28.984
+
+    и первая строка — это СПУСК с высоты смены инструмента, после которого
+    фреза едет поперёк уже опущенной. Заводская программа делает наоборот
+    (`PR_1_01`: `L X0 Y-28. FMAX` → `L Z44. FMAX`).
+
+    Меняем местами ровно эту пару и только там, где спуск заведомо безопасен
+    менять — в НАЧАЛЕ ПРОГРАММЫ и сразу после смены инструмента: там фреза
+    стоит в точке смены, то есть в верхней точке хода по Z, и поперечное
+    перемещение на этой высоте ничего не задевает. Внутри операции порядок уже
+    правильный (отвод на плоскость безопасности, потом XY) — туда не лезем.
+    """
+    import re as _re
+    lines = gcode.splitlines(True)
+    out = []
+    armed = True                    # начало программы = та же ситуация
+    pend = None                     # отложенный «G0 только по Z»
+    nswap = 0
+
+    def _axes(code):
+        return {a: float(v) for a, v in _re.findall(r"\b([XYZ])(-?[\d.]+)", code)}
+
+    for line in lines:
+        code = line.split("(")[0].strip()
+        if not code:                                   # комментарий
+            if _re.search(r"\(\s*M0?6\s+T\d+\s*\)", line):
+                if pend is not None:                   # не потерять отложенное
+                    out.append(pend[0])
+                armed, pend = True, None
+            out.append(line)
+            continue
+        if not armed or not _re.match(r"\s*G0*0\b(?!\d)", code):
+            if pend is not None:                       # пара не сложилась
+                out.append(pend[0])
+                pend = None
+            armed = armed and not _re.search(r"\b[XYZ]-?[\d.]", code)
+            out.append(line)
+            continue
+
+        ax = _axes(code)
+        if pend is None:
+            if set(ax) == {"Z"}:
+                pend = (line, ax["Z"])
+            else:
+                armed = False
+                out.append(line)
+            continue
+
+        # ждали пару: G0 в XY на той же высоте, что и предыдущий спуск
+        if {"X", "Y"} <= set(ax) and abs(ax.get("Z", pend[1]) - pend[1]) < 1e-6:
+            # XY идёт первым и БЕЗ Z — фреза едет поперёк на той высоте, где
+            # стоит (точка смены инструмента), и только потом опускается.
+            out.append(_re.sub(r"\s*Z-?[\d.]+", "", code) + "\n")
+            out.append(pend[0])
+            nswap += 1
+        else:
+            out.append(pend[0])
+            out.append(line)
+        pend, armed = None, False
+
+    if pend is not None:
+        out.append(pend[0])
+    if nswap:
+        log(f"порядок первых перемещений: XY → Z, исправлено мест: {nswap}")
+    return "".join(out)
+
+
+class StockMap:
+    """Модель снятого материала 2.5D: карта «верх материала» в узлах сетки XY.
+
+    Нужна, чтобы отличить спуск сквозь ВОЗДУХ от врезания в металл. Path Surface
+    начинает каждый проход от верха ГАБАРИТНОГО БОКСА заготовки и идёт вниз на
+    рабочей подаче; у гнутого листа (заготовка 003 занимает 8 % своего бокса)
+    почти весь этот спуск — воздух. На базовом прогоне 003 это 430 спусков,
+    7854 мм и треть машинного времени.
+
+    Одной исходной заготовки мало: проходы идут слоями, и ко второму слою
+    материал сверху уже снят. Поэтому карта не статическая — `cut()` опускает её
+    вслед за фрезой, как это делает воксельный симулятор, только в 2.5D.
+
+    Обе стороны считаются с запасом В БЕЗОПАСНУЮ СТОРОНУ:
+      * при построении треугольник растеризуется по своему прямоугольнику —
+        материал получается не ниже настоящего;
+      * `top()` берёт максимум по диску радиуса фрезы + шаг сетки;
+      * `cut()` опускает карту по диску радиуса фрезы − шаг сетки, то есть
+        снимает МЕНЬШЕ, чем снимет фреза.
+    Итог: карта всегда не ниже настоящего материала, ошибка приводит к лишнему
+    рабочему ходу, а не к холостому в металл.
+
+    Тело считается сплошным вниз от верха — для гнутого листа это неверно
+    физически (под полкой воздух), но в ту же безопасную сторону: под полку
+    фреза на холостом ходу не поедет.
+    """
+
+    def __init__(self, verts, tris, bbox, tool_r, pitch=0.5):
+        import numpy as np
+        self.np = np
+        self.pitch = float(pitch)
+        self.bb = bbox
+        self.r = float(tool_r)
+        nx = int(math.ceil(bbox.XLength / self.pitch)) + 1
+        ny = int(math.ceil(bbox.YLength / self.pitch)) + 1
+        self.nx, self.ny = nx, ny
+        self.H = np.full((nx, ny), -1e9)
+
+        vx = [v.x for v in verts]
+        vy = [v.y for v in verts]
+        vz = [v.z for v in verts]
+        for a, b, c in tris:
+            xs = (vx[a], vx[b], vx[c])
+            ys = (vy[a], vy[b], vy[c])
+            z = max(vz[a], vz[b], vz[c])
+            sub = self.H[self._gx(min(xs)):self._gx(max(xs)) + 1,
+                         self._gy(min(ys)):self._gy(max(ys)) + 1]
+            np.maximum(sub, z, out=sub)
+
+        # координаты узлов — для векторного расстояния до отрезка
+        self.X = bbox.XMin + np.arange(nx) * self.pitch
+        self.Y = bbox.YMin + np.arange(ny) * self.pitch
+
+    def _gx(self, x):
+        return min(max(int((x - self.bb.XMin) / self.pitch), 0), self.nx - 1)
+
+    def _gy(self, y):
+        return min(max(int((y - self.bb.YMin) / self.pitch), 0), self.ny - 1)
+
+    def _window(self, x0, y0, x1, y1, r):
+        return (self._gx(min(x0, x1) - r), self._gx(max(x0, x1) + r) + 1,
+                self._gy(min(y0, y1) - r), self._gy(max(y0, y1) + r) + 1)
+
+    def _dist2(self, i0, i1, j0, j1, x0, y0, x1, y1):
+        """Квадрат расстояния от узлов окна до отрезка (x0,y0)-(x1,y1)."""
+        np = self.np
+        gx = self.X[i0:i1][:, None]
+        gy = self.Y[j0:j1][None, :]
+        dx, dy = x1 - x0, y1 - y0
+        L2 = dx * dx + dy * dy
+        if L2 < 1e-12:
+            return (gx - x0) ** 2 + (gy - y0) ** 2
+        t = ((gx - x0) * dx + (gy - y0) * dy) / L2
+        t = np.clip(t, 0.0, 1.0)
+        return (gx - (x0 + t * dx)) ** 2 + (gy - (y0 + t * dy)) ** 2
+
+    def top(self, x, y):
+        """Верх материала в радиусе фрезы вокруг (x, y); -inf — материала нет."""
+        r = self.r + self.pitch                      # запрос с запасом наружу
+        if not (self.bb.XMin - r <= x <= self.bb.XMax + r
+                and self.bb.YMin - r <= y <= self.bb.YMax + r):
+            return float("-inf")
+        i0, i1, j0, j1 = self._window(x, y, x, y, r)
+        d2 = self._dist2(i0, i1, j0, j1, x, y, x, y)
+        sub = self.H[i0:i1, j0:j1]
+        vals = sub[d2 <= r * r]
+        return float(vals.max()) if vals.size else float("-inf")
+
+    def cut(self, x0, y0, x1, y1, z):
+        """Снять материал вдоль отрезка на уровень z (радиус — с недобором)."""
+        r = max(self.r - self.pitch, 0.0)            # снимаем МЕНЬШЕ, чем фреза
+        i0, i1, j0, j1 = self._window(x0, y0, x1, y1, r)
+        if i0 >= i1 or j0 >= j1:
+            return
+        d2 = self._dist2(i0, i1, j0, j1, x0, y0, x1, y1)
+        sub = self.H[i0:i1, j0:j1]
+        m = d2 <= r * r
+        self.np.copyto(sub, self.np.minimum(sub, z), where=m)
+
+
+def _parse_blocks(gcode):
+    """G-код → список кадров с посчитанными позициями. Комментарии сохраняются."""
+    import re as _re
+    out = []
+    x = y = z = 0.0
+    have = False
+    mode = None
+    feed = 0.0
+    for raw in gcode.splitlines(True):
+        code = raw.split("(")[0].strip()
+        if not code:
+            out.append({"raw": raw, "mode": None})
+            continue
+        g = _re.search(r"\bG(0|1|2|3)\b(?!\d)", code)
+        if g:
+            mode = int(g.group(1))
+        f = _re.search(r"\bF(-?[\d.]+)", code)
+        if f:
+            feed = float(f.group(1))
+        ax = {a: float(v) for a, v in _re.findall(r"\b([XYZ])(-?[\d.]+)", code)}
+        if not ax or mode is None:
+            out.append({"raw": raw, "mode": None})
+            continue
+        nx_, ny_, nz_ = ax.get("X", x), ax.get("Y", y), ax.get("Z", z)
+        out.append({"raw": raw, "mode": mode, "feed": feed,
+                    "p0": None if not have else (x, y, z),
+                    "p1": (nx_, ny_, nz_)})
+        x, y, z, have = nx_, ny_, nz_, True
+    return out
+
+
+def _ramp(entry, target, nxt, angle_deg, feed, min_len=0.5):
+    """Врезание «змейкой» по отрезку, который фреза всё равно сейчас режет.
+
+    Замечание ОЭЦМ: «опасные вертикальные врезания». Ход вниз заменяется на
+    спуск под углом ВДОЛЬ БУДУЩЕГО РЕЗА и обратно, столько раз, сколько нужно
+    для глубины. Рампа не выходит за траекторию, которую программа и так
+    собиралась пройти, поэтому зарезать ею нечего.
+
+    entry — (x, y, z_сверху), target — z внизу, nxt — конец следующего реза.
+    Возвращает список точек (x, y, z) или None, если рампу негде разместить
+    (следующий ход короткий или это не прямой рез — тогда остаётся отвесный
+    вход на вертикальной подаче).
+    """
+    import math as _m
+    x0, y0, z0 = entry
+    if nxt is None:
+        return None
+    dx, dy = nxt[0] - x0, nxt[1] - y0
+    seg = _m.hypot(dx, dy)
+    if seg < min_len:
+        return None
+    depth = z0 - target
+    if depth <= 0:
+        return None
+    run = depth / _m.tan(_m.radians(angle_deg))      # длина спуска по горизонтали
+    ux, uy = dx / seg, dy / seg
+    pts = []
+    z = z0
+    pos = 0.0                                        # координата вдоль отрезка
+    direction = 1
+    left = run
+    guard = 0
+    while left > 1e-9 and guard < 200:
+        guard += 1
+        room = (seg - pos) if direction > 0 else pos
+        if room < 1e-9:
+            direction = -direction
+            continue
+        step = min(left, room)
+        pos += step * direction
+        z = max(target, z - step * _m.tan(_m.radians(angle_deg)))
+        pts.append((x0 + ux * pos, y0 + uy * pos, z))
+        left -= step
+        direction = -direction
+    if not pts:
+        return None
+    if abs(pts[-1][0] - x0) > 1e-9 or abs(pts[-1][1] - y0) > 1e-9:
+        pts.append((x0, y0, target))                 # вернуться в точку входа
+    else:
+        pts[-1] = (x0, y0, target)
+    return pts
+
+
+def optimize_links(gcode, stock_map, vert_feed, clearance=1.0, air_cuts=False,
+                   ramp_angle=0.0, horiz_feed=None):
+    """Подвод и врезание по модели снятого материала.
+
+    Замечание ОЭЦМ: «лишние перемещения и опасные вертикальные врезания». У нас
+    это одно место — длинный отвесный спуск на рабочей подаче от верха габарита
+    заготовки (Path Surface начинает проход именно оттуда). Каждый такой спуск
+    делится на две части:
+
+      * холостую — до «верх материала + зазор»; где материала на вертикали нет
+        вовсе, весь спуск становится холостым;
+      * рабочую — остаток. При ramp_angle > 0 она идёт РАМПОЙ вдоль будущего
+        реза, иначе отвесно, но на ВЕРТИКАЛЬНОЙ подаче (Path Surface ставит там
+        горизонтальную — это и есть опасное врезание из отчёта).
+
+    air_cuts=True переводит в холостой ход ещё и ГОРИЗОНТАЛЬНЫЕ рабочие ходы
+    заведомо выше материала. Отдельным флагом: ошибка здесь стоит дороже —
+    лишний спуск по воздуху безвреден, а пропущенный рез оставит металл.
+    """
+    import re as _re
+    blocks = _parse_blocks(gcode)
+    out = []
+    n_cut = n_all = n_air = n_ramp = 0
+    saved = 0.0
+
+    def head_of(code):
+        h = _re.sub(r"\s*Z-?[\d.]+", "", code.split("F")[0]).strip()
+        return _re.sub(r"^G0*[123]\b", "", h).strip()
+
+    def next_cut_end(i):
+        """Конец ближайшего прямого рабочего хода после кадра i."""
+        for b in blocks[i + 1:i + 4]:
+            if b["mode"] == 1 and b.get("p0") is not None:
+                p0, p1 = b["p0"], b["p1"]
+                if abs(p1[0] - p0[0]) > 1e-6 or abs(p1[1] - p0[1]) > 1e-6:
+                    return p1
+                continue
+            if b["mode"] in (0, 2, 3):
+                return None
+        return None
+
+    for i, b in enumerate(blocks):
+        if b["mode"] is None or b.get("p0") is None:
+            out.append(b["raw"])
+            continue
+        x, y, z = b["p0"]
+        nx_, ny_, nz_ = b["p1"]
+        if b["mode"] == 0:                           # холостой материал не трогает
+            out.append(b["raw"])
+            continue
+
+        code = b["raw"].split("(")[0].strip()
+        head = head_of(code)
+        feed = b.get("feed") or vert_feed
+        vertical = (abs(nx_ - x) < 1e-6 and abs(ny_ - y) < 1e-6 and nz_ < z - 1e-6)
+
+        if vertical:
+            zt = stock_map.top(x, y)
+            z_safe = min(z, zt + clearance)
+            # Спуск целиком по воздуху — и когда материала на вертикали нет
+            # вовсе, и когда фреза не доходит до его верха (зазор ещё не
+            # выбран): врезания тут нет, рампа не нужна.
+            if z_safe <= nz_ + 1e-3 or nz_ >= zt - 1e-3:
+                out.append(_join("G0", head, nz_, None))
+                n_all += 1
+                saved += z - nz_
+            else:
+                if z_safe < z - 1e-3:
+                    out.append(_join("G0", head, z_safe, None))
+                    n_cut += 1
+                    saved += z - z_safe
+                pts = (_ramp((x, y, z_safe), nz_, next_cut_end(i), ramp_angle,
+                             feed) if ramp_angle > 0 else None)
+                if pts:
+                    fr = horiz_feed or feed
+                    for px, py, pz in pts:
+                        out.append("G1 X%.3f Y%.3f Z%.3f F%.3f\n"
+                                   % (px, py, pz, fr))
+                    n_ramp += 1
+                else:
+                    out.append(_join("G1", head, nz_, vert_feed))
+        elif air_cuts and b["mode"] == 1 and min(z, nz_) > clearance + max(
+                stock_map.top(x, y), stock_map.top(nx_, ny_),
+                stock_map.top((x + nx_) / 2.0, (y + ny_) / 2.0)):
+            out.append(_join("G0", head, nz_, None))  # рабочий ход по воздуху
+            n_air += 1
+        else:
+            out.append(b["raw"])
+
+        stock_map.cut(x, y, nx_, ny_, min(z, nz_))
+
+    if n_cut or n_all or n_air or n_ramp:
+        log(f"подвод: {n_all} спусков целиком по воздуху, {n_cut} укорочено, "
+            f"{n_ramp} врезаний рампой"
+            + (f", {n_air} холостых резов" if n_air else "")
+            + f"; снято с рабочей подачи {saved:.0f} мм")
+    return "".join(out)
+
+
+def _join(g, head, z, feed):
+    s = f"{g} {head} Z{z:.3f}" if head else f"{g} Z{z:.3f}"
+    if feed is not None:
+        s += f" F{feed:.3f}"
+    return s + "\n"
+
+
+
 def mill(doc, feat, p, stock_solid=None):
     """Последовательная обработка: черновая по этапам (отверстия → грани →
     периметр). → текст G-Code.
@@ -1432,6 +1798,21 @@ def mill(doc, feat, p, stock_solid=None):
                  for t in ([tc] + list(used.values()))}
     body = export_gcode(job, ops, p["postprocessor"])
     body = insert_tool_passports(body, tools_map, p.get("tool_catalog"))
+    if p.get("safe_start_order", True):
+        body = reorder_first_positioning(body)
+    if p.get("air_plunge_rapid", True):
+        try:
+            sh = job.Stock.Shape
+            verts, tris = sh.tessellate(0.2)
+            smap = StockMap(verts, tris, sh.BoundBox, tool_d / 2.0)
+            body = optimize_links(
+                body, smap, float(feed) / 4.0,
+                float(p.get("air_plunge_clearance", 1.0)),
+                air_cuts=bool(p.get("air_cuts_rapid", False)),
+                ramp_angle=float(p.get("ramp_angle", 0.0)),
+                horiz_feed=float(feed))
+        except Exception as e:   # без модели программа валидна, просто длиннее
+            log(f"warn: подвод не оптимизирован ({e})")
     return p["_gcode_header"] + body
 
 
