@@ -152,7 +152,30 @@ DIAMETER (its helix entry needs ~2 Ø, growing by the radius returns an empty pa
 003 with the factory's own feed (F2000, read out of `PR_1_01…06`): 22 427 → 8 672 mm
 of cutting, ISV 00:31:01 → 00:05:33, diff still 0/0; factory is 4 891 mm / 00:03:30.
 
-CRITICAL Adaptive gotcha: regions must be explicit planar faces. Passing model faces
+Before the contour runs, the band it will sweep is CLEARED as its own stage
+(`CLEAR_CONTOUR_BAND`, `RoughClear<N>`, right after the bulk stage) — the customer
+does the same with `NK_1_02/03` and profiles into empty air. The contour cuts at
+shelf level while the tool BODY reaches 20 mm up, so stock standing in its swath gets
+ploughed by the flank at full height on a feed chosen for a 1 mm layer, and the diff
+cannot see it (it measures the part body; what is ploughed is leftover stock). The
+zone is derived, not hardcoded: the contour tool's swath (`contour_band`: a ring from
+0 to 2R+allowance around the filled silhouette) is intersected with the STOCK section
+above the contour's start depth — whatever stands there is cut down in ROUGH_STEPDOWN
+(or `CLEAR_STEPDOWN`) layers; where nothing stands, no operation is created at all.
+The toolpath is the CONTOUR PATH itself, trimmed to those patches: running a narrow
+patch along its median line (as RoughBulk does) would drive a 12 mm cutter 5 mm into
+the part, because on 003 that median sits 1.2 mm from the wall's end face. TWO lines
+are emitted (offsets R and R+allowance) because the swath is wider than the tool by
+exactly the allowance — one pass leaves a ring either against the part or outside it;
+the customer's `NK_1_02`/`NK_1_02_COPY` are 0.5 mm apart for the same reason. On 003:
+00:04:21 with a hidden 14.5 mm flank cut -> 00:05:31 with none (CLEAR_STEPDOWN 3),
+diff 0/0 either way; the customer spends 626 mm and 0.91 min on the same job. GOTCHA
+fixed alongside: `ClearanceHeight`/`SafeHeight` are bound by EXPRESSION to the
+SetupSheet, so plain assignment silently does nothing — an op working within 19 mm of
+height was retracting 47 mm up and back on EVERY level. `make_engrave_sweep` now
+clears the expression first; the other op builders were left alone on purpose, since
+their start_z can sit below neighbouring standing stock. CRITICAL Adaptive gotcha:
+regions must be explicit planar faces. Passing model faces
 as `Base` yields open projected contours on real parts (`Path.Area: ccurve not closed`)
 and Adaptive silently returns an empty path. Adaptive also needs ~2 tool diameters of
 material width for its helix entry — narrow perimeter slivers (e.g. corner rounds at
