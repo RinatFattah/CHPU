@@ -135,6 +135,7 @@ def generate_gcode_freecad(model_path: str, gcode_path: str) -> int:
         "clear_tall_band": float(getattr(config, "CLEAR_TALL_BAND", 10.0)),
         "clear_stepdown_shallow": float(getattr(config, "CLEAR_STEPDOWN_SHALLOW", 1.5)),
         "clear_straight": bool(getattr(config, "CLEAR_STRAIGHT", True)),
+        "drop_null_moves": bool(getattr(config, "DROP_NULL_MOVES", True)),
         "rough_mode": config.ROUGH_MODE,
         "rough_allowance": config.ROUGH_ALLOWANCE,
         "rough_allowance_mode": config.ROUGH_ALLOWANCE_MODE,

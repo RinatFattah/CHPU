@@ -323,17 +323,22 @@ def align_stock(stock, part_bb):
 def normalize_origin(solid, mode, journal=None):
     """Сдвигает модель к нулю программы. Детали из NX часто экспортированы в координатах
     сборки/станка (геометрия за метры от нуля) — без сдвига первый же G0 уводит фрезу туда.
-      corner-top — X0 Y0 = мин. угол габарита, Z0 = верхняя плоскость (стандарт ЧПУ);
-      center-top — X0 Y0 = центр детали, Z0 = верх;
-      model      — не сдвигать (ноль = ноль CAD-файла)."""
+      corner-bottom — X0 Y0 = мин. угол габарита, Z0 = НИЖНЯЯ плоскость (ноль заказчика);
+      center-bottom — X0 Y0 = центр детали, Z0 = низ;
+      corner-top    — то же, но Z0 = верх детали;
+      center-top    — X0 Y0 = центр детали, Z0 = верх;
+      model         — не сдвигать (ноль = ноль CAD-файла).
+
+    XY и Z выбираются независимо: приставка до дефиса задаёт привязку в плане,
+    после — по высоте."""
     if mode == "model":
         return solid
     bb = solid.BoundBox
-    if mode == "center-top":
+    if mode.startswith("center"):
         dx, dy = -(bb.XMin + bb.XMax) / 2.0, -(bb.YMin + bb.YMax) / 2.0
-    else:  # corner-top
+    else:  # corner-*
         dx, dy = -bb.XMin, -bb.YMin
-    dz = -bb.ZMax
+    dz = -bb.ZMin if mode.endswith("-bottom") else -bb.ZMax
     if max(abs(dx), abs(dy), abs(dz)) > 1e-9:
         solid.translate(FreeCAD.Vector(dx, dy, dz))
         if journal is not None:
@@ -1956,10 +1961,17 @@ def reorder_first_positioning(gcode):
     (`PR_1_01`: `L X0 Y-28. FMAX` → `L Z44. FMAX`).
 
     Меняем местами ровно эту пару и только там, где спуск заведомо безопасен
-    менять — в НАЧАЛЕ ПРОГРАММЫ и сразу после смены инструмента: там фреза
-    стоит в точке смены, то есть в верхней точке хода по Z, и поперечное
-    перемещение на этой высоте ничего не задевает. Внутри операции порядок уже
-    правильный (отвод на плоскость безопасности, потом XY) — туда не лезем.
+    менять — в начале программы, сразу после смены инструмента и НА СТЫКЕ
+    ОПЕРАЦИЙ. Общее у трёх случаев одно: фреза стоит выше, чем поедет поперёк,
+    поэтому перестановка переносит поперечный ход на БОЛЬШУЮ высоту, то есть
+    строго в безопасную сторону. Внутри операции порядок уже правильный (отвод
+    на плоскость безопасности, потом XY) — туда не лезем.
+
+    Стык операций добавлен 25.08.2026: там же нашлось и то, что раньше пряталось
+    за повтором. `RoughClear` открывалась парой одинаковых `G0 Z…`, и второй
+    кадр — «ход по Z без движения» — сбивал признак пары. Как только повторы
+    стали выбрасываться (`drop_null_moves`), спуск с 55 до 31.5 с последующим
+    поперечным ходом на 66.8 мм проявился в приёмке.
     """
     import re as _re
     lines = gcode.splitlines(True)
@@ -1967,6 +1979,8 @@ def reorder_first_positioning(gcode):
     armed = True                    # начало программы = та же ситуация
     pend = []                       # отложенные «G0 только по Z», подряд
     nswap = 0
+    cur_z = None                    # где фреза сейчас
+    z_before = None                 # высота перед серией «только по Z»
 
     def _axes(code):
         return {a: float(v) for a, v in _re.findall(r"\b([XYZ])(-?[\d.]+)", code)}
@@ -1974,7 +1988,8 @@ def reorder_first_positioning(gcode):
     for line in lines:
         code = line.split("(")[0].strip()
         if not code:                                   # комментарий
-            if _re.search(r"\(\s*M0?6\s+T\d+\s*\)", line):
+            if (_re.search(r"\(\s*M0?6\s+T\d+\s*\)", line)
+                    or "Begin operation" in line):
                 out.extend(q[0] for q in pend)         # не потерять отложенное
                 armed, pend = True, []
             out.append(line)
@@ -1983,6 +1998,9 @@ def reorder_first_positioning(gcode):
             out.extend(q[0] for q in pend)             # пара не сложилась
             pend = []
             armed = armed and not _re.search(r"\b[XYZ]-?[\d.]", code)
+            zz = _axes(code).get("Z")
+            if zz is not None:
+                cur_z = zz
             out.append(line)
             continue
 
@@ -1992,17 +2010,27 @@ def reorder_first_positioning(gcode):
             # подъём на плоскость безопасности дважды. Копим их все, схлопывая
             # повтор одной и той же высоты, — иначе перестановка на такую пару
             # не срабатывает и «сначала Z, потом XY» остаётся в программе.
+            if not pend:
+                z_before = cur_z
             if not pend or abs(pend[-1][1] - ax["Z"]) > 1e-6:
                 pend.append((line, ax["Z"]))
+            cur_z = ax["Z"]
             continue
         if not pend:
             armed = False
+            if ax.get("Z") is not None:
+                cur_z = ax["Z"]
             out.append(line)
             continue
 
-        # ждали пару: G0 в XY на той же высоте, что и последний спуск
+        # ждали пару: G0 в XY на той же высоте, что и последний спуск. И только
+        # если серия «только по Z» — СПУСК: тогда поперечный ход переезжает
+        # наверх. Был бы это подъём, перестановка увезла бы его вниз, в металл.
+        # z_before = None бывает в начале программы: там фреза в точке смены
+        # инструмента, то есть заведомо наверху, и условие не нужно.
         if ({"X", "Y"} <= set(ax)
-                and abs(ax.get("Z", pend[-1][1]) - pend[-1][1]) < 1e-6):
+                and abs(ax.get("Z", pend[-1][1]) - pend[-1][1]) < 1e-6
+                and (z_before is None or pend[-1][1] < z_before - 1e-6)):
             # XY идёт первым и БЕЗ Z — фреза едет поперёк на той высоте, где
             # стоит (точка смены инструмента), и только потом опускается.
             out.append(_re.sub(r"\s*Z-?[\d.]+", "", code) + "\n")
@@ -2011,7 +2039,9 @@ def reorder_first_positioning(gcode):
         else:
             out.extend(q[0] for q in pend)
             out.append(line)
-        pend, armed = [], False
+        if ax.get("Z") is not None:
+            cur_z = ax["Z"]
+        pend, armed, z_before = [], False, None
 
     out.extend(q[0] for q in pend)
     if nswap:
@@ -2270,6 +2300,40 @@ def _ramp(entry, target, track, angle_deg, min_len=0.5):
         leg(pts, pos, 0.0, target, target)
     pts[-1] = (x0, y0, target)
     return pts
+
+
+def drop_null_moves(gcode):
+    """Выбрасывает движения В НИКУДА: цель кадра совпадает с текущей точкой.
+
+    Замечание ОЭЦМ «повторяющийся код (увеличение времени)» — на их скриншоте
+    обведены подряд идущие ОДИНАКОВЫЕ строки `G0`. Берутся они со стыков: каждая
+    операция FreeCAD начинается отводом на плоскость безопасности и им же
+    заканчивается, а `Path.Op.Engrave` печатает отвод дважды и внутри одной
+    операции. Стойка отрабатывает такой кадр как паузу — метров не добавляет, но
+    время ест и читается как ошибка расчёта.
+
+    Считаем не «строка равна предыдущей», а «кадр никуда не ведёт»: так же
+    ловятся `G0 X10 Y20` следом за `G0 X10 Y20 Z5` (Z уже там) и повтор через
+    комментарий между строками.
+
+    Трогаются только G0/G1: у полной окружности G2/G3 начало совпадает с концом,
+    и она не пустая. Кадр со сменой подачи сохраняется — на случай постпроцессора,
+    который печатает F не в каждой строке.
+    """
+    out, dropped, last_feed = [], 0, None
+    for b in _parse_blocks(gcode):
+        if (b["mode"] in (0, 1) and b["p0"] is not None
+                and max(abs(a - c) for a, c in zip(b["p0"], b["p1"])) < 1e-6
+                and (b["mode"] == 0 or b["feed"] == last_feed)
+                and "(" not in b["raw"]):
+            dropped += 1
+            continue
+        if b["mode"] is not None:
+            last_feed = b["feed"]
+        out.append(b["raw"])
+    if dropped:
+        log(f"выброшено кадров без движения: {dropped}")
+    return "".join(out)
 
 
 def optimize_links(gcode, stock_map, vert_feed, clearance=1.0, air_cuts=False,
@@ -2656,6 +2720,11 @@ def mill(doc, feat, p, stock_solid=None):
                 stepdown=float(p.get("rough_stepdown", 1.0)))
         except Exception as e:   # без модели программа валидна, просто длиннее
             log(f"warn: подвод не оптимизирован ({e})")
+    # ПОСЛЕДНИМ: предыдущие пассы сами переставляют и вставляют кадры, и часть
+    # повторов появляется именно от них (перестановка XY→Z схлопывает пару ходов
+    # в один, а второй остаётся пустым).
+    if p.get("drop_null_moves", True):
+        body = drop_null_moves(body)
     return p["_gcode_header"] + body
 
 

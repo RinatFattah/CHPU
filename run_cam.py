@@ -53,6 +53,38 @@ def convert_prt(path: str, what: str) -> str:
     return step
 
 
+def emit_heidenhain(gcode: str) -> str:
+    """G-код → диалог Heidenhain рядом, <out>.h. Возвращает путь.
+
+    Стойка заказчика — iTNC 530 на DMC 635V, диалект снят с их же программ
+    (`nx/grbl_to_heidenhain.py`). Перевод идёт БЕЗ сдвига по Z, когда ноль уже
+    внизу: `z_datum` у переводчика означает «где ноль ДОЛЖЕН оказаться», поэтому
+    при ORIGIN = *-bottom мы просим «top», то есть «оставить как есть», а при
+    ORIGIN = *-top — «bottom», и он сам сдвигает на высоту детали из шапки.
+    Так .gcode и .h всегда выходят в ОДНОЙ системе координат.
+    """
+    import re
+    from nx import grbl_to_heidenhain as gh
+
+    origin = str(getattr(config, "ORIGIN", "corner-bottom"))
+    z_datum = "bottom" if origin.endswith("-top") else "top"
+    dst = os.path.splitext(gcode)[0] + ".h"
+    # Имя программы у стойки — идентификатор, а не путь: буквы, цифры, подчёркивание.
+    name = (getattr(config, "HEIDENHAIN_NAME", "") or
+            re.sub(r"\W", "_", os.path.splitext(os.path.basename(dst))[0])[:16])
+
+    with open(gcode, encoding="utf-8", errors="replace") as f:
+        src = f.read().splitlines()
+    body, warn = gh.convert(src, name, float(getattr(config, "HEIDENHAIN_TOL", 0.01)),
+                            z_datum)
+    with open(dst, "w", encoding="utf-8", newline="\r\n") as f:
+        for i, ln in enumerate(body, 1):
+            f.write(f"{i} {ln}\n")
+    for w in dict.fromkeys(warn):
+        print(f"   ⚠  {w}")
+    return f"{dst}  ({len(body)} блоков, программа {name})"
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="CAD-модель (.step/.iges/.stl) → G-Code через FreeCAD CAM (3D по поверхности)",
@@ -64,9 +96,12 @@ def main():
     ap.add_argument("--mm", action="store_true", help="меш в миллиметрах (scale=1.0)")
     ap.add_argument("--meters", action="store_true", help="меш в метрах (scale=1000)")
     ap.add_argument("--scale", type=float, help="произвольный множитель меша → мм")
-    ap.add_argument("--origin", choices=["corner-top", "center-top", "model"],
-                    help="ноль программы: corner-top = угол детали + верх (дефолт), "
-                         "center-top = центр + верх, model = как в CAD-файле")
+    ap.add_argument("--origin", choices=["corner-bottom", "center-bottom",
+                                         "corner-top", "center-top", "model"],
+                    help="ноль программы: corner-bottom = угол детали + НИЗ (дефолт, "
+                         "ноль заказчика), center-bottom = центр + низ, "
+                         "corner-top / center-top = то же с нулём по верху, "
+                         "model = как в CAD-файле")
     ap.add_argument("--rough", type=float, metavar="MM",
                     help="величина припуска, мм (0 = без черновой; дефолт из конфига)")
     ap.add_argument("--allowance-xy", action="store_true",
@@ -101,6 +136,11 @@ def main():
                     help="доп. сохранить деталь и заготовку в STEP в системе координат "
                          "G-кода (для ручной симуляции в NX): рядом лягут "
                          "<out>_part.step / _stock.step")
+    ap.add_argument("--no-heidenhain", action="store_true",
+                    help="не переводить программу в диалог Heidenhain (.h); по "
+                         "умолчанию рядом с G-кодом кладётся <out>.h для iTNC 530")
+    ap.add_argument("--h-name", metavar="ИМЯ",
+                    help="имя программы у стойки в .h (дефолт — из имени файла)")
     args = ap.parse_args()
 
     if args.config:
@@ -114,6 +154,10 @@ def main():
         config.STL_SCALE_TO_MM = args.scale
     if args.origin:
         config.ORIGIN = args.origin
+    if args.no_heidenhain:
+        config.EMIT_HEIDENHAIN = False
+    if args.h_name:
+        config.HEIDENHAIN_NAME = args.h_name
     if args.rough is not None:
         config.ROUGH_ALLOWANCE = args.rough
     if args.allowance_xy:
@@ -192,6 +236,12 @@ def main():
         sys.exit(1)
 
     print(f"✅ Готово: {n} строк → {gcode}  ({os.path.getsize(gcode):,} байт)")
+
+    if getattr(config, "EMIT_HEIDENHAIN", True):
+        try:
+            print(f"   → диалог Heidenhain: {emit_heidenhain(gcode)}")
+        except Exception as e:      # G-код при этом валиден, перевод — довесок
+            print(f"⚠  Перевод в Heidenhain не удался: {e}")
 
     if config.SIMULATE:
         print("Симуляция на виртуальном станке NX (ISV) — на время прогона "
