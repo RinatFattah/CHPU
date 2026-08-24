@@ -298,6 +298,9 @@ def simulate_program(program_path: str, stock_step_path: str, out_stem: str,
         "log_path": log_path,
         # журналу — запас на ожидание конца прогона (сек), меньше общего таймаута
         "sim_timeout": max(60, getattr(config, "NX_SIM_TIMEOUT", 1800) - 300),
+        # след кончика фрезы, раскрашенный по типу движения (как в Vericut)
+        "tool_trace": bool(getattr(config, "NX_SIM_TOOL_TRACE", True)),
+        "tool_trace_size": int(getattr(config, "NX_SIM_TOOL_TRACE_SIZE", 2)),
     }
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
                                      encoding="utf-8") as tmp:

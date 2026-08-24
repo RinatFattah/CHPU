@@ -242,8 +242,26 @@ def main():
         log(f"warn: EnableIpw: {e}")
     # КЛЮЧЕВОЕ: ISV сам сохранит вырезанный IPW отдельным .prt в конце прогона
     so.SaveAsPartfile = True
+    # СЛЕД ИНСТРУМЕНТА — линия, которую кончик фрезы рисует по ходу прогона
+    # (в Vericut это то же самое: видны спираль врезания, дуги, прямые).
+    # Раскраска ПО ТИПУ ДВИЖЕНИЯ: холостой ход, рабочий, дуга — разными цветами,
+    # то есть по следу сразу видно, где программа идёт по воздуху, а где режет.
+    # Это НЕ «траектория» (SetShowToolPath) — та берётся из операций CAM, а у
+    # внешней программы операций нет, показывать ей нечего.
+    if p.get("tool_trace", True):
+        try:
+            so.ToolTraceModeValue = (
+                NXOpen.CAM.SimulationOptionsBuilderToolTraceMode.MotionType)
+            so.ToolTraceSize = int(p.get("tool_trace_size", 2))
+        except Exception as e:
+            log(f"warn: настройки следа инструмента: {e}")
     so.Commit()
     cpb.ApplySimulationOptions()
+    if p.get("tool_trace", True):
+        try:
+            cpb.SetShowToolTrace(True)      # NX2206+, лицензия ug_isv_full
+        except Exception as e:
+            log(f"warn: след инструмента не включился: {e}")
     cpb.SetSpeed(10)
 
     import time
