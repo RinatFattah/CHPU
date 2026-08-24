@@ -32,7 +32,19 @@ OffsetExtra, floors via FinalDepth — EXCEPT through-holes (RoughHole) and the 
 contour (RoughPerimeter),
 cut to the PART bottom (bb.ZMin, no floor allowance): a through-hole has no floor to
 finish and the perimeter must part the piece from the frame, so leaving allowance there
-strands a skin at the bottom. Down/side-facing or covered faces are skipped (warned, second setup);
+strands a skin at the bottom. A face whose surface is ALREADY formed in the stock
+(bend radius of a folded sheet, cast/forged surfaces) gets no operation at all
+(`SKIP_FORMED_FACES`, `formed_allowance`): the old "is there anything to remove" test
+compared the top of stock over the zone with the BOTTOM OF THE FACE'S BBOX, which is
+exact for a plane but always counts a curved face's own height as allowance.
+Allowance is now sampled ON THE SURFACE — the face is tessellated and each point
+probed for stock above it (a point counts only if it is outside the part and inside
+the stock; above `_bulk_floor` it was already taken by the bulk stage). On all 12
+customer milling parts exactly one face is skipped (the bend fillet, 0.00 mm) while
+every kept face has >= 1.00 mm, so `FORMED_FACE_TOL` (0.05) sits in an empty gap. On
+003 this drops RoughSlope3+FinishSlope3: 7 761 -> 6 424 mm of cutting, ISV 00:05:14
+-> 00:04:21, diff unchanged at 0/0. Down/side-facing or covered faces are skipped
+(warned, second setup);
 material unreachable from above (overhangs) is skipped —
 that's a second setup, not something to cut through. Silhouette sections MUST be
 built with `Part.makeFace(wires, "Part::FaceMakerBullseye")` — making a Face per
@@ -69,7 +81,8 @@ left (the diff reports them as undercut) — add diameters to get the old behavi
 `SET_OP_TOOLS` / the LLM `set_op_tool` action override per op and their diameters
 are ADDED to the set — `choose_tc` snaps an override to the nearest AVAILABLE
 diameter, so without that merge a one-element set would silently swallow every
-override, and set_op_tool is the first rung of the auto_fix remedy ladder. FreeCAD BUG: `Op.Create` throws `cannot access local variable 'tc'` when
+override, and set_op_tool is the first rung of the auto_fix remedy ladder. FreeCAD
+BUG: `Op.Create` throws `cannot access local variable 'tc'` when
 `job.Tools.Group` has >1 controller — so extra TCs are created OUTSIDE the group
 (op.ToolController still assignable/computable), and added to job.Tools only AFTER
 all ops exist, then renumbered T2.. Unused pool TCs are removed. grbl post writes
@@ -109,7 +122,17 @@ material + a ramp entry zig-zagging along the very cut the tool is about to make
 (arcs are followed by a fine polyline — a chord across a 2 mm arc is 0.18 mm, and on
 an OUTSIDE profile that is inside the part). `AIR_CUTS_RAPID` also converts
 horizontal cuts above material into rapids: −5.5 min on part 003 but it recreates
-the "down in Z, then sideways" pattern, so it is OFF by default. `cam/gcode_stats.py`
+the "down in Z, then sideways" pattern, so it is OFF by default. `optimize_links`
+also runs a SIDE-CUT detector over the same StockMap: a feed move whose footprint
+still holds material well above the move's floor (> 3x stepdown) means the tool is
+cutting with its FLANK to that depth, which the diff cannot see (it measures the part
+body, and what is being ploughed is leftover stock). On 003 it fires in both variants
+— `FinishSlope3` (13.5 mm) before the formed-face fix, `RoughPerimeter` (14.5 mm)
+after: the blank's standing leg is 80 mm long against the part's 40, and no operation
+clears the 20 mm stub at each end. The customer has dedicated ops for exactly that
+(`NK_1_02/03`, 626 mm); we do not. Probe points on ARCS use the true arc midpoint,
+not the chord midpoint — the latter lies inside the arc and false-fires on every
+contour corner. `cam/gcode_stats.py`
 prints the acceptance numbers — programs cannot be compared line by line because
 `Path.Op.Adaptive` varies 0.7 % of cutting length between runs of identical code.
 
@@ -151,7 +174,8 @@ FreeCAD host modules and workers in `cam/`; everything Siemens NX in `nx/`
 In-package modules bootstrap repo root onto sys.path, so both `python run_cam.py`
 and direct runs like `python cam/step_diff.py a.step b.stp` work.
 
-- `run_cam.py` - CLI entry point: `python run_cam.py model.step|model.prt [out.gcode] [--config config.yaml]`
+- `run_cam.py` - CLI entry point: `python run_cam.py model.step|model.prt [out.gcode]
+[--config config.yaml]`
 - `auto_fix.py` - autonomous LLM loop: generate → NX-simulate → boolean diff
   (`cam/step_diff.py` + `cam/freecad_diff_worker.py`) → ask an LLM → parse STRICT-JSON
   actions (set_param whitelist with bounds; extra_zone = forced clearing rect for
