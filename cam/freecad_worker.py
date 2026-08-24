@@ -691,7 +691,8 @@ def median_line(face, tool_d):
     return Part.Wire([Part.makeLine(a, b)])
 
 
-def make_engrave_sweep(doc, job, tc, name, wire, p, start_z, final_z):
+def make_engrave_sweep(doc, job, tc, name, wire, p, start_z, final_z,
+                       note="проход по средней линии"):
     """Проход ПО ЛИНИИ, слоями StepDown: ось фрезы идёт по самой линии.
 
     Path Engrave — единственная операция FreeCAD, которая не смещает фрезу от
@@ -713,12 +714,23 @@ def make_engrave_sweep(doc, job, tc, name, wire, p, start_z, final_z):
     op.StartDepth = start_z
     op.setExpression("FinalDepth", None)
     op.FinalDepth = final_z
-    op.ClearanceHeight.Value = start_z + p["safe_height"]
-    op.SafeHeight.Value = start_z + 3.0
+    # Высоты отвода привязаны ВЫРАЖЕНИЕМ к SetupSheet (верх ЗАГОТОВКИ), и без
+    # сброса выражения присваивание молча не действует. Для стадии съёма объёма
+    # это незаметно — она и стартует с верха заготовки; а очистка полосы под
+    # обвод работает внизу, и отвод уносил фрезу на 47 мм вверх и обратно на
+    # КАЖДОМ уровне: 1 064 мм холостого хода на операцию. Обе стадии стартуют с
+    # верха ОСТАВШЕГОСЯ материала, выше него ничего нет — отводиться туда и надо.
+    for prop, val in (("ClearanceHeight", start_z + p["safe_height"]),
+                      ("SafeHeight", start_z + 3.0)):
+        try:
+            op.setExpression(prop, None)
+        except Exception:
+            pass
+        set_prop(op, prop, val)
     doc.recompute()
 
     n = len(op.Path.Commands) if op.Path else 0
-    log(f"{name}: {n} команд (проход по средней линии)")
+    log(f"{name}: {n} команд ({note})")
     if n > 2:
         return op
     try:
@@ -727,6 +739,129 @@ def make_engrave_sweep(doc, job, tc, name, wire, p, start_z, final_z):
     except Exception:
         pass
     return None
+
+
+def contour_band(filled, dia, alw_xy):
+    """След обводной фрезы вокруг детали: (пути центра фрезы, полоса под ней).
+
+    Обвод (`make_profile`, Side=Outside) ведёт центр фрезы по силуэту детали,
+    отжатому на радиус + припуск; чистовой обвод — по тому же силуэту без
+    припуска. Вместе они заметают кольцо от нуля до 2R + припуск — это и есть
+    полоса, в которой к моменту обвода не должно стоять ничего.
+
+    Полоса ШИРЕ фрезы ровно на припуск, поэтому одним проходом её не закрыть:
+    пройди по чистовой линии — останется припуск снаружи, по черновой —
+    останется он же изнутри, вплотную к детали. Отсюда ДВА пути, как у завода:
+    `NK_1_02` и `NK_1_02_COPY` идут в 0.5 мм друг от друга и вместе прорезают
+    полосу шириной ровно 2R + припуск.
+    """
+    r = dia / 2.0
+    offs = [r] + ([r + alw_xy] if alw_xy > 1e-6 else [])
+    band = filled.makeOffset2D(2.0 * r + alw_xy).cut(filled)
+    return offs, band
+
+
+def make_clearance_ops(doc, job, shape, p, filled, peri_top, alw_xy, choose):
+    """Очистка полосы, по которой ПОТОМ пойдёт обвод контура.
+
+    Обвод режет на уровне полки, а тело фрезы поднимается на всю длину режущей
+    части. Стоит в её следе заготовка — фреза снимет её БОКОМ, на всю высоту, за
+    один проход и на подаче, выбранной под съём слоя. Сверка этого не покажет:
+    она меряет тело детали, а срезается остаток заготовки.
+
+    Завод снимает эту полосу ЗАРАНЕЕ, отдельными операциями (`NK_1_02/03` у
+    003 — прямые ходы поперёк стенки по уровням), и обводит контур уже по
+    пустому. Здесь то же самое, но зона не задаётся руками:
+
+      * след обводной фрезы считается из её же геометрии (`contour_band`);
+      * пересекается с сечением ЗАГОТОВКИ выше старта обвода — что там стоит,
+        то и снимаем; где не стоит ничего, операция не создаётся вовсе;
+      * снимается уровнями по ROUGH_STEPDOWN.
+
+    Путь — САМ путь обводной фрезы, обрезанный участками, где материал стоит.
+    Вести узкую площадку по её средней линии (как делает RoughBulk) здесь
+    НЕЛЬЗЯ: у торца стенки 003 средняя линия проходит в 1.2 мм от детали, и
+    фреза Ø12 вошла бы в неё на пять миллиметров. Путь обвода по построению
+    держит от детали радиус + припуск.
+
+    Ставится сразу после съёма объёма: там верх материала известен точно (пол
+    той стадии), и ни один уровень не режет воздух.
+    """
+    step = float(p.get("clear_stepdown") or p["rough_stepdown"])
+    z_top = p.get("_bulk_floor")
+    if z_top is None:
+        z_top = job.Stock.Shape.BoundBox.ZMax
+    if z_top - peri_top < step * 0.5:
+        return []
+
+    tcx, dia = choose("RoughClear1", None)
+    try:
+        offs, band = contour_band(filled, dia, alw_xy)
+    except Exception as e:
+        log(f"warn: полоса обвода не построена ({e}) — очистка пропущена")
+        return []
+
+    # Сечения заготовки по высоте диапазона — объединением, как в make_bulk_ops:
+    # заготовка не обязана быть призмой, а объединение ошибается в сторону
+    # лишнего холостого хода, а не пропущенного материала.
+    n = max(2, min(8, int((z_top - peri_top) / step) + 1))
+    sec = None
+    for i in range(n):
+        z = peri_top + 0.05 + (z_top - 0.1 - peri_top) * i / (n - 1)
+        for fc in _slice_faces(job.Stock.Shape, z):
+            sec = fc if sec is None else sec.fuse(fc)
+    if sec is None:
+        return []
+    try:
+        stand = sec.common(band).removeSplitter()
+    except Exception as e:
+        log(f"warn: остаток в полосе обвода не посчитан ({e})")
+        return []
+    faces = [f for f in stand.Faces if f.Area > 1.0]
+    if not faces:
+        log("полоса под обвод контура чиста — очистка не нужна")
+        return []
+
+    # куда должна встать фреза, чтобы это снять
+    r = dia / 2.0
+    reach = None
+    for f in faces:
+        try:
+            g = f.makeOffset2D(r)
+        except Exception:
+            g = f
+        reach = g if reach is None else reach.fuse(g)
+
+    ops, total, n = [], 0.0, 0
+    for off in offs:
+        try:
+            path = filled.makeOffset2D(off).OuterWire
+            edges = [e for e in path.common(reach).Edges if e.Length > 0.5]
+        except Exception as e:
+            log(f"warn: участки пути не выделены ({e}) — очистка неполная")
+            break
+        for chain in Part.sortEdges(edges):
+            try:
+                wire = Part.Wire(chain)
+            except Exception:
+                continue
+            n += 1
+            name = f"RoughClear{n}"
+            op = make_engrave_sweep(doc, job, tcx, name, wire,
+                                    dict(p, rough_stepdown=step),
+                                    z_top, peri_top,
+                                    note="очистка полосы под обвод контура")
+            if op:
+                ops.append(op)
+                total += wire.Length
+            else:
+                log(f"{name}: пустая траектория — участок не очищен")
+    if ops:
+        log(f"очистка полосы под обвод: {len(faces)} участков "
+            f"({sum(f.Area for f in faces):.0f} мм² в плане), {len(offs)} линии "
+            f"обвода, путь {total:.0f} мм на уровень, "
+            f"Z {z_top:.1f}..{peri_top:.1f}, слой {step:g} мм")
+    return ops
 
 
 def make_bulk_ops(doc, job, tc, shape, p, alw_xy, alw_z, choose):
@@ -1069,6 +1204,32 @@ def make_roughing_ops(doc, job, tc, shape, p):
         else:
             log(f"{name}: пустая траектория — чистового прохода не будет")
 
+    # Внешний контур считается ЗАРАНЕЕ: по нему же строится полоса, которую надо
+    # очистить ДО обвода (иначе фреза снимет стоящее в ней боком — см.
+    # make_clearance_ops). Сам обвод создаётся в конце, как и раньше.
+    filled, peri_top = None, None
+    if sil is not None:
+        try:
+            filled = Part.makeFace([f.OuterWire for f in sil.Faces],
+                                   "Part::FaceMakerBullseye")
+        except Exception as e:
+            log(f"warn: внешний контур не построился: {e}")
+    if filled is not None:
+        # Верх обвода — по ВЕРХУ НИЖНЕЙ ПОЛКИ детали (самой большой
+        # горизонтальной грани, смотрящей вверх). Выше полки силуэт сжимается до
+        # стенки, и обвод по силуэту шёл бы там по воздуху.
+        peri_top = min(sb.ZMax, bb.ZMax)
+        shelf_a, shelf_z = 0.0, None
+        for f in shape.Faces:
+            if surf_name(f) != "Plane" or f.normalAt(0, 0).z < 0.999:
+                continue
+            if f.Area > shelf_a:
+                shelf_a, shelf_z = f.Area, f.BoundBox.ZMax
+        if shelf_z is not None:
+            peri_top = min(peri_top, max(shelf_z, bb.ZMin + 0.1))
+            log(f"RoughPerimeter: верх обвода по полке Z={peri_top:.2f} "
+                f"(верх детали {bb.ZMax:.2f})")
+
     # ── 0) съём объёма НАД деталью уровнями, ПЕРВЫМ — как `NK_1_01` у завода.
     #      Без этой стадии её работу делают операции по граням, каждая заново
     #      проходя весь столб материала над своей гранью. ──
@@ -1080,6 +1241,18 @@ def make_roughing_ops(doc, job, tc, shape, p):
             ops.extend(bulk)
             p["_bulk_floor"] = bulk_floor
             write_partial(job, ops, p, "снят объём над деталью")
+
+    # ── 0a) очистка полосы, по которой пойдёт обвод контура — ЗАРАНЕЕ, чтобы к
+    #       обводу там уже ничего не стояло и бокового реза не возникало. У
+    #       завода на это отдельные операции (`NK_1_02/03`), и контур они
+    #       обводят по пустому. ──
+    if (p.get("clear_contour_band", True) and filled is not None
+            and peri_top is not None and not skip("RoughClear1")):
+        clr = make_clearance_ops(doc, job, shape, p, filled, peri_top,
+                                 alw_xy, choose_tc)
+        if clr:
+            ops.extend(clr)
+            write_partial(job, ops, p, "очищена полоса под обвод контура")
 
     # ── 1) сквозные вырезы любой формы, ПЕРВЫМИ (деталь ещё жёстко в заготовке) ──
     if sil is None:
@@ -1339,33 +1512,13 @@ def make_roughing_ops(doc, job, tc, shape, p):
     #      Один обвод Profile снаружи вдоль силуэта детали; лишний материал в
     #      углах заготовки, не касающийся детали, остаётся (так просил техпроцесс).
     #      Прорезаем именно внешний периметр детали, не выбирая всё поле. ──
-    if sil is not None:
-        try:
-            filled = Part.makeFace([f.OuterWire for f in sil.Faces],
-                                   "Part::FaceMakerBullseye")
-        except Exception as e:
-            filled = None
-            log(f"warn: внешний контур не построился: {e}")
-        if filled is not None and not skip("RoughPerimeter"):
+    if filled is not None and peri_top is not None:
+        if not skip("RoughPerimeter"):
             # внешний контур режем до дна ДЕТАЛИ (bb.ZMin, снизу клампится полом):
             # периметр отделяет деталь от рамки заготовки. Припуск по стенке
-            # (OffsetExtra) при этом сохраняется.
-            # Верх обвода жёстко задан по ВЕРХУ НИЖНЕЙ ПОЛКИ детали — самой
-            # большой горизонтальной грани, смотрящей вверх (у уголка это плита,
-            # у плоской детали — её верх). Выше полки силуэт сжимается до стенки,
-            # и обвод по силуэту шёл бы там по воздуху. Это единственное
-            # упрощение — только высота, без подбора полос по сечениям.
-            peri_top = min(sb.ZMax, bb.ZMax)
-            shelf_a, shelf_z = 0.0, None
-            for f in shape.Faces:
-                if surf_name(f) != "Plane" or f.normalAt(0, 0).z < 0.999:
-                    continue
-                if f.Area > shelf_a:
-                    shelf_a, shelf_z = f.Area, f.BoundBox.ZMax
-            if shelf_z is not None:
-                peri_top = min(peri_top, max(shelf_z, bb.ZMin + 0.1))
-                log(f"RoughPerimeter: верх обвода по полке Z={peri_top:.2f} "
-                    f"(верх детали {bb.ZMax:.2f})")
+            # (OffsetExtra) при этом сохраняется. Верх обвода (peri_top) и сам
+            # силуэт (filled) посчитаны выше — по ним же строилась полоса,
+            # которую очистила стадия RoughClear.
             tcx, _ = choose_tc("RoughPerimeter", None)
             op = make_profile(doc, job, tcx, "RoughPerimeter", filled, p,
                               peri_top, bb.ZMin, alw_xy)
