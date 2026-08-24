@@ -969,6 +969,49 @@ def make_roughing_ops(doc, job, tc, shape, p):
             log(f"warn: локальный верх зоны не посчитался ({e}) — беру верх заготовки")
             return sb.ZMax
 
+    def formed_allowance(f, tol):
+        """Максимальный припуск над ПОВЕРХНОСТЬЮ грани, но не больше tol.
+
+        Возвращает None, если припуска нигде нет (грань уже готова в
+        заготовке), иначе величину, на которой проверка остановилась.
+
+        Зачем отдельно от local_start. Тот меряет «верх материала над зоной»
+        против НИЗА габарита грани. У плоской грани это точно: обе величины —
+        горизонтали. У наклонной и кривой её собственная высота габарита
+        каждый раз засчитывается как припуск, даже когда поверхность заготовки
+        совпадает с поверхностью детали. Гнутый лист, отливка, поковка несут
+        часть поверхностей готовыми, и на них это даёт целую пару операций
+        впустую: на 003 радиус гиба согнут в заготовке (0.00 мм припуска во
+        всех 64 точках грани), а габаритная проверка видела 2.5 мм и заводила
+        RoughSlope+FinishSlope на 1 370 мм рабочего хода.
+
+        Меряется точечно по самой грани. Точка идёт в припуск, только если она
+        ВНЕ детали (иначе это тело самой детали, а не то, что надо снять) и
+        ВНУТРИ заготовки. Материал выше `_bulk_floor` не в счёт — его сняла
+        стадия съёма объёма; та же оговорка, что в local_start.
+        """
+        floor = p.get("_bulk_floor")
+        try:
+            verts, tris = f.tessellate(max(tol / 2.0, 0.02))
+            pts = [(verts[a] + verts[b] + verts[c]) * (1.0 / 3.0)
+                   for a, b, c in tris]
+        except Exception as e:
+            log(f"warn: грань не тесселируется ({e}) — считаю, что припуск есть")
+            return tol
+        if not pts:
+            return tol
+        if len(pts) > 800:                      # плотность важнее полноты
+            pts = pts[::len(pts) // 800 + 1]
+        for pt in pts:
+            q = FreeCAD.Vector(pt.x, pt.y, pt.z + tol)
+            if floor is not None and q.z >= floor:
+                continue                        # выше снято стадией съёма объёма
+            if shape.isInside(q, 1e-6, True):
+                continue                        # тело детали, а не припуск
+            if stock_shape.isInside(q, 1e-6, True):
+                return tol                      # припуск есть — грань нужна
+        return None
+
     def concave_radius(f):
         """Радиус ВОГНУТОГО скругления грани (гиб, галтель у стенки) или None.
         Вогнутое = тело снаружи цилиндра: пробуем точку на 0.1 мм в сторону оси —
@@ -1164,7 +1207,7 @@ def make_roughing_ops(doc, job, tc, shape, p):
             FreeCAD.Vector(fbb.XMin, fbb.YMin, 0)]))
         faces.append({"kind": "slope", "z": fbb.ZMax, "final": fbb.ZMin + alw_z,
                       "final0": fbb.ZMin,
-                      "rect": rect, "idx": idx, "area": f.Area,
+                      "rect": rect, "idx": idx, "area": f.Area, "face": f,
                       "cx": mid.x, "cy": mid.y})
 
     # сортировка сверху вниз; на одном уровне — от ближней к дальней
@@ -1175,6 +1218,10 @@ def make_roughing_ops(doc, job, tc, shape, p):
                                   lambda f: (f["cx"], f["cy"]))
 
     face_n = slope_n = 0
+    # грани, готовые в заготовке (радиус гиба у гнутого листа, литые
+    # поверхности), операциями не трогаем — см. formed_allowance
+    skip_formed = bool(p.get("skip_formed_faces", True))
+    formed_tol = float(p.get("formed_face_tol", 0.05))
     for fc in ordered:
         if fc["kind"] == "planar":
             top = local_start(fc["region"])
@@ -1212,6 +1259,12 @@ def make_roughing_ops(doc, job, tc, shape, p):
             if top is None:
                 log(f"RoughSlope (Z={fc['z']:.1f}): материала над гранью нет — "
                     f"пропущено")
+                continue
+            if skip_formed and formed_allowance(fc["face"], formed_tol) is None:
+                log(f"RoughSlope (Z={fc['z']:.1f}, {fc['area']:.0f} мм²): "
+                    f"заготовка нигде не выше поверхности грани на "
+                    f"{formed_tol} мм — грань уже готова в заготовке, "
+                    f"операции не нужны")
                 continue
             slope_n += 1
             name = f"RoughSlope{slope_n}"
@@ -1873,7 +1926,8 @@ def _ramp(entry, target, track, angle_deg, min_len=0.5):
 
 
 def optimize_links(gcode, stock_map, vert_feed, clearance=1.0, air_cuts=False,
-                   ramp_angle=0.0, horiz_feed=None, tool_radii=None):
+                   ramp_angle=0.0, horiz_feed=None, tool_radii=None,
+                   stepdown=None):
     """Подвод и врезание по модели снятого материала.
 
     Замечание ОЭЦМ: «лишние перемещения и опасные вертикальные врезания». У нас
@@ -1901,6 +1955,16 @@ def optimize_links(gcode, stock_map, vert_feed, clearance=1.0, air_cuts=False,
     # там, где работает Ø1, значит стереть материал, которого фреза не касалась.
     radii = {int(k): float(v) / 2.0 for k, v in (tool_radii or {}).items()}
     cur_r = None
+    # ── боковой рез: фреза идёт на своей высоте, а в её следе стоит материал
+    #    заметно выше дна хода — значит режет БОКОМ на всю эту глубину. Операция
+    #    на это не рассчитана: подача выбрана под съём слоя, а не под паз в
+    #    полтора десятка миллиметров, и заметить такое по сверке нельзя — сверка
+    #    меряет тело детали, а срезается тут остаток заготовки.
+    #    Ловится той же 2.5D-моделью снятого материала, по которой считается
+    #    подвод. Радиус берётся с НЕДОБОРОМ (как в cut): материал ровно на
+    #    границе диска — это стенка, вдоль которой фреза и должна идти.
+    side_lim = None if stepdown is None else max(3.0 * float(stepdown), 3.0)
+    side_max, side_at, side_op, cur_op = 0.0, None, None, None
 
     def head_of(code):
         h = _re.sub(r"\s*Z-?[\d.]+", "", code.split("F")[0]).strip()
@@ -1950,6 +2014,9 @@ def optimize_links(gcode, stock_map, vert_feed, clearance=1.0, air_cuts=False,
             m = _re.search(r"\(\s*M0?6\s+T(\d+)\s*\)", b["raw"])
             if m:
                 cur_r = radii.get(int(m.group(1)), cur_r)
+            m = _re.search(r"\(Begin operation:\s*(.+?)\)", b["raw"])
+            if m:
+                cur_op = m.group(1)
             out.append(b["raw"])
             continue
         x, y, z = b["p0"]
@@ -1999,7 +2066,27 @@ def optimize_links(gcode, stock_map, vert_feed, clearance=1.0, air_cuts=False,
         else:
             out.append(b["raw"])
 
+        if side_lim is not None and cur_r:
+            zb = min(z, nz_)
+            pr = max(cur_r - 2.0 * stock_map.pitch, stock_map.pitch)
+            # Середину дуги нельзя брать как середину ХОРДЫ: она лежит внутри
+            # дуги и на обводе контура заезжает в тело детали — ложная тревога
+            # на каждом скруглении угла.
+            pts_probe = [(x, y), (nx_, ny_), _mid_point(b, x, y, nx_, ny_)]
+            for px, py in pts_probe:
+                d = stock_map.top(px, py, pr) - zb
+                if d > side_max:
+                    side_max, side_at, side_op = d, (px, py, zb), cur_op
+
         stock_map.cut(x, y, nx_, ny_, min(z, nz_), cur_r)
+
+    if side_lim is not None and side_max > side_lim:
+        px, py, pz = side_at
+        log(f"ВНИМАНИЕ: боковой рез — {side_op or '?'} идёт на Z={pz:.2f}, а в "
+            f"следе фрезы стоит материал до Z={pz + side_max:.2f} "
+            f"(X={px:.1f} Y={py:.1f}). Фреза срежет его боком на "
+            f"{side_max:.1f} мм: этот материал должна была снять более ранняя "
+            f"операция, и сверка такого не покажет — она меряет тело детали")
 
     if n_cut or n_all or n_air or n_ramp:
         log(f"подвод: {n_all} спусков целиком по воздуху, {n_cut} укорочено, "
@@ -2007,6 +2094,28 @@ def optimize_links(gcode, stock_map, vert_feed, clearance=1.0, air_cuts=False,
             + (f", {n_air} холостых резов" if n_air else "")
             + f"; снято с рабочей подачи {saved:.0f} мм")
     return "".join(out)
+
+
+def _mid_point(b, x, y, nx_, ny_):
+    """Середина кадра НА самой траектории: у дуги — по дуге, не по хорде."""
+    if b["mode"] not in (2, 3):
+        return ((x + nx_) / 2.0, (y + ny_) / 2.0)
+    i, j = b.get("ij", (0.0, 0.0))
+    cx, cy = x + i, y + j
+    r = math.hypot(x - cx, y - cy)
+    if r < 1e-9:
+        return ((x + nx_) / 2.0, (y + ny_) / 2.0)
+    a0 = math.atan2(y - cy, x - cx)
+    a1 = math.atan2(ny_ - cy, nx_ - cx)
+    da = a1 - a0
+    if b["mode"] == 2:                       # G2 — по часовой
+        while da >= 0:
+            da -= 2 * math.pi
+    else:
+        while da <= 0:
+            da += 2 * math.pi
+    am = a0 + da / 2.0
+    return (cx + r * math.cos(am), cy + r * math.sin(am))
 
 
 def _join(g, head, z, feed):
@@ -2196,7 +2305,8 @@ def mill(doc, feat, p, stock_solid=None):
                 float(p.get("air_plunge_clearance", 1.0)),
                 air_cuts=bool(p.get("air_cuts_rapid", False)),
                 ramp_angle=float(p.get("ramp_angle", 0.0)),
-                horiz_feed=float(feed), tool_radii=tools_map)
+                horiz_feed=float(feed), tool_radii=tools_map,
+                stepdown=float(p.get("rough_stepdown", 1.0)))
         except Exception as e:   # без модели программа валидна, просто длиннее
             log(f"warn: подвод не оптимизирован ({e})")
     return p["_gcode_header"] + body
