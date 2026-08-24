@@ -746,6 +746,117 @@ def make_engrave_sweep(doc, job, tc, name, wire, p, start_z, final_z,
 # (0.5 мм) — иначе модель снятого материала «увидит» металл под фрезой.
 CLEAR_AIR_MARGIN = 1.0
 
+# Доля габаритного прямоугольника, при которой связный кусок считаем
+# прямоугольным. У стенки 003 это 1.000 и 0.997 — вторую долю обкусывает след
+# гиба, и запас до 0.9 оставлен ровно на такие следы и на скругления.
+CLEAR_RECT_FILL = 0.9
+# Сколько куска допустимо не накрыть прямыми проходами, мм². Больше — значит
+# кусок прямой линией не снимается, и мы остаёмся на обводе по контуру.
+CLEAR_RECT_RESIDUAL = 1.0
+
+
+def _uv_extent(shape, u, v):
+    """Габарит фигуры в осях (u, v): (umin, umax, vmin, vmax) или None."""
+    pts = []
+    for e in shape.Edges:
+        try:
+            pts += e.discretize(Number=max(2, min(64, int(e.Length / 0.5) + 2)))
+        except Exception:
+            pts += [vx.Point for vx in e.Vertexes]
+    if not pts:
+        return None
+    us = [q.x * u.x + q.y * u.y for q in pts]
+    vs = [q.x * v.x + q.y * v.y for q in pts]
+    return min(us), max(us), min(vs), max(vs)
+
+
+def straight_pass(chain, face, filled, off, r):
+    """Прямой проход ВДОЛЬ прямоугольного куска вместо куска контурной кривой.
+
+    Путь обвода прямой не везде: у угла детали он уходит дугой радиуса
+    R + припуск, и обрезка его зоной достижимости тащит эту дугу за собой. Снимать
+    фрезе там нечего — материал стоит только напротив прямого участка, — зато дуга
+    удлиняет каждый уровень и уводит вход туда, где под фрезой стенка САМОЙ
+    ДЕТАЛИ, то есть требует врезания рампой. На 003 из 24.46 мм цепочки полезны
+    11.4: остальное ход вдоль стенки, где фреза не касается ничего, и дуга вокруг
+    угла. Отсюда `RoughClear1` с 1 237 мм рабочего хода против 441 у её пары.
+
+    Завод в таком месте (`NK_1_02/03`) ведёт фрезу прямо: один ход насквозь через
+    стенку, из воздуха в воздух. Здесь то же самое, но только когда это заведомо
+    безопасно:
+
+      * кусок — прямоугольник В ОСЯХ ПРОХОДА (площадь ≥ CLEAR_RECT_FILL от
+        габаритной);
+      * линия берётся ТА ЖЕ, по которой пойдёт обвод — из самого длинного прямого
+        ребра цепочки, причём из ДАЛЬНЕГО от детали: у торца стенки параллельных
+        прямых две (силуэт полки и торец стенки расходятся на 0.04 мм), и ближняя
+        срезала бы эти 0.04 мм с детали;
+      * отрезок растягивается на габарит куска плюс радиус фрезы и запас на выход
+        в воздух;
+      * и проверяется по детали — расстояние до силуэта обязано остаться не
+        меньше смещения самой линии.
+
+    Возвращает (проволока, след фрезы) или None; None — остаться на цепочке
+    обвода. Накрывают ли следы кусок целиком, решает вызывающий: это видно только
+    по ВСЕМ линиям куска сразу.
+    """
+    lines = [e for e in chain
+             if type(e.Curve).__name__ == "Line" and e.Length > 1e-6]
+    if not lines:
+        return None
+    base = max(lines, key=lambda e: e.Length)
+    a0, a1 = base.Vertexes[0].Point, base.Vertexes[-1].Point
+    u = FreeCAD.Vector(a1.x - a0.x, a1.y - a0.y, 0.0)
+    if u.Length < 1e-6:
+        return None
+    u.normalize()
+    v = FreeCAD.Vector(-u.y, u.x, 0.0)
+
+    ext = _uv_extent(face, u, v)
+    if ext is None:
+        return None
+    umin, umax, vmin, vmax = ext
+    if (umax - umin) < 1e-6 or (vmax - vmin) < 1e-6:
+        return None
+    if face.Area / ((umax - umin) * (vmax - vmin)) < CLEAR_RECT_FILL:
+        return None                       # не прямоугольник: Г, дуга, клин
+
+    # Из параллельных прямых цепочки берём ДАЛЬНЮЮ от детали: ближняя отличается
+    # на доли миллиметра и ровно на столько же залезла бы в деталь.
+    cm = filled.CenterOfMass
+    v_part = cm.x * v.x + cm.y * v.y
+    best = None
+    for e in lines:
+        p0, p1 = e.Vertexes[0].Point, e.Vertexes[-1].Point
+        d = FreeCAD.Vector(p1.x - p0.x, p1.y - p0.y, 0.0)
+        if d.Length < 1e-6:
+            continue
+        d.normalize()
+        if abs(d.x * v.x + d.y * v.y) > 0.035:       # не параллельна u (2°)
+            continue
+        vi = p0.x * v.x + p0.y * v.y
+        if best is None or abs(vi - v_part) > abs(best - v_part):
+            best = vi
+    if best is None:
+        return None
+
+    grow = r + CLEAR_AIR_MARGIN
+    a = u * (umin - grow) + v * best
+    b = u * (umax + grow) + v * best
+    a = FreeCAD.Vector(a.x, a.y, 0.0)
+    b = FreeCAD.Vector(b.x, b.y, 0.0)
+    try:
+        seg = Part.makeLine(a, b)
+        if seg.distToShape(filled)[0] < off - 0.02:
+            return None                   # отрезок подошёл к детали ближе линии
+        q = [a + v * r, b + v * r, b - v * r, a - v * r]
+        q = [FreeCAD.Vector(t.x, t.y, 0.0) for t in q]
+        swath = Part.Face(Part.Wire([Part.makeLine(q[i], q[(i + 1) % 4])
+                                     for i in range(4)]))
+    except Exception:
+        return None
+    return Part.Wire([seg]), swath
+
 
 def contour_band(filled, dia, alw_xy):
     """След обводной фрезы вокруг детали: (пути центра фрезы, полоса под ней).
@@ -857,46 +968,82 @@ def make_clearance_ops(doc, job, shape, p, filled, peri_top, alw_xy, choose):
     # материала (0.5 мм), иначе она «увидит» металл под фрезой и всё равно
     # потребует врезания.
     r = dia / 2.0
-    reach = None
-    for f in faces:
-        try:
-            g = f.makeOffset2D(r + CLEAR_AIR_MARGIN)
-        except Exception:
-            g = f
-        reach = g if reach is None else reach.fuse(g)
 
+    # Каждый связный кусок отдельно: у него своя зона достижимости, свой выбор
+    # «прямыми или по контуру» и свои линии. Порядок — ближайший следующий, как
+    # у съёма объёма: куски стоят на разных концах детали, и обход их подряд
+    # экономит длинный холостой ход между ними.
+    faces = _nearest_order(faces, lambda f: (f.CenterOfMass.x, f.CenterOfMass.y))
     ops, total, n = [], 0.0, 0
-    for off in offs:
+    for face in faces:
         try:
-            path = filled.makeOffset2D(off).OuterWire
-            # Фильтровать по длине РЕБРА нельзя: у замкнутого контура на шве
-            # остаётся крошечное ребро, и без него цепочка рвётся пополам —
-            # вместо одного прохода из воздуха в воздух получаются два, каждый
-            # со своим врезанием посреди металла. Отсеиваем по длине ЦЕПОЧКИ.
-            edges = [e for e in path.common(reach).Edges if e.Length > 1e-6]
-        except Exception as e:
-            log(f"warn: участки пути не выделены ({e}) — очистка неполная")
-            break
-        for chain in Part.sortEdges(edges):
-            if sum(e.Length for e in chain) < 1.0:
-                continue
-            # С какого конца цепочки пойдёт проход, ВЫБИРАЕТ САМ Engrave —
-            # проверено: разворот списка рёбер и разворот самих рёбер выхлопа
-            # не меняют. Поэтому вход в воздух обеспечивается только длиной
-            # цепочки (CLEAR_AIR_MARGIN выводит концы за металл); где Engrave
-            # всё же начал с конца, идущего по касательной к стенке САМОЙ
-            # ДЕТАЛИ, пасс подвода поставит там врезание рампой — на длинной
-            # цепочке это один наклонный ход, а не зигзаг.
+            reach = face.makeOffset2D(r + CLEAR_AIR_MARGIN)
+        except Exception:
+            reach = face
+        chains = []
+        for off in offs:
             try:
-                wire = Part.Wire(chain)
-            except Exception:
-                continue
+                path = filled.makeOffset2D(off).OuterWire
+                # Фильтровать по длине РЕБРА нельзя: у замкнутого контура на шве
+                # остаётся крошечное ребро, и без него цепочка рвётся пополам —
+                # вместо одного прохода из воздуха в воздух получаются два,
+                # каждый со своим врезанием посреди металла. Отсеиваем по длине
+                # ЦЕПОЧКИ.
+                edges = [e for e in path.common(reach).Edges if e.Length > 1e-6]
+            except Exception as e:
+                log(f"warn: участки пути не выделены ({e}) — очистка неполная")
+                edges = []
+            for chain in Part.sortEdges(edges):
+                if sum(e.Length for e in chain) < 1.0:
+                    continue
+                chains.append((chain, off))
+        if not chains:
+            continue
+
+        # Прямые проходы вдоль куска — если он прямоугольный И если их следы его
+        # накрывают. Покрытие считается по ВСЕМ линиям куска сразу: одна линия
+        # накрывает полосу шириной с фрезу, а полоса под обвод шире её ровно на
+        # припуск, и закрывают её только обе линии вместе.
+        how_path, wires = "по контуру обвода", None
+        if p.get("clear_straight", True):
+            st = [straight_pass(ch, face, filled, off, r) for ch, off in chains]
+            if all(s is not None for s in st):
+                sw = None
+                for _w, s in st:
+                    sw = s if sw is None else sw.fuse(s)
+                try:
+                    resid = face.cut(sw).Area
+                except Exception:
+                    resid = 1e9
+                if resid <= CLEAR_RECT_RESIDUAL:
+                    wires = [s[0] for s in st]
+                    how_path = ("прямыми вдоль куска" if resid < 0.01 else
+                                f"прямыми вдоль куска, не накрыто {resid:.2f} мм²")
+                else:
+                    log(f"кусок {face.Area:.0f} мм²: прямые проходы оставляют "
+                        f"{resid:.1f} мм² — веду по контуру обвода")
+        if wires is None:
+            # Обвод по контуру: с какого конца цепочки пойдёт проход, ВЫБИРАЕТ
+            # САМ Engrave — проверено, разворот списка рёбер и разворот самих
+            # рёбер выхлопа не меняют. Поэтому вход в воздух обеспечивается
+            # только длиной цепочки (CLEAR_AIR_MARGIN выводит концы за металл);
+            # где Engrave начал с конца, идущего по касательной к стенке САМОЙ
+            # ДЕТАЛИ, пасс подвода поставит там врезание рампой.
+            wires = []
+            for chain, _off in chains:
+                try:
+                    wires.append(Part.Wire(chain))
+                except Exception:
+                    pass
+
+        for wire in wires:
             n += 1
             name = f"RoughClear{n}"
             op = make_engrave_sweep(doc, job, tcx, name, wire,
                                     dict(p, rough_stepdown=step),
                                     z_top, peri_top,
-                                    note="очистка полосы под обвод контура")
+                                    note="очистка полосы под обвод контура, "
+                                         + how_path)
             if op:
                 ops.append(op)
                 total += wire.Length
