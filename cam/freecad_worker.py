@@ -592,6 +592,111 @@ def make_adaptive(doc, job, tc, name, region_shape, p, start_z, final_z, allowan
     return None  # 2 команды = пустой путь (один подъём Z)
 
 
+def max_inset(face, hi, tol=0.05):
+    """Наибольшее смещение внутрь, при котором зона ещё не выродилась, мм.
+
+    Это радиус наибольшей окружности, вписанной в зону. Считается делением
+    пополам, потому что прямого запроса у OCCT нет, а о вырождении он сообщает
+    ДВУМЯ способами: смещение чуть меньше предельного отдаёт фигуру без граней,
+    а чуть больше — бросает `CADKernelError: offset result has no wires`.
+    Ловить одно исключение нельзя: им же сообщается и о неудаче на сложной
+    геометрии, а деление пополам ошибается только в безопасную сторону —
+    занижает вписанную окружность, то есть добавляет виток, а не убирает.
+    """
+    def alive(d):
+        try:
+            return bool([f for f in face.makeOffset2D(-d).Faces if f.Area > 1e-6])
+        except Exception:
+            return False
+
+    lo = min(0.1, hi / 4.0)
+    if not alive(lo):
+        return None            # смещение не считается вовсе — величины нет
+    while hi - lo > tol:
+        mid = (lo + hi) / 2.0
+        if alive(mid):
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def single_lap_clears(region, r, allowance):
+    """Накрывает ли зону ОДИН виток по её контуру.
+
+    Виток идёт по контуру, отжатому внутрь на r + припуск, и сметает всё в
+    радиусе r от себя, то есть достаёт до глубины 2r + припуск. Значит одного
+    витка хватает ровно тогда, когда вписанная окружность зоны не больше этого.
+
+    Это ровно то, чего не знает выборка FreeCAD: она кладёт витки, пока не
+    выродится сама ЛИНИЯ (центр фрезы), а не пока остаётся непокрытое. У окна
+    003 (47 x 24 при фрезе Ø12) из-за этого появляется второй виток 64 мм на
+    уровень, который не снимает ничего: вписанная окружность 12.0 мм при
+    достижимых 12.5. У завода в `CAVITY_MILL_1` виток один.
+    """
+    reach = 2.0 * r + allowance
+    faces = [f for f in region.Faces if f.Area > 1e-6]
+    if not faces:
+        return False
+    ins = 0.0
+    for f in faces:               # зона может быть из нескольких кусков
+        v = max_inset(f, reach + 1.0)
+        if v is None:
+            log("  вписанная окружность не посчиталась — веду витками")
+            return False
+        ins = max(ins, v)
+    log(f"  вписанная окружность зоны {ins:.1f} мм, виток достаёт {reach:.1f}")
+    return ins <= reach
+
+
+def make_pocket(doc, job, tc, name, region_shape, p, start_z, final_z, allowance):
+    """Выборка зоны КОНЦЕНТРИЧЕСКИМИ ВИТКАМИ внутрь — «follow periphery».
+
+    Так режет заводской `CAVITY_MILL`: виток по контуру зоны, отжатому на радиус
+    + припуск, затем следующий внутрь на шаг строчки, и так пока есть что
+    снимать. У узкой зоны витков выходит один-два, и это ровно то, что нужно.
+
+    Adaptive на той же зоне держит ПОСТОЯННУЮ НАГРУЗКУ и потому вьётся
+    трохоидами. Это окупается в широком кармане и на глубоком слое, где полная
+    ширина резания опасна; на листовой детали платить за это нечем — у окна 003
+    (47 x 24 при фрезе Ø12) один виток накрывает вырез целиком.
+    """
+    final_z = max(final_z, p.get("_floor_limit", final_z))
+    region = doc.addObject("Part::Feature", f"Region{name}")
+    region.Shape = region_shape
+    doc.recompute()
+
+    import Path.Op.PocketShape as PocketShape
+    op = PocketShape.Create(name, parentJob=job)
+    op.ToolController = tc
+    op.Base = [(region, f"Face{i + 1}") for i in range(len(region.Shape.Faces))]
+    set_prop(op, "ClearingPattern", "Offset")   # витки по контуру, как Cavity Mill
+    set_prop(op, "StartAt", "Edge")             # снаружи внутрь
+    set_prop(op, "StepOver", int(p["rough_stepover"]))
+    set_prop(op, "ExtraOffset", FreeCAD.Units.Quantity(f"{allowance} mm"))
+    set_prop(op, "KeepToolDown", True)          # не отводиться между витками
+    op.setExpression("StepDown", None)
+    set_prop(op, "StepDown", layer_step(p, start_z, final_z))
+    op.setExpression("StartDepth", None)
+    op.StartDepth = start_z
+    op.setExpression("FinalDepth", None)
+    op.FinalDepth = final_z
+    op.ClearanceHeight.Value = start_z + p["safe_height"]
+    op.SafeHeight.Value = start_z + 3.0
+    doc.recompute()
+
+    n = len(op.Path.Commands) if op.Path else 0
+    log(f"{name}: {n} команд (витки по контуру)")
+    if n > 2:
+        return op
+    try:
+        doc.removeObject(op.Name)
+        doc.recompute()
+    except Exception:
+        pass
+    return None
+
+
 def make_profile(doc, job, tc, name, region_shape, p, start_z, final_z, allowance,
                  side="Outside"):
     """Контурный проход (Path Profile): фреза обходит внешний контур зоны
@@ -1791,8 +1896,21 @@ def make_roughing_ops(doc, job, tc, shape, p):
                                   if d < dx0 and name not in overrides]
         op = None
         for tcx, dx in tries:
-            op = make_adaptive(doc, job, tcx, name, region, p,
-                               hole_top, bb.ZMin, alw_xy)
+            op = None
+            if p.get("hole_pocket", True):
+                # Витки по контуру внутрь, как заводской CAVITY_MILL. Adaptive
+                # остаётся запасным путём: он держит постоянную нагрузку, и это
+                # нужно там, где виток шёл бы полной шириной по глубокому слою.
+                if single_lap_clears(region, dx / 2.0, alw_xy):
+                    log(f"{name}: один виток по контуру накрывает вырез целиком")
+                    op = make_profile(doc, job, tcx, name, region, p,
+                                      hole_top, bb.ZMin, alw_xy, side="Inside")
+                else:
+                    op = make_pocket(doc, job, tcx, name, region, p,
+                                     hole_top, bb.ZMin, alw_xy)
+            if not op:
+                op = make_adaptive(doc, job, tcx, name, region, p,
+                                   hole_top, bb.ZMin, alw_xy)
             if not op and width > dx + 0.2:
                 # узкий паз: винтового захода нет, но фреза в паз проходит —
                 # контурный обход ИЗНУТРИ (вход вертикальным врезанием)
