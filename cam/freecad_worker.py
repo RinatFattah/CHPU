@@ -452,6 +452,42 @@ def build_silhouette(solid, bb, step):
     return sil
 
 
+def outline_face(shp):
+    """Силуэт ОДНОЙ гранью, даже если он собрался несколькими кусками.
+
+    `build_silhouette` объединяет сечения по высоте, и обычно OCCT сливает их в
+    одну грань. Но когда куски стыкуются по-разному на разных высотах, `fuse`
+    оставляет ШЕЛЛ из нескольких граней, а `removeSplitter` на нём падает
+    («Removing splitter failed»). У 007 так и вышло: стенка шириной 2.5 мм с
+    закруглённым верхом дала кроме основной фигуры ещё четыре куска, из них два
+    — полоски шириной 0.10 мм. Дальше `Part.makeFace` по внешним контурам таких
+    граней отдаёт КОМПАУНД, у компаунда нет `OuterWire`, и очистка полосы под
+    обвод не создаётся вовсе (в логе четыре `warn: участки пути не выделены`), а
+    обвод потом срезает оставшийся в полосе материал БОКОМ.
+
+    Обход — не 2D-слияние, а вычитание из большого прямоугольника: контур детали
+    становится в нём ДЫРКОЙ, а дырка это один замкнутый контур независимо от
+    того, сколькими кусками была собрана фигура.
+
+    Возвращает None, если контур не выделился; вызывающий тогда остаётся на
+    прежнем значении.
+    """
+    try:
+        b = shp.BoundBox
+        m = max(10.0, 0.05 * max(b.XLength, b.YLength))
+        box = Part.makePlane(b.XLength + 2 * m, b.YLength + 2 * m,
+                             FreeCAD.Vector(b.XMin - m, b.YMin - m, 0))
+        inner = []
+        for f in box.cut(shp).Faces:
+            outer = f.OuterWire
+            inner += [w for w in f.Wires if not w.isSame(outer)]
+        if not inner:
+            return None
+        return Part.makeFace(inner, "Part::FaceMakerBullseye")
+    except Exception:
+        return None
+
+
 def _nearest_order(items, xy):
     """Порядок «как человек»: начиная от нуля детали, дальше ближайший следующий."""
     rest = list(items)
@@ -1050,6 +1086,10 @@ def clear_step(p, thick):
             f"кусок {thick:.1f} мм вдоль хода — фреза идёт вдоль металла")
 
 
+# Допуск сборки цепочек из рёбер: см. `make_clearance_ops`.
+CHAIN_JOIN_TOL = 1e-3
+
+
 def contour_band(filled, dia, alw_xy):
     """След обводной фрезы вокруг детали: (пути центра фрезы, полоса под ней).
 
@@ -1166,6 +1206,21 @@ def make_clearance_ops(doc, job, shape, p, filled, peri_top, alw_xy, choose):
             reach = face.makeOffset2D(r + CLEAR_AIR_MARGIN)
         except Exception:
             reach = face
+        # Обрезка ведётся ПРИЗМОЙ, а не плоской гранью. Сечения силуэта уложены
+        # на Z=0 сдвигом на высоту слоя, и после этого сдвига остаётся мусор
+        # порядка 1e-7: путь обвода у 007 лежит в Z −1.9e-07..+3.5e-08. Для
+        # булевой операции это ровно порог совпадения (Precision::Confusion),
+        # поэтому она срабатывает не всегда — у 007 ближний конец стенки
+        # обрезался, а дальний давал НОЛЬ рёбер и участок молча оставался
+        # неочищенным (потом его срезал боком обвод). Призма высотой 2 мм
+        # накрывает разброс с запасом; на кусках, где грань и так работала,
+        # результат совпадает до сотых (007, ближний конец: 24.31 и 24.53 мм
+        # обоими способами).
+        try:
+            reach_solid = reach.extrude(FreeCAD.Vector(0, 0, 2.0))
+            reach_solid.translate(FreeCAD.Vector(0, 0, -1.0))
+        except Exception:
+            reach_solid = reach
         chains = []
         for off in offs:
             try:
@@ -1174,12 +1229,21 @@ def make_clearance_ops(doc, job, shape, p, filled, peri_top, alw_xy, choose):
                 # остаётся крошечное ребро, и без него цепочка рвётся пополам —
                 # вместо одного прохода из воздуха в воздух получаются два,
                 # каждый со своим врезанием посреди металла. Отсеиваем по длине
-                # ЦЕПОЧКИ.
-                edges = [e for e in path.common(reach).Edges if e.Length > 1e-6]
+                # ЦЕПОЧКИ. Микроребро всё же приходится выбрасывать (нулевой
+                # длины дуга ломает Engrave), поэтому цепочки собираются С
+                # ДОПУСКОМ: у 007 на дальнем конце стенки выпало ребро длиной
+                # 1e-06 мм, и при стандартном допуске 1e-07 цепочка 24.31 мм
+                # разваливалась на 17.81 + 6.50 — четыре операции вместо двух и
+                # мелкий шаг слоя, потому что огрызок 6.5 мм меряется поперёк.
+                # 1e-03 мм заведомо меньше любого настоящего разрыва (соседние
+                # куски полосы отстоят на миллиметры) и заведомо больше
+                # выброшенных микрорёбер.
+                edges = [e for e in path.common(reach_solid).Edges
+                         if e.Length > 1e-6]
             except Exception as e:
                 log(f"warn: участки пути не выделены ({e}) — очистка неполная")
                 edges = []
-            for chain in Part.sortEdges(edges):
+            for chain in Part.sortEdges(edges, CHAIN_JOIN_TOL):
                 if sum(e.Length for e in chain) < 1.0:
                     continue
                 chains.append((chain, off))
@@ -1834,6 +1898,18 @@ def make_roughing_ops(doc, job, tc, shape, p):
                                    "Part::FaceMakerBullseye")
         except Exception as e:
             log(f"warn: внешний контур не построился: {e}")
+    # Силуэт, собравшийся несколькими кусками, до `OuterWire` не доходит — и
+    # тогда молча пропадает очистка полосы под обвод. Пересборка включается
+    # ТОЛЬКО на этом пути: где силуэт и так одна грань, код прежний до знака.
+    if filled is not None and not hasattr(filled, "OuterWire"):
+        fixed = outline_face(filled)
+        if fixed is not None and hasattr(fixed, "OuterWire"):
+            log(f"силуэт собрался {len(filled.Faces)} кусками — "
+                f"внешний контур пересобран одной гранью")
+            filled = fixed
+        else:
+            log("warn: силуэт собрался несколькими кусками и не пересобрался — "
+                "очистка полосы под обвод будет неполной")
     if filled is not None:
         # Верх обвода — по ВЕРХУ НИЖНЕЙ ПОЛКИ детали (самой большой
         # горизонтальной грани, смотрящей вверх). Выше полки силуэт сжимается до
