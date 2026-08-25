@@ -1591,17 +1591,41 @@ def make_roughing_ops(doc, job, tc, shape, p):
                 log(f"{name}: фреза Ø{dx:g} не дала траектории — пробую мельче")
         return None, dx0
 
-    def finish_surface(rough_name, face_idx, top, final_z, width):
+    def finish_surface(rough_name, face_idx, top, final_z, width, region=None):
         """Чистовой проход по той же грани — пара к черновой, как у завода.
 
         Черновая оставляет припуск (по стенкам StockToLeave, по поверхности
         DepthOffset) и ступеньки высотой до StepDown; чистовая идёт одним
-        проходом прямо по поверхности с более мелким шагом строчек."""
+        проходом прямо по поверхности с более мелким шагом строчек.
+
+        УЗКАЯ ПЛОСКАЯ ПОЛОСА — особый случай: один проход по средней линии.
+        3D-проход сканирует прямоугольник, раздутый на радиус фрезы, и на полосе
+        это почти весь ход впустую. Замер на верхнем торце стенки 003 (полоса
+        2.5 x 30.4 мм): девять строчек с шагом 3 мм по зоне шириной 24 мм, из
+        них ЧЕТЫРЕ КРАЙНИЕ (179 мм из 472) вообще не дотягиваются до стенки, а
+        каждая строчка вдвое длиннее полосы. Фреза Ø12 накрывает полосу целиком,
+        поэтому хватает одной линии по середине — так же снимает эту стенку наша
+        же стадия съёма объёма (`RoughBulk`) и заводская `NK_1_01_COPY`.
+        Только для ПЛОСКИХ граней: у кривой средняя линия задала бы плоский рез.
+        """
         if not fin:
             return
         name = rough_name.replace("Rough", "Finish", 1)
         if skip(name):
             return
+        if region is not None and p.get("face_median_line", True):
+            tcx, dxm = choose_tc(name, None)
+            line = median_line(region, dxm)
+            if line is not None:
+                # один уровень: StepDown заведомо больше всего спуска
+                op3 = make_engrave_sweep(
+                    doc, job, tcx, name, line,
+                    dict(p, rough_stepdown=abs(top - final_z) + 1.0),
+                    top, final_z, note="полоса, средняя линия")
+                if op3:
+                    ops.append(op3)
+                    return
+                log(f"{name}: проход по средней линии пуст — 3D-проходом")
         op2, _ = surface_ladder(name, face_idx, top, final_z, width, 0.0,
                                 single_pass=True, stepover=fin_stepover)
         if op2:
@@ -1814,7 +1838,8 @@ def make_roughing_ops(doc, job, tc, shape, p):
                     rfb = fc["region"].BoundBox
                     finish_surface(f"RoughFace{face_n}", fc["idx"], top,
                                    fc["final0"],
-                                   min(rfb.XLength, rfb.YLength))
+                                   min(rfb.XLength, rfb.YLength),
+                                   region=fc["region"])
                 continue  # грань вровень с верхом материала — снимать нечего
             face_n += 1
             name = f"RoughFace{face_n}"
@@ -1893,7 +1918,9 @@ def make_roughing_ops(doc, job, tc, shape, p):
             note = f"готова криволинейная грань {slope_n} (Ø{dx:g}, {fc['area']:.0f} мм²)"
         if op:
             ops.append(op)
-            finish_surface(name, fc["idx"], top, fc["final0"], fin_width)
+            finish_surface(name, fc["idx"], top, fc["final0"], fin_width,
+                           region=(fc["region"] if fc["kind"] == "planar"
+                                   else None))
             write_partial(job, ops, p, note)
         else:
             log(f"{name}: (Z={fc['z']:.1f}) пустая траектория — пропущено")
