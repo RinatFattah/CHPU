@@ -136,6 +136,8 @@ def generate_gcode_freecad(model_path: str, gcode_path: str) -> int:
         "clear_stepdown_shallow": float(getattr(config, "CLEAR_STEPDOWN_SHALLOW", 1.5)),
         "clear_straight": bool(getattr(config, "CLEAR_STRAIGHT", True)),
         "drop_null_moves": bool(getattr(config, "DROP_NULL_MOVES", True)),
+        "fillet_profile": bool(getattr(config, "FILLET_PROFILE", True)),
+        "fillet_tolerance": float(getattr(config, "FILLET_TOLERANCE", 0.01)),
         "rough_mode": config.ROUGH_MODE,
         "rough_allowance": config.ROUGH_ALLOWANCE,
         "rough_allowance_mode": config.ROUGH_ALLOWANCE_MODE,

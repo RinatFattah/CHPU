@@ -1063,6 +1063,212 @@ def make_clearance_ops(doc, job, shape, p, filled, peri_top, alw_xy, choose):
     return ops
 
 
+# Скругление ВДОЛЬ РЕБРА — цилиндрическая грань с горизонтальной осью. Порог на
+# «горизонтальность»: 0.02 по z единичного вектора это 1.1°. Промежуточных
+# случаев на листовых деталях не бывает — ось либо вдоль ребра, либо вертикальна
+# (угол стенки, его берёт обвод контура).
+FILLET_AXIS_TOL = 0.02
+
+
+def fillet_frame(f, shape):
+    """Рама сечения скругления вдоль ребра или None, если грань не такая.
+
+    Разбор заводской `RADIYS_1` показал, чем их обработка отличается от нашей:
+    скругление они режут НЕ сверху построчно, а ведут фрезу ПО СЕЧЕНИЮ, по дуге
+    в плоскости, перпендикулярной ребру, и шагают вдоль ребра. Для 18.8 мм²
+    грани у 003 это 280 мм пути против наших 727: 3D-проход по поверхности
+    сканирует прямоугольник 24 x 29 мм (зона раздута на радиус фрезы), и больше
+    половины ходов не задевает грань вовсе.
+
+    Признак, по которому это распознаётся, из модели и универсален: грань —
+    ЦИЛИНДР с ГОРИЗОНТАЛЬНОЙ осью. У 003 таких три: два скругления R5 на торцах
+    стенки и радиус гиба R2.5 (его пропускает проверка «готово в заготовке»).
+    Цилиндры с ВЕРТИКАЛЬНОЙ осью — углы полки и окна, их и сейчас берёт обвод
+    контура; свободные формы остаются на прежнем 3D-проходе.
+
+    Возвращает (C, e1, a, R, phi0, phi1, t0, t1):
+      C   — точка на оси, e1 — горизонтальная единичная НАРУЖУ от тела,
+      a   — единичная вдоль оси, R — радиус,
+      phi — угол в сечении от e1 к вертикали (0 = сбоку, 90° = сверху),
+      t   — координата вдоль оси, отсчёт от C.
+    """
+    if surf_name(f) != "Cylinder":
+        return None
+    try:
+        s = f.Surface
+        a = FreeCAD.Vector(s.Axis).normalize()
+        if abs(a.z) > FILLET_AXIS_TOL:
+            return None                      # вертикальная ось — угол стенки
+        R = float(s.Radius)
+        C = FreeCAD.Vector(s.Center)
+        u0, u1, v0, v1 = f.ParameterRange
+        mid = f.valueAt((u0 + u1) / 2.0, (v0 + v1) / 2.0)
+        # ВЫПУКЛОСТЬ: тело со стороны оси. У вогнутого (гиб, галтель) фреза
+        # катится по внутренней стороне, смещение считается иначе — не берём.
+        axis_pt = C + a * (mid - C).dot(a)
+        d = axis_pt - mid
+        if d.Length < 1e-9:
+            return None
+        if not shape.isInside(mid + d.normalize() * 0.1, 1e-6, True):
+            return None
+        z = FreeCAD.Vector(0, 0, 1)
+        e1 = a.cross(z)
+        if e1.Length < 1e-9:
+            return None
+        e1.normalize()
+        # Куда смотрит грань: если она лежит на стороне -e1, разворачиваем.
+        pts = []
+        for e in f.OuterWire.Edges:
+            n = max(2, min(24, int(e.Length / 0.5) + 2))
+            try:
+                pts += e.discretize(Number=n)
+            except Exception:
+                pts += [vx.Point for vx in e.Vertexes]
+        if not pts:
+            return None
+        if sum((q - C).dot(e1) for q in pts) < 0:
+            e1 = e1 * -1.0
+        ang = [math.degrees(math.atan2((q - C).dot(z), (q - C).dot(e1)))
+               for q in pts]
+        phi0, phi1 = min(ang), max(ang)
+        # Скругление «сбоку наверх»: от горизонтали до вертикали. Ниже
+        # горизонтали фреза с вертикальной осью не достаёт (там поднутрение), а
+        # больше 95° быть не может — это уже другая грань.
+        if phi0 < -2.0 or phi1 > 95.0 or phi1 - phi0 < 10.0:
+            return None
+        ts = [(q - C).dot(a) for q in pts]
+        return (C, e1, a, R, math.radians(phi0), math.radians(phi1),
+                min(ts), max(ts))
+    except Exception:
+        return None
+
+
+def fillet_path(fr, tool_r, offset, tol, t, blend=0.0):
+    """Точки ОСИ ФРЕЗЫ вдоль сечения скругления на позиции t по ребру.
+
+    Плоская фреза радиуса `tool_r` касается выпуклого цилиндра нижней кромкой:
+    торец встаёт на высоту точки касания, а ось отходит по горизонтали ровно на
+    свой радиус. Отсюда путь оси — та же дуга, сдвинутая на `tool_r * e1`:
+
+        P(phi) = C + t*a + (R + offset)*(cos(phi)*e1 + sin(phi)*z) + tool_r*e1
+
+    Заводская траектория считается той же формулой с поправкой на радиус при
+    вершине их пластины (R0.5): подстановка даёт центр (Y -0.45, Z 15.53) и
+    радиус 5.5, а подгонка окружности по их точкам — (-0.450, 15.510) и 5.500.
+
+    Дуга ломается по стрелке прогиба: хорда с углом d отходит от дуги на
+    rho*(1 - cos(d/2)), отсюда шаг по углу.
+    """
+    C, e1, a, R, phi0, phi1, _t0, _t1 = fr
+    rho = R + offset + blend
+    step = 2.0 * math.acos(max(-1.0, min(1.0, 1.0 - float(tol) / rho)))
+    n = max(3, int(math.ceil((phi1 - phi0) / max(step, 1e-4))) + 1)
+    nb = max(1, (n - 1) // 4)
+    z = FreeCAD.Vector(0, 0, 1)
+    out = []
+    for i in range(n):
+        # СВЕРХУ ВНИЗ. Наверху дуга касается верхней плоскости, то есть проход
+        # начинается ровно на верху оставшегося материала — спуск туда идёт по
+        # воздуху, а дальше фреза опускается по самой дуге, и отдельное врезание
+        # не нужно вовсе: уклон задаёт сама поверхность.
+        phi = phi1 + (phi0 - phi1) * i / (n - 1)
+        # `blend` — насколько выше номинала начинается проход. Чистовому это
+        # даёт вход по черновой поверхности (припуск сходит на нет за первую
+        # четверть дуги), иначе первый же кадр был бы отвесным врезанием в
+        # оставленный припуск.
+        off = offset + blend * max(0.0, 1.0 - float(i) / nb)
+        r = e1 * math.cos(phi) + z * math.sin(phi)
+        out.append(C + a * t + r * (R + off) + e1 * tool_r)
+    return out
+
+
+def make_fillet_op(doc, job, tc, fr, name, p, start_z, offset, cusp, tol,
+                   blend=0.0):
+    """Проход ПО СЕЧЕНИЮ скругления: явный путь, а не 3D-проход по поверхности.
+
+    Строчки идут вдоль ребра, и шаг между ними считается по ГРЕБЕШКУ. Одной
+    строчкой обойтись нельзя, хотя торец фрезы и накрывает всю грань: касание
+    происходит ровно на оси фрезы, а в стороны её кромка ОТХОДИТ по окружности,
+    и на расстоянии d от оси до детали остаётся
+
+        h = R_ф - sqrt(R_ф^2 - d^2),   откуда   d = sqrt(2*R_ф*h - h^2).
+
+    Замерено на 003 одной строчкой: плёнки по 0.1 мм у краёв 2.5 мм стенки при
+    чистых 1.0..1.5 мм посередине — ровно этот эффект (у краёв d = 1.25, что
+    даёт 0.13 мм). Формула та же, что у завода для гребешка от радиуса при
+    вершине, только радиус здесь не 0.5, а весь радиус фрезы.
+    """
+    import Path.Op.Custom as Custom
+    C, e1, a, R, phi0, phi1, t0, t1 = fr
+    tool_r = float(tc.Tool.Diameter.Value) / 2.0
+    L = t1 - t0
+    h = max(float(cusp), 1e-4)
+    step = 2.0 * math.sqrt(max(1e-9, 2.0 * tool_r * h - h * h))
+    if L <= step:
+        ts = [(t0 + t1) / 2.0]
+    else:
+        n = int(math.ceil(L / step)) + 1
+        ts = [t0 + L * i / (n - 1) for i in range(n)]
+    # ЗАХОД ВДОЛЬ РЕБРА, снаружи заготовки. Даёт сразу две вещи: спуск попадает
+    # в чистый воздух, и перед дугой появляется ПЛОСКИЙ отрезок, вдоль которого
+    # пасс подвода уложит рампу. Без него вход неизбежно упирается в припуск,
+    # оставленный на соседней плоскости, а рампе идти не по чему — сама дуга
+    # уже спускается.
+    # Сторона выбирается по габариту ЗАГОТОВКИ: годится тот конец ребра, за
+    # которым фреза целиком выходит из её габарита. Не нашлось такого — заход
+    # не ставим, вместо него припуск сходит на нет за первую четверть дуги
+    # (`blend`), это оставляет плёнку, но не бьёт по металлу.
+    sb = job.Stock.Shape.BoundBox
+    lead = tool_r + 2.0
+    lead_t = None
+    for cand in (t0 - lead, t1 + lead):
+        q = C + a * cand
+        if not (sb.XMin - 1e-6 <= q.x <= sb.XMax + 1e-6
+                and sb.YMin - 1e-6 <= q.y <= sb.YMax + 1e-6):
+            lead_t = cand
+            break
+    if lead_t is not None:
+        blend = 0.0
+
+    clear = start_z + p["safe_height"]
+    # Подача в кадре Custom задаётся во ВНУТРЕННИХ единицах FreeCAD, а это мм/с:
+    # написать «F2000» значит попросить 120 000 мм/мин. Постпроцессор печатает
+    # уже мм/мин, поэтому делим на 60.
+    feed = float(p["feed_rate"]) / 60.0
+    g = [f"G0 Z{clear:.3f}"]
+    total = 0.0
+    for k, t in enumerate(ts):
+        pts = fillet_path(fr, tool_r, offset, tol, t, blend)
+        if lead_t is not None:
+            pts.insert(0, pts[0] + a * (lead_t - t))
+        if k:
+            g.append(f"G0 Z{clear:.3f}")
+        g.append(f"G0 X{pts[0].x:.3f} Y{pts[0].y:.3f}")
+        g.append(f"G1 Z{pts[0].z:.3f} F{feed / 4.0:.6f}")
+        for q, q0 in zip(pts[1:], pts):
+            g.append(f"G1 X{q.x:.3f} Y{q.y:.3f} Z{q.z:.3f} F{feed:.6f}")
+            total += q.distanceToPoint(q0)
+    g.append(f"G0 Z{clear:.3f}")
+
+    op = Custom.Create(name, parentJob=job)
+    op.ToolController = tc
+    op.Source = "Text"
+    op.Gcode = g
+    doc.recompute()
+    n_cmd = len(op.Path.Commands) if op.Path else 0
+    log(f"{name}: {n_cmd} команд (по сечению скругления R{R:.2f}, "
+        f"{len(ts)} строчек вдоль ребра с шагом {step:.2f} мм, "
+        f"припуск {offset:g} мм, путь {total:.0f} мм)")
+    if n_cmd > 2:
+        return op
+    try:
+        doc.removeObject(op.Name)
+        doc.recompute()
+    except Exception:
+        pass
+    return None
+
+
 def make_bulk_ops(doc, job, tc, shape, p, alw_xy, alw_z, choose):
     """Съём объёма НАД деталью уровнями — первая стадия заводской программы.
 
@@ -1644,6 +1850,34 @@ def make_roughing_ops(doc, job, tc, shape, p):
                 continue
             rb2 = fc["rect"].BoundBox
             width = min(rb2.XLength, rb2.YLength)
+            # Скругление ВДОЛЬ РЕБРА — не 3D-проход сверху, а ход по сечению,
+            # как заводская `RADIYS_1`. Признак читается из модели (цилиндр с
+            # горизонтальной осью), путь считается формулой, пара
+            # «черновая с припуском → чистовая» повторяет заводскую.
+            fr = (fillet_frame(fc["face"], shape)
+                  if p.get("fillet_profile", True) else None)
+            if fr is not None:
+                tcx, dx = choose_tc(name, None)
+                ftol = float(p.get("fillet_tolerance", 0.01))
+                made = []
+                op = make_fillet_op(doc, job, tcx, fr, name, p, top, alw_z,
+                                    max(alw_z, ftol),
+                                    max(float(p["rough_tolerance"]), ftol))
+                if op:
+                    made.append(op)
+                fname = name.replace("Rough", "Finish", 1)
+                if op and fin and alw_z > 1e-6 and not skip(fname):
+                    op2 = make_fillet_op(doc, job, tcx, fr, fname, p, top, 0.0,
+                                         ftol, ftol, blend=alw_z)
+                    if op2:
+                        made.append(op2)
+                if made:
+                    ops.extend(made)
+                    write_partial(job, ops, p,
+                                  f"готово скругление вдоль ребра {slope_n} "
+                                  f"(Ø{dx:g}, R{fr[3]:.2f}, {fc['area']:.0f} мм²)")
+                    continue
+                log(f"{name}: ход по сечению пуст — возвращаюсь к 3D-проходу")
             # ВОГНУТЫЙ радиус (гиб, галтель у стенки) ограничивает фрезу сверху:
             # плоская фреза радиусом больше R в такой угол не входит — её ось не
             # подойдёт к стенке ближе своего радиуса, и вся дуга остаётся целой.
