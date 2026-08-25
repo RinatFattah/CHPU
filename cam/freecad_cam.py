@@ -132,7 +132,11 @@ def generate_gcode_freecad(model_path: str, gcode_path: str) -> int:
         "bulk_rough": bool(getattr(config, "BULK_ROUGH", True)),
         "clear_contour_band": bool(getattr(config, "CLEAR_CONTOUR_BAND", True)),
         "clear_stepdown": float(getattr(config, "CLEAR_STEPDOWN", 0.0) or 0.0),
-        "clear_tall_band": float(getattr(config, "CLEAR_TALL_BAND", 10.0)),
+        # Прежнее имя порога — CLEAR_TALL_BAND: он мерил ВЫСОТУ полосы, а не
+        # толщину куска вдоль хода, то есть отвечал на другой вопрос. Алиаса
+        # намеренно нет: загрузчик конфига печатает старый ключ как неизвестный,
+        # и это видно, а тихая подмена смысла — нет.
+        "clear_thin_pass": float(getattr(config, "CLEAR_THIN_PASS", 10.0)),
         "clear_stepdown_shallow": float(getattr(config, "CLEAR_STEPDOWN_SHALLOW", 1.5)),
         "clear_straight": bool(getattr(config, "CLEAR_STRAIGHT", True)),
         "drop_null_moves": bool(getattr(config, "DROP_NULL_MOVES", True)),

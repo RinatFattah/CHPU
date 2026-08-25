@@ -896,6 +896,55 @@ def straight_pass(chain, face, filled, off, r):
     return Part.Wire([seg]), swath
 
 
+def pass_thickness(chain, face):
+    """Толщина куска ВДОЛЬ ХОДА, мм, или None: сколько металла фреза пересекает
+    за один проход.
+
+    Именно эта величина решает, какой слой по глубине можно себе позволить:
+    фреза, пересёкшая стенку 2.5 мм и вышедшая в воздух, нагружена совсем не
+    так, как та, что идёт вдоль металла. Направление хода берётся из самого
+    длинного ПРЯМОГО ребра цепочки (по нему же строится прямой проход), а если
+    прямых рёбер нет — из хорды всей цепочки.
+    """
+    lines = [e for e in chain
+             if type(e.Curve).__name__ == "Line" and e.Length > 1e-6]
+    if lines:
+        base = max(lines, key=lambda e: e.Length)
+        a0, a1 = base.Vertexes[0].Point, base.Vertexes[-1].Point
+    else:
+        a0 = chain[0].Vertexes[0].Point
+        a1 = chain[-1].Vertexes[-1].Point
+    u = FreeCAD.Vector(a1.x - a0.x, a1.y - a0.y, 0.0)
+    if u.Length < 1e-6:
+        return None
+    u.normalize()
+    ext = _uv_extent(face, u, FreeCAD.Vector(-u.y, u.x, 0.0))
+    return None if ext is None else ext[1] - ext[0]
+
+
+def clear_step(p, thick):
+    """Шаг слоя очистки по толщине куска вдоль хода: (шаг, чем обоснован).
+
+    Завод разводит шаг по стадиям при ОДНОМ инструменте и ОДНИХ режимах (F2000,
+    12000 об/мин): на съёме объёма над деталью 1.0 мм (`NK_1_01`, 24 уровня), на
+    боковых полосках 1.5 (`NK_1_02/03`, 9–10 уровней). Разница ровно в длине
+    контакта: там фреза 80 мм подряд снимает верх стенки ТОРЦОМ, здесь
+    пересекает 2.5 мм стенки БОКОМ и сразу выходит в воздух. Чем короче контакт,
+    тем больше осевой глубины при той же нагрузке.
+    """
+    given = float(p.get("clear_stepdown") or 0.0)
+    if given > 0:
+        return given, "задан"
+    thin = float(p.get("clear_thin_pass", 10.0))
+    if thick is None:
+        return float(p["rough_stepdown"]), "толщина вдоль хода не посчитана"
+    if thick <= thin:
+        return (float(p.get("clear_stepdown_shallow", 1.5)),
+                f"кусок {thick:.1f} мм вдоль хода — фреза его пересекает")
+    return (float(p["rough_stepdown"]),
+            f"кусок {thick:.1f} мм вдоль хода — фреза идёт вдоль металла")
+
+
 def contour_band(filled, dia, alw_xy):
     """След обводной фрезы вокруг детали: (пути центра фрезы, полоса под ней).
 
@@ -947,23 +996,12 @@ def make_clearance_ops(doc, job, shape, p, filled, peri_top, alw_xy, choose):
         z_top = job.Stock.Shape.BoundBox.ZMax
     height = z_top - peri_top
 
-    # Шаг слоя. Завод разводит его по стадиям: на съёме объёма над деталью
-    # 1.0 мм (`NK_1_01`, 24 уровня), на боковых полосках 1.5 (`NK_1_02/03`,
-    # 9–10 уровней) — при одном и том же инструменте и одних режимах (F2000,
-    # 12000 об/мин). Разница в характере контакта: там фреза 80 мм подряд
-    # снимает верх стенки ТОРЦОМ, здесь пересекает 2.5 мм стенки БОКОМ и сразу
-    # выходит в воздух. Чем короче контакт, тем больше осевой глубины можно себе
-    # позволить при той же нагрузке.
-    # Отсюда правило по высоте полосы: высокая (глубокий суммарный съём) —
-    # осторожный шаг чернового слоя, невысокая — крупный.
-    step = float(p.get("clear_stepdown") or 0.0)
-    if step > 0:
-        how = "задан"
-    elif height > float(p.get("clear_tall_band", 10.0)):
-        step, how = float(p["rough_stepdown"]), "полоса высокая"
-    else:
-        step, how = float(p.get("clear_stepdown_shallow", 1.5)), "полоса невысокая"
-    if height < step * 0.5:
+    # Шаг слоя выбирается ПО КУСКУ, ниже в цикле: величина, которая решает, —
+    # ТОЛЩИНА КУСКА ВДОЛЬ ХОДА, то есть сколько металла фреза пересекает за
+    # проход. Здесь только запасное значение: им сэмплируются сечения заготовки
+    # и отсекается совсем мелкий диапазон.
+    step = float(p.get("clear_stepdown") or 0.0) or float(p["rough_stepdown"])
+    if height < min(step, float(p.get("clear_stepdown_shallow", 1.5))) * 0.5:
         return []
 
     tcx, dia = choose("RoughClear1", None)
@@ -1038,6 +1076,12 @@ def make_clearance_ops(doc, job, shape, p, filled, peri_top, alw_xy, choose):
         if not chains:
             continue
 
+        # Шаг слоя — по толщине ЭТОГО куска вдоль хода. Самый толстый из
+        # вариантов прохода, то есть самый осторожный выбор.
+        thick = [pass_thickness(ch, face) for ch, _off in chains]
+        thick = max([t for t in thick if t is not None], default=None)
+        step, how_step = clear_step(p, thick)
+
         # Прямые проходы вдоль куска — если он прямоугольный И если их следы его
         # накрывают. Покрытие считается по ВСЕМ линиям куска сразу: одна линия
         # накрывает полосу шириной с фрезу, а полоса под обвод шире её ровно на
@@ -1080,8 +1124,9 @@ def make_clearance_ops(doc, job, shape, p, filled, peri_top, alw_xy, choose):
             op = make_engrave_sweep(doc, job, tcx, name, wire,
                                     dict(p, rough_stepdown=step),
                                     z_top, peri_top,
-                                    note="очистка полосы под обвод контура, "
-                                         + how_path)
+                                    note=f"очистка полосы под обвод контура, "
+                                         f"{how_path}, слой {step:g} мм "
+                                         f"({how_step})")
             if op:
                 ops.append(op)
                 total += wire.Length
@@ -1091,8 +1136,7 @@ def make_clearance_ops(doc, job, shape, p, filled, peri_top, alw_xy, choose):
         log(f"очистка полосы под обвод: {len(faces)} участков "
             f"({sum(f.Area for f in faces):.0f} мм² в плане), {len(offs)} линии "
             f"обвода, путь {total:.0f} мм на уровень, "
-            f"Z {z_top:.1f}..{peri_top:.1f} ({height:.1f} мм), "
-            f"слой {step:g} мм ({how})")
+            f"Z {z_top:.1f}..{peri_top:.1f} ({height:.1f} мм)")
     return ops
 
 
