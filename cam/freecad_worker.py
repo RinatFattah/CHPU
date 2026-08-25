@@ -1064,8 +1064,13 @@ def contour_band(filled, dia, alw_xy):
     `NK_1_02` и `NK_1_02_COPY` идут в 0.5 мм друг от друга и вместе прорезают
     полосу шириной ровно 2R + припуск.
     """
+    # Порядок: СНАЧАЛА линия с припуском, потом в размер — как `NK_1_02`
+    # (Y 46.55) перед `NK_1_02_COPY` (Y 46.05) у завода. Обратный порядок не
+    # ошибка по геометрии, но снимает торец стенки В РАЗМЕР сразу, полной
+    # шириной фрезы, а второму проходу оставляет полоску 0.5 мм у дальнего
+    # края — то есть чистовое резание идёт первым и по полному металлу.
     r = dia / 2.0
-    offs = [r] + ([r + alw_xy] if alw_xy > 1e-6 else [])
+    offs = ([r + alw_xy] if alw_xy > 1e-6 else []) + [r]
     band = filled.makeOffset2D(2.0 * r + alw_xy).cut(filled)
     return offs, band
 
@@ -1365,7 +1370,7 @@ def fillet_path(fr, tool_r, offset, tol, t, blend=0.0):
 
 
 def make_fillet_op(doc, job, tc, fr, name, p, start_z, offset, cusp, tol,
-                   blend=0.0):
+                   blend=0.0, feed_scale=1.0):
     """Проход ПО СЕЧЕНИЮ скругления: явный путь, а не 3D-проход по поверхности.
 
     Строчки идут вдоль ребра, и шаг между ними считается по ГРЕБЕШКУ. Одной
@@ -1416,7 +1421,11 @@ def make_fillet_op(doc, job, tc, fr, name, p, start_z, offset, cusp, tol,
     # Подача в кадре Custom задаётся во ВНУТРЕННИХ единицах FreeCAD, а это мм/с:
     # написать «F2000» значит попросить 120 000 мм/мин. Постпроцессор печатает
     # уже мм/мин, поэтому делим на 60.
-    feed = float(p["feed_rate"]) / 60.0
+    # feed_scale — доля рабочей подачи. Завод режет чистовой проход по
+    # скруглению вдвое медленнее остального (`RADIYS_1_CHIST` идёт на F1000
+    # при F2000 везде), и это решение про шероховатость: радиальная нагрузка
+    # на чистовом проходе, наоборот, мизерная.
+    feed = float(p["feed_rate"]) * float(feed_scale) / 60.0
     g = [f"G0 Z{clear:.3f}"]
     total = 0.0
     for k, t in enumerate(ts):
@@ -2087,8 +2096,10 @@ def make_roughing_ops(doc, job, tc, shape, p):
                     made.append(op)
                 fname = name.replace("Rough", "Finish", 1)
                 if op and fin and alw_z > 1e-6 and not skip(fname):
-                    op2 = make_fillet_op(doc, job, tcx, fr, fname, p, top, 0.0,
-                                         ftol, ftol, blend=alw_z)
+                    op2 = make_fillet_op(
+                        doc, job, tcx, fr, fname, p, top, 0.0, ftol, ftol,
+                        blend=alw_z,
+                        feed_scale=float(p.get("fillet_finish_feed", 0.5)))
                     if op2:
                         made.append(op2)
                 if made:
