@@ -138,6 +138,7 @@ def generate_gcode_freecad(model_path: str, gcode_path: str) -> int:
         "drop_null_moves": bool(getattr(config, "DROP_NULL_MOVES", True)),
         "fillet_profile": bool(getattr(config, "FILLET_PROFILE", True)),
         "face_median_line": bool(getattr(config, "FACE_MEDIAN_LINE", True)),
+        "even_stepdown": bool(getattr(config, "EVEN_STEPDOWN", True)),
         "fillet_tolerance": float(getattr(config, "FILLET_TOLERANCE", 0.01)),
         "rough_mode": config.ROUGH_MODE,
         "rough_allowance": config.ROUGH_ALLOWANCE,

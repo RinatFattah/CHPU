@@ -515,6 +515,39 @@ def find_up_faces(shape, bb, include_top=False):
     return ordered
 
 
+# Насколько шаг слоя разрешено превысить, чтобы не появился вырожденный
+# последний уровень, — доля самого шага. FreeCAD делит высоту на шаг с
+# округлением ВВЕРХ, и остаток, каким бы малым он ни был, становится отдельным
+# уровнем. У обвода контура 003 высота 2.016 мм при шаге 1.0: три уровня, из
+# которых третий снимает 16 МИКРОН — целый обвод детали (270 мм) ради них.
+# С допуском 5 % те же 2.016 делятся на два слоя по 1.008.
+STEPDOWN_SLACK = 0.05
+
+
+def layer_step(p, start_z, final_z, step=None):
+    """Шаг слоя, разложенный по высоте ровно: уровни выходят одинаковыми.
+
+    Возвращает шаг, на который FreeCAD поделит (start_z − final_z) без остатка.
+    Заданный шаг при этом может быть превышен, но не более чем на
+    STEPDOWN_SLACK — то есть ровно настолько, насколько дешевле превысить, чем
+    гнать лишний проход ради остатка.
+    """
+    step = float(p["rough_stepdown"] if step is None else step)
+    if not p.get("even_stepdown", True):
+        return step
+    total = float(start_z) - float(final_z)
+    if total <= 1e-9 or step <= 1e-9 or total <= step:
+        return step
+    n = max(1, int(math.ceil(total / step - STEPDOWN_SLACK)))
+    # Шаг берём чуть БОЛЬШЕ точного частного, на последнем бите. Иначе
+    # `PathUtils.depth_params` ловит двоичную неточность: число полных шагов оно
+    # считает через int() (отбрасывание), а «дошли ли ровно до дна» — точным
+    # сравнением ==. Ровное частное 19.000000000000004 / 19 даёт шаг, при
+    # котором нижний уровень появляется ДВАЖДЫ. С нижним битом вверх число
+    # полных шагов всегда n−1, и дно добавляется ровно один раз.
+    return total / n * (1.0 + 1e-12)
+
+
 def make_adaptive(doc, job, tc, name, region_shape, p, start_z, final_z, allowance):
     """Одна черновая операция Adaptive по явной 2D-зоне (Side=Inside).
     Возвращает операцию или None, если траектория пуста.
@@ -538,7 +571,7 @@ def make_adaptive(doc, job, tc, name, region_shape, p, start_z, final_z, allowan
     set_prop(op, "Tolerance", float(p["rough_tolerance"]))
     # setExpression(None) снимает привязку к SetupSheet — иначе recompute вернёт дефолт
     op.setExpression("StepDown", None)
-    set_prop(op, "StepDown", p["rough_stepdown"])
+    set_prop(op, "StepDown", layer_step(p, start_z, final_z))
     op.setExpression("StartDepth", None)
     op.StartDepth = start_z
     op.setExpression("FinalDepth", None)
@@ -579,7 +612,7 @@ def make_profile(doc, job, tc, name, region_shape, p, start_z, final_z, allowanc
     set_prop(op, "UseComp", True)  # смещение на радиус фрезы считается в софте
     set_prop(op, "OffsetExtra", FreeCAD.Units.Quantity(f"{allowance} mm"))
     op.setExpression("StepDown", None)
-    set_prop(op, "StepDown", p["rough_stepdown"])
+    set_prop(op, "StepDown", layer_step(p, start_z, final_z))
     op.setExpression("StartDepth", None)
     op.StartDepth = start_z
     op.setExpression("FinalDepth", None)
@@ -649,7 +682,7 @@ def make_surface_rough(doc, job, tc, name, model_obj, face_idx, p,
              FreeCAD.Units.Quantity(f"{max(float(p['rough_tolerance']), 0.2)} mm"))
     set_prop(op, "DepthOffset", FreeCAD.Units.Quantity(f"{allowance} mm"))
     op.setExpression("StepDown", None)
-    set_prop(op, "StepDown", p["rough_stepdown"])
+    set_prop(op, "StepDown", layer_step(p, start_z, final_z))
     op.setExpression("StartDepth", None)
     op.StartDepth = start_z
     op.setExpression("FinalDepth", None)
@@ -714,7 +747,7 @@ def make_engrave_sweep(doc, job, tc, name, wire, p, start_z, final_z,
     op.ToolController = tc
     op.BaseShapes = [feat]
     op.setExpression("StepDown", None)
-    set_prop(op, "StepDown", p["rough_stepdown"])
+    set_prop(op, "StepDown", layer_step(p, start_z, final_z))
     op.setExpression("StartDepth", None)
     op.StartDepth = start_z
     op.setExpression("FinalDepth", None)
