@@ -2970,7 +2970,7 @@ def drop_null_moves(gcode):
 
 def optimize_links(gcode, stock_map, vert_feed, clearance=1.0, air_cuts=False,
                    ramp_angle=0.0, horiz_feed=None, tool_radii=None,
-                   stepdown=None):
+                   stepdown=None, op_stepdowns=None):
     """Подвод и врезание по модели снятого материала.
 
     Замечание ОЭЦМ: «лишние перемещения и опасные вертикальные врезания». У нас
@@ -3006,8 +3006,24 @@ def optimize_links(gcode, stock_map, vert_feed, clearance=1.0, air_cuts=False,
     #    Ловится той же 2.5D-моделью снятого материала, по которой считается
     #    подвод. Радиус берётся с НЕДОБОРОМ (как в cut): материал ровно на
     #    границе диска — это стенка, вдоль которой фреза и должна идти.
-    side_lim = None if stepdown is None else max(3.0 * float(stepdown), 3.0)
+    # Порог считается от слоя ТЕКУЩЕЙ операции, а не от общего дефолта: с
+    # техпланом слой у каждой операции свой, и общий порог превращал законный
+    # крупный слой в ложное срабатывание. Замерено: план агента поднял слой
+    # очистки полосы до 9.5 мм — операция ровно на это и рассчитана, а детектор
+    # мерил её порогом 3.0 от конфига.
+    op_steps = {k: float(v) for k, v in (op_stepdowns or {}).items() if v}
+    base_step = None if stepdown is None else float(stepdown)
+
+    def side_limit(op_name):
+        st = op_steps.get(op_name, base_step)
+        return None if st is None else max(3.0 * st, 3.0)
+
+    side_lim = side_limit(None)
+    # Хранится ХУДШЕЕ ПРЕВЫШЕНИЕ над порогом СВОЕЙ операции, а не абсолютная
+    # высота: у операций с разными слоями пороги разные, и сравнивать их
+    # абсолютные величины нельзя.
     side_max, side_at, side_op, cur_op = 0.0, None, None, None
+    side_over, side_lim_at = 0.0, None
 
     def head_of(code):
         h = _re.sub(r"\s*Z-?[\d.]+", "", code.split("F")[0]).strip()
@@ -3109,7 +3125,8 @@ def optimize_links(gcode, stock_map, vert_feed, clearance=1.0, air_cuts=False,
         else:
             out.append(b["raw"])
 
-        if side_lim is not None and cur_r:
+        lim_here = side_limit(cur_op)
+        if lim_here is not None and cur_r:
             zb = min(z, nz_)
             pr = max(cur_r - 2.0 * stock_map.pitch, stock_map.pitch)
             # Середину дуги нельзя брать как середину ХОРДЫ: она лежит внутри
@@ -3118,18 +3135,20 @@ def optimize_links(gcode, stock_map, vert_feed, clearance=1.0, air_cuts=False,
             pts_probe = [(x, y), (nx_, ny_), _mid_point(b, x, y, nx_, ny_)]
             for px, py in pts_probe:
                 d = stock_map.top(px, py, pr) - zb
-                if d > side_max:
+                if d > lim_here and d - lim_here > side_over:
+                    side_over, side_lim_at = d - lim_here, lim_here
                     side_max, side_at, side_op = d, (px, py, zb), cur_op
 
         stock_map.cut(x, y, nx_, ny_, min(z, nz_), cur_r)
 
-    if side_lim is not None and side_max > side_lim:
+    if side_at is not None:
         px, py, pz = side_at
         log(f"ВНИМАНИЕ: боковой рез — {side_op or '?'} идёт на Z={pz:.2f}, а в "
             f"следе фрезы стоит материал до Z={pz + side_max:.2f} "
             f"(X={px:.1f} Y={py:.1f}). Фреза срежет его боком на "
-            f"{side_max:.1f} мм: этот материал должна была снять более ранняя "
-            f"операция, и сверка такого не покажет — она меряет тело детали")
+            f"{side_max:.1f} мм при пороге {side_lim_at:.1f} для этой операции: "
+            f"материал должна была снять более ранняя операция, и сверка такого "
+            f"не покажет — она меряет тело детали")
 
     if n_cut or n_all or n_air or n_ramp:
         log(f"подвод: {n_all} спусков целиком по воздуху, {n_cut} укорочено, "
@@ -3407,7 +3426,9 @@ def mill(doc, feat, p, stock_solid=None):
                 air_cuts=bool(p.get("air_cuts_rapid", False)),
                 ramp_angle=float(p.get("ramp_angle", 0.0)),
                 horiz_feed=float(feed), tool_radii=tools_map,
-                stepdown=float(p.get("rough_stepdown", 1.0)))
+                stepdown=float(p.get("rough_stepdown", 1.0)),
+                op_stepdowns={o.Name: getattr(getattr(o, "StepDown", None),
+                                              "Value", None) for o in ops})
         except Exception as e:   # без модели программа валидна, просто длиннее
             log(f"warn: подвод не оптимизирован ({e})")
     # ПОСЛЕДНИМ: предыдущие пассы сами переставляют и вставляют кадры, и часть
