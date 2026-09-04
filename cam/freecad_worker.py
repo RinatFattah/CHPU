@@ -38,7 +38,24 @@ for _stream in (sys.stdout, sys.stderr):
         except (AttributeError, ValueError):
             pass
 
+# Техплан лежит соседним модулем: его читают и хост, и тесты, поэтому в worker
+# он не встроен. Свою папку в sys.path добавляем сами — freecadcmd этого не
+# гарантирует, а worker вдобавок бывает скопирован в TEMP (кириллица в пути).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from plan import Plan
+except ImportError as _e:      # план не критичен для программы — не роняем расчёт
+    Plan = None
+    _PLAN_ERR = _e
+
 SOLID_EXTS = {".step", ".stp", ".iges", ".igs", ".brep", ".brp"}
+
+
+def _feat(p, op_name, klass, **kw):
+    """Записать фичу в техплан, если он ведётся. На расчёт не влияет."""
+    pl = p.get("_plan")
+    if pl is not None:
+        pl.feature(op_name, klass, **kw)
 
 
 def log(msg):
@@ -1295,6 +1312,9 @@ def make_clearance_ops(doc, job, shape, p, filled, peri_top, alw_xy, choose):
         for wire in wires:
             n += 1
             name = f"RoughClear{n}"
+            _feat(p, name, "полоса под обвод контура",
+                  длина_линии=wire.Length, Z_от=z_top, Z_до=peri_top,
+                  слой=step)
             op = make_engrave_sweep(doc, job, tcx, name, wire,
                                     dict(p, rough_stepdown=step),
                                     z_top, peri_top,
@@ -1583,6 +1603,9 @@ def make_bulk_ops(doc, job, tc, shape, p, alw_xy, alw_z, choose):
         except Exception:
             w_eff = dia * 3
         narrow = w_eff < 2.0 * dia
+        _feat(p, name, "объём над деталью", площадь=rf.Area,
+              средняя_ширина=w_eff, узкая_полоса=narrow,
+              Z_от=z_top, Z_до=z_floor)
 
         op, how = None, ""
         # Полоса-прямоугольник — один проход по средней линии на уровень, как
@@ -1976,6 +1999,9 @@ def make_roughing_ops(doc, job, tc, shape, p):
         # теперь берём следующую по убыванию, пока путь не появится.
         width = min(rb.XLength, rb.YLength)
         name = f"RoughHole{i}"
+        _feat(p, name, "сквозной вырез", площадь=region.Area,
+              габарит=[round(rb.XLength, 2), round(rb.YLength, 2)],
+              наименьшая_ширина=width, Z_от=hole_top, Z_до=bb.ZMin)
         first, dx0 = choose_tc(name, width)
         tries = [(first, dx0)] + [(pool[d], d) for d in diams
                                   if d < dx0 and name not in overrides]
@@ -2115,6 +2141,14 @@ def make_roughing_ops(doc, job, tc, shape, p):
                     # Черновой снимать нечего (стадия съёма объёма дошла ровно
                     # до припуска), а чистовому есть: припуск на грани остался.
                     face_n += 1
+                    # фича регистрируется и здесь: иначе у чистового прохода в
+                    # плане не будет фичи, и это выглядело бы как непокрытая
+                    # грань, хотя она покрыта
+                    _feat(p, f"RoughFace{face_n}", "плоскость",
+                          площадь=fc["area"], Z=fc["z"], Z_от=top,
+                          Z_до=fc["final0"],
+                          припуск_от_заготовки=top - fc["final0"],
+                          только_чистовой=True)
                     rfb = fc["region"].BoundBox
                     finish_surface(f"RoughFace{face_n}", fc["idx"], top,
                                    fc["final0"],
@@ -2123,6 +2157,8 @@ def make_roughing_ops(doc, job, tc, shape, p):
                 continue  # грань вровень с верхом материала — снимать нечего
             face_n += 1
             name = f"RoughFace{face_n}"
+            _feat(p, name, "плоскость", площадь=fc["area"], Z=fc["z"],
+                  Z_от=top, Z_до=fc["final"], припуск_от_заготовки=top - fc["final0"])
             if skip(name):
                 continue
             rfb = fc["region"].BoundBox
@@ -2151,6 +2187,9 @@ def make_roughing_ops(doc, job, tc, shape, p):
                 continue
             slope_n += 1
             name = f"RoughSlope{slope_n}"
+            _feat(p, name, "криволинейная грань", площадь=fc["area"],
+                  Z_от=top, Z_до=fc["final"],
+                  припуск_от_заготовки=top - fc["final0"])
             if skip(name):
                 continue
             rb2 = fc["rect"].BoundBox
@@ -2255,6 +2294,8 @@ def make_roughing_ops(doc, job, tc, shape, p):
     #      углах заготовки, не касающийся детали, остаётся (так просил техпроцесс).
     #      Прорезаем именно внешний периметр детали, не выбирая всё поле. ──
     if filled is not None and peri_top is not None:
+        _feat(p, "RoughPerimeter", "внешний контур",
+              площадь=filled.Area, Z_от=peri_top, Z_до=bb.ZMin)
         if not skip("RoughPerimeter"):
             # внешний контур режем до дна ДЕТАЛИ (bb.ZMin, снизу клампится полом):
             # периметр отделяет деталь от рамки заготовки. Припуск по стенке
@@ -3134,6 +3175,25 @@ def mill(doc, feat, p, stock_solid=None):
             f"({stock_note})")
     export_stock(job, p)
 
+    # Техплан пишется ПАРАЛЛЕЛЬНО расчёту и ни на что не влияет: это снимок
+    # решений, а не их источник. Источником он станет, когда решения начнёт
+    # принимать агент.
+    if Plan is not None:
+        p["_plan"] = Plan()
+        p["_plan"].input(
+            деталь=os.path.basename(p.get("model_path", "")),
+            заготовка=(os.path.basename(p["stock_file"]) if p.get("stock_file")
+                       else f"габарит + поля {p.get('stock_margin')} мм"),
+            материал=p.get("material") or None,
+            станок=p.get("machine") or None,
+            габарит_детали=[round(bb.XLength, 2), round(bb.YLength, 2),
+                            round(bb.ZLength, 2)],
+            габарит_заготовки=[round(sb.XLength, 2), round(sb.YLength, 2),
+                               round(sb.ZLength, 2)],
+            нуль=p.get("origin"), зазор_от_стола=p.get("floor_clearance"))
+    else:
+        log(f"warn: техплан не пишется — модуль plan не импортировался ({_PLAN_ERR})")
+
     tc = job.Tools.Group[0]
     feed = float(p["feed_rate"])
     rpm = float(p["spindle_speed"])
@@ -3178,6 +3238,28 @@ def mill(doc, feat, p, stock_solid=None):
             f"(главная Ø{tool_d:g}); неглавные добавятся в программу по факту")
     p["_tool_pool"] = pool
     p["_tool_diams"] = tset
+    if p.get("_plan") is not None:
+        pl = p["_plan"]
+        cat = p.get("tool_catalog") or {}
+        pl.input(инструмент=[
+            dict({"Ø": d, "T": i + 1}, **{k: v for k, v in
+                  (next((c for kk, c in cat.items()
+                         if abs(float(kk) - d) < 1e-6), {}) or {}).items()})
+            for i, d in enumerate(tset)])
+        # Шаги алгоритма, которые сейчас НЕ выполняются. Пишем явно: молчаливое
+        # умолчание неотличимо от расчёта, а по этому списку видно, чего системе
+        # не хватает и что первым отдавать агенту.
+        pl.undone(3, "требования по квалитету и Ra не читаются: на моделях они "
+                     "заданы цветом, расшифровки инструкции 30.0011.0155.998 нет",
+                  "все грани обрабатываются как этап I")
+        pl.undone(7, "порядок стадий зашит в код, а не выведен",
+                  "объём → полоса → вырезы → грани сверху вниз → контур")
+        pl.undone(13, "число зубьев фрезы неизвестно — в операционной карте не "
+                      "указано")
+        pl.undone(14, "подача не рассчитана по карте 3", f"F={feed:g} мм/мин из конфига")
+        pl.undone(15, "скорость резания не рассчитана по карте 4",
+                  f"n={rpm:g} об/мин из конфига")
+        pl.undone(16, "проверка по силе и мощности не делается — нет паспорта станка")
     doc.recompute()
 
     # в описание идёт только диаметр — единственный размер, который мы задаём;
@@ -3245,6 +3327,13 @@ def mill(doc, feat, p, stock_solid=None):
     # порядок операций = порядок выполнения
     tools_map = {getattr(t, "ToolNumber", 0): t.Tool.Diameter.Value
                  for t in ([tc] + list(used.values()))}
+    if p.get("_plan") is not None:
+        try:
+            pl = p["_plan"].collect(ops)
+            dst = pl.dump(Plan.path_for(p["gcode_path"]))
+            log(f"техплан: {pl.summary()} → {os.path.basename(dst)}")
+        except Exception as e:
+            log(f"warn: техплан не записан: {e}")
     body = export_gcode(job, ops, p["postprocessor"])
     body = insert_tool_passports(body, tools_map, p.get("tool_catalog"))
     if p.get("safe_start_order", True):

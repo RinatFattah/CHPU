@@ -73,6 +73,11 @@ def _worker_path() -> str:
         return p
     dst = os.path.join(tempfile.gettempdir(), "freecad_worker.py")
     shutil.copyfile(_WORKER, dst)
+    # worker импортирует соседний plan.py — при копировании во временную папку
+    # он обязан поехать вместе, иначе техплан молча не пишется
+    side = os.path.join(os.path.dirname(_WORKER), "plan.py")
+    if os.path.exists(side):
+        shutil.copyfile(side, os.path.join(tempfile.gettempdir(), "plan.py"))
     return dst
 
 
@@ -112,6 +117,8 @@ def generate_gcode_freecad(model_path: str, gcode_path: str) -> int:
         "tool_catalog": {float(k): v for k, v in
                          (getattr(config, "TOOL_CATALOG", None) or {}).items()},
         "spindle_speed": config.SPINDLE_SPEED,
+        "material": str(getattr(config, "MATERIAL", "") or ""),
+        "machine": str(getattr(config, "MACHINE", "") or ""),
         "safe_height": config.SAFE_HEIGHT,
         "stock_margin": config.STOCK_MARGIN,
         "stock_margin_top": config.STOCK_MARGIN_TOP,
