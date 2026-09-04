@@ -119,6 +119,9 @@ def main():
                          "layers = послойно, как Cavity Mill (эксперимент)")
     ap.add_argument("--stock-margin", type=float, metavar="MM",
                     help="поля заготовки вокруг детали по X/Y, мм (дефолт из конфига)")
+    ap.add_argument("--plan", metavar="FILE",
+                    help="строить программу ПО техплану: состав операций, "
+                         "инструмент, слой и шаг строчек берутся из него")
     ap.add_argument("--stock", metavar="FILE",
                     help="заготовка из файла (.step/.iges/.brep/.stl) в той же "
                          "системе координат, что и модель; поля игнорируются")
@@ -172,6 +175,8 @@ def main():
         config.ROUGH_MODE = args.rough_mode
     if args.stock_margin is not None:
         config.STOCK_MARGIN = args.stock_margin
+    if args.plan:
+        config.PLAN_IN = args.plan
     if args.stock:
         config.STOCK_FILE = args.stock
     if args.stock_align:

@@ -58,6 +58,27 @@ def _feat(p, op_name, klass, **kw):
         pl.feature(op_name, klass, **kw)
 
 
+def _why(p, op_name, шаг, блок, правило, значение, вид="выбор"):
+    """Записать обоснование решения. На расчёт не влияет."""
+    pl = p.get("_plan")
+    if pl is not None:
+        pl.ground(op_name, шаг, блок, правило, значение, вид)
+
+
+def planned(p, op_name, key, default=None):
+    """Значение из ВХОДНОГО плана для этой операции, иначе default.
+
+    Это точка, где решение перестаёт быть эвристикой воркера и становится
+    данными: с планом на входе воркер исполняет, без плана — решает сам.
+    Обратная совместимость поэтому даровая — нет плана, нет и переопределений.
+    """
+    tr = (p.get("_plan_ops") or {}).get(op_name)
+    if not tr:
+        return default
+    v = tr.get(key)
+    return default if v is None else v
+
+
 def log(msg):
     # stdout worker'а парсится хостом; префикс отделяет наши строки от шума FreeCAD
     print(f"[worker] {msg}", flush=True)
@@ -620,11 +641,13 @@ def make_adaptive(doc, job, tc, name, region_shape, p, start_z, final_z, allowan
     set_prop(op, "OperationType", "Clearing")
     set_prop(op, "Side", "Inside")
     set_prop(op, "StockToLeave", FreeCAD.Units.Quantity(f"{allowance} mm"))
-    set_prop(op, "StepOver", int(p["rough_stepover"]))
+    set_prop(op, "StepOver",
+             int(planned(p, name, "шаг_строчек_%", p["rough_stepover"])))
     set_prop(op, "Tolerance", float(p["rough_tolerance"]))
     # setExpression(None) снимает привязку к SetupSheet — иначе recompute вернёт дефолт
     op.setExpression("StepDown", None)
-    set_prop(op, "StepDown", layer_step(p, start_z, final_z))
+    set_prop(op, "StepDown",
+             layer_step(p, start_z, final_z, planned(p, name, "слой")))
     op.setExpression("StartDepth", None)
     op.StartDepth = start_z
     op.setExpression("FinalDepth", None)
@@ -725,11 +748,13 @@ def make_pocket(doc, job, tc, name, region_shape, p, start_z, final_z, allowance
     op.Base = [(region, f"Face{i + 1}") for i in range(len(region.Shape.Faces))]
     set_prop(op, "ClearingPattern", "Offset")   # витки по контуру, как Cavity Mill
     set_prop(op, "StartAt", "Edge")             # снаружи внутрь
-    set_prop(op, "StepOver", int(p["rough_stepover"]))
+    set_prop(op, "StepOver",
+             int(planned(p, name, "шаг_строчек_%", p["rough_stepover"])))
     set_prop(op, "ExtraOffset", FreeCAD.Units.Quantity(f"{allowance} mm"))
     set_prop(op, "KeepToolDown", True)          # не отводиться между витками
     op.setExpression("StepDown", None)
-    set_prop(op, "StepDown", layer_step(p, start_z, final_z))
+    set_prop(op, "StepDown",
+             layer_step(p, start_z, final_z, planned(p, name, "слой")))
     op.setExpression("StartDepth", None)
     op.StartDepth = start_z
     op.setExpression("FinalDepth", None)
@@ -770,7 +795,8 @@ def make_profile(doc, job, tc, name, region_shape, p, start_z, final_z, allowanc
     set_prop(op, "UseComp", True)  # смещение на радиус фрезы считается в софте
     set_prop(op, "OffsetExtra", FreeCAD.Units.Quantity(f"{allowance} mm"))
     op.setExpression("StepDown", None)
-    set_prop(op, "StepDown", layer_step(p, start_z, final_z))
+    set_prop(op, "StepDown",
+             layer_step(p, start_z, final_z, planned(p, name, "слой")))
     op.setExpression("StartDepth", None)
     op.StartDepth = start_z
     op.setExpression("FinalDepth", None)
@@ -833,14 +859,15 @@ def make_surface_rough(doc, job, tc, name, model_obj, face_idx, p,
     set_prop(op, "BoundaryEnforcement", keep_in)
     # шаг строчек на наклоне — свой, мельче: гребешки между строчками остаются
     # на самой поверхности детали (чистовой обработки нет)
-    set_prop(op, "StepOver", int(stepover if stepover
-                                 else p.get("rough_stepover_slope",
-                                            p["rough_stepover"])))
+    set_prop(op, "StepOver",
+             int(planned(p, name, "шаг_строчек_%",
+                         stepover if stepover else p["rough_stepover"])))
     set_prop(op, "SampleInterval",
              FreeCAD.Units.Quantity(f"{max(float(p['rough_tolerance']), 0.2)} mm"))
     set_prop(op, "DepthOffset", FreeCAD.Units.Quantity(f"{allowance} mm"))
     op.setExpression("StepDown", None)
-    set_prop(op, "StepDown", layer_step(p, start_z, final_z))
+    set_prop(op, "StepDown",
+             layer_step(p, start_z, final_z, planned(p, name, "слой")))
     op.setExpression("StartDepth", None)
     op.StartDepth = start_z
     op.setExpression("FinalDepth", None)
@@ -905,7 +932,8 @@ def make_engrave_sweep(doc, job, tc, name, wire, p, start_z, final_z,
     op.ToolController = tc
     op.BaseShapes = [feat]
     op.setExpression("StepDown", None)
-    set_prop(op, "StepDown", layer_step(p, start_z, final_z))
+    set_prop(op, "StepDown",
+             layer_step(p, start_z, final_z, planned(p, name, "слой")))
     op.setExpression("StartDepth", None)
     op.StartDepth = start_z
     op.setExpression("FinalDepth", None)
@@ -1641,6 +1669,11 @@ def make_bulk_ops(doc, job, tc, shape, p, alw_xy, alw_z, choose):
                 how = "контурный обход"
         if op:
             ops.append(op)
+            _why(p, name, 12, "B07",
+                 "узкая полоса (2A/P < 2Ø) — проход по средней линии; "
+                 "иначе выборка" if narrow else
+                 "зона шире 2Ø — выборка с винтовым заходом",
+                 f"2A/P = {w_eff:.2f} мм при 2Ø = {2.0 * dia:g} мм")
             log(f"{name}: ширина зоны {w_eff:.1f} мм ({how})")
         else:
             log(f"{name}: пустая траектория — объём над деталью не снят")
@@ -1736,11 +1769,21 @@ def make_roughing_ops(doc, job, tc, shape, p):
         return False
 
     skip_ops = set(p.get("skip_ops") or [])
+    plan_ops = p.get("_plan_ops")
 
     def skip(name):
-        """Операция в чёрном списке (указание оператора/ЛЛМ) — не создавать."""
+        """Операцию не создавать: чёрный список или отсутствие её в плане.
+
+        Второе — главный рычаг плана: СОСТАВ программы задаётся тем, какие
+        переходы в нём перечислены. Чистовые пары проверяются по себе, поэтому
+        убрать из плана `FinishSlope1`, оставив `RoughSlope1`, — законный
+        способ отменить чистовой проход по одной грани.
+        """
         if name in skip_ops:
             log(f"{name}: в списке skip_ops — пропущено по указанию")
+            return True
+        if plan_ops is not None and name not in plan_ops:
+            log(f"{name}: в техплане такого перехода нет — пропущено")
             return True
         return False
 
@@ -1754,8 +1797,9 @@ def make_roughing_ops(doc, job, tc, shape, p):
         """(TC, диаметр) для операции: пофрезное переопределение (SET_OP_TOOLS) →
         иначе крупнейшая фреза набора, влезающая в фичу шириной width
         (width=None — выборка/контур, берём крупнейшую)."""
-        if name in overrides:
-            d = min(diams, key=lambda t: abs(t - float(overrides[name])))
+        want = overrides.get(name) or planned(p, name, "инструмент_Ø")
+        if want:
+            d = min(diams, key=lambda t: abs(t - float(want)))
         elif width is None:
             d = diams[0]
         else:
@@ -2013,6 +2057,10 @@ def make_roughing_ops(doc, job, tc, shape, p):
                 # остаётся запасным путём: он держит постоянную нагрузку, и это
                 # нужно там, где виток шёл бы полной шириной по глубокому слою.
                 if single_lap_clears(region, dx / 2.0, alw_xy):
+                    _why(p, name, 12, "B07",
+                         "вырез накрывается одним витком по контуру — "
+                         "контурный проход вместо выборки",
+                         f"Ø{dx:g} по зоне {rb.XLength:.0f}×{rb.YLength:.0f} мм")
                     log(f"{name}: один виток по контуру накрывает вырез целиком")
                     op = make_profile(doc, job, tcx, name, region, p,
                                       hole_top, bb.ZMin, alw_xy, side="Inside")
@@ -3178,6 +3226,16 @@ def mill(doc, feat, p, stock_solid=None):
     # Техплан пишется ПАРАЛЛЕЛЬНО расчёту и ни на что не влияет: это снимок
     # решений, а не их источник. Источником он станет, когда решения начнёт
     # принимать агент.
+    # Входной план: с ним воркер ИСПОЛНЯЕТ решения, без него принимает их сам.
+    if p.get("plan_in"):
+        try:
+            import plan as _plan_mod
+            _data, p["_plan_ops"] = _plan_mod.load(p["plan_in"])
+            log(f"техплан на входе: {len(p['_plan_ops'])} переходов "
+                f"({os.path.basename(p['plan_in'])}) — состав, инструмент, слой "
+                f"и шаг строчек берутся из него")
+        except Exception as e:
+            raise RuntimeError(f"техплан {p['plan_in']} не прочитан: {e}")
     if Plan is not None:
         p["_plan"] = Plan()
         p["_plan"].input(

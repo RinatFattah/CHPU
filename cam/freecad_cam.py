@@ -117,6 +117,8 @@ def generate_gcode_freecad(model_path: str, gcode_path: str) -> int:
         "tool_catalog": {float(k): v for k, v in
                          (getattr(config, "TOOL_CATALOG", None) or {}).items()},
         "spindle_speed": config.SPINDLE_SPEED,
+        "plan_in": (os.path.abspath(config.PLAN_IN)
+                    if getattr(config, "PLAN_IN", "") else ""),
         "material": str(getattr(config, "MATERIAL", "") or ""),
         "machine": str(getattr(config, "MACHINE", "") or ""),
         "safe_height": config.SAFE_HEIGHT,
