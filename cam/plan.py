@@ -53,6 +53,12 @@ def _prop(op, name):
     return _num(getattr(op, name, None))
 
 
+def _ov(regimes, op_name, key):
+    """Переопределение режима для операции из входного плана, иначе None."""
+    tr = (regimes or {}).get(op_name)
+    return _num(tr.get(key)) if tr else None
+
+
 def _feed_mm_min(tc):
     """Подача в мм/мин. У Quantity FreeCAD `.Value` во ВНУТРЕННИХ единицах —
     для скорости это мм/с, и 2000 мм/мин приходят как 33.33. Сначала пробуем
@@ -115,7 +121,7 @@ class Plan:
 
     # ── сбор переходов из готовых операций ────────────────────────────────────
 
-    def collect(self, ops):
+    def collect(self, ops, regimes=None):
         """Переходы вычитываются из САМИХ операций, а не ведутся параллельно.
 
         Параллельная бухгалтерия разошлась бы с тем, что реально построено, —
@@ -150,8 +156,11 @@ class Plan:
                                else _prop(op, "OffsetExtra")),
                 "шаг_строчек_%": _prop(op, "StepOver"),
                 "сторона": getattr(op, "Side", None),
-                "подача": _feed_mm_min(tc),
-                "обороты": _num(getattr(tc, "SpindleSpeed", None)),
+                # Режим берётся из ПРИМЕНЁННОГО переопределения, если оно было:
+                # иначе план сказал бы «12000», а в программе стояло 7984.
+                "подача": (_ov(regimes, name, "подача") or _feed_mm_min(tc)),
+                "обороты": (_ov(regimes, name, "обороты")
+                            or _num(getattr(tc, "SpindleSpeed", None))),
                 "обоснование": self._ground.get(name, []),
             }
             self.data["переходы"].append({k: v for k, v in rec.items()

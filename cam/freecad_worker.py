@@ -2964,6 +2964,54 @@ def _ramp(entry, target, track, angle_deg, min_len=0.5):
     return pts
 
 
+def apply_op_regimes(gcode, plan_ops, feed, rpm):
+    """Подача и обороты ПО ОПЕРАЦИЯМ, из техплана.
+
+    Технолог назначает режим на каждый участок (ОН-1980, этапы VI–IX), а у нас
+    один Job = один инструмент = одна подача на всю программу. Завод так не
+    делает: на окне детали 003 у них 7984 об/мин против 12000 на остальном —
+    это единственное место, где фреза идёт полной шириной, и скорость резания
+    там снижена с 452 до 301 м/мин.
+
+    Пассом по готовому коду, а не свойствами Job: так режим меняется в любом
+    диалекте, не плодит лишних смен инструмента и виден в одном месте.
+
+    Подача МАСШТАБИРУЕТСЯ, а не подставляется: у врезания она вчетверо меньше
+    рабочей, и подстановка одного числа сделала бы врезание рабочим ходом.
+    """
+    import re as _re
+    ops = {k: v for k, v in (plan_ops or {}).items()
+           if v.get("подача") or v.get("обороты")}
+    if not ops or not feed:
+        return gcode
+    begin = _re.compile(r"\(Begin operation: (.+?)\)")
+    fnum = _re.compile(r"F(\d+\.?\d*)")
+    out, scale, changed = [], 1.0, {}
+    for line in gcode.splitlines(True):
+        m = begin.search(line)
+        if m:
+            cur = m.group(1).strip()
+            tr = ops.get(cur) or {}
+            f_new = tr.get("подача")
+            scale = (float(f_new) / float(feed)) if f_new else 1.0
+            out.append(line)
+            s_new = tr.get("обороты")
+            if s_new and abs(float(s_new) - float(rpm)) > 1e-6:
+                out.append("S%g\n" % float(s_new))
+                changed.setdefault(cur, []).append("S%g" % float(s_new))
+            if abs(scale - 1.0) > 1e-9:
+                changed.setdefault(cur, []).append("F x%.3f" % scale)
+            continue
+        if abs(scale - 1.0) > 1e-9:
+            line = fnum.sub(lambda mm: "F%.3f" % (float(mm.group(1)) * scale),
+                            line)
+        out.append(line)
+    if changed:
+        log("режим по операциям: " + "; ".join(
+            "%s %s" % (k, " ".join(v)) for k, v in changed.items()))
+    return "".join(out)
+
+
 def drop_null_moves(gcode):
     """Выбрасывает движения В НИКУДА: цель кадра совпадает с текущей точкой.
 
@@ -3462,12 +3510,13 @@ def mill(doc, feat, p, stock_solid=None):
                      "Ra неизвестны, пара создана глобальным флагом FINISH",
                      f"пара к {_op.Name.replace('Finish', 'Rough', 1)}")
         try:
-            pl = p["_plan"].collect(ops)
+            pl = p["_plan"].collect(ops, p.get("_plan_ops"))
             dst = pl.dump(Plan.path_for(p["gcode_path"]))
             log(f"техплан: {pl.summary()} → {os.path.basename(dst)}")
         except Exception as e:
             log(f"warn: техплан не записан: {e}")
     body = export_gcode(job, ops, p["postprocessor"])
+    body = apply_op_regimes(body, p.get("_plan_ops"), feed, rpm)
     body = insert_tool_passports(body, tools_map, p.get("tool_catalog"))
     if p.get("safe_start_order", True):
         body = reorder_first_positioning(body)

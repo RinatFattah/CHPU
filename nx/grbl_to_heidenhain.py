@@ -157,6 +157,14 @@ def convert(src_lines, name="PROG", tol=0.01, z_datum="top"):
             continue
         if ln.startswith("(") or not ln:
             continue
+        # Смена оборотов ПОСРЕДИ программы. Раньше обороты брались только из
+        # шапки и выставлялись один раз при вызове инструмента, а строка `S…`
+        # молча терялась: у детали 003 окно должно резаться на 7984 против
+        # 12000 на остальном, и в `.h` уходило 12000 везде.
+        ms = re.fullmatch(r"S(\d+(?:\.\d+)?)\s*(?:M0?3)?", ln)
+        if ms:
+            out.append(f"TOOL CALL S{int(float(ms.group(1)))}")
+            continue
         g = re.match(r"G(\d+)", ln)
         code = int(g.group(1)) if g else None
         if code in (0, 1, 2, 3):

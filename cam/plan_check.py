@@ -90,6 +90,15 @@ def check(plan, name=""):
         note.append("группа материала неизвестна — предел t×B не проверяется "
                     f"(в плане: {vin.get('материал') or 'не задан'})")
 
+    # Материал режущей части — из записи инструмента в плане. Без него берётся
+    # быстрорез, и это надо видеть: у алюминия другой колонки нет вовсе.
+    tool_mat = {}
+    for it in (vin.get("инструмент") or []):
+        try:
+            tool_mat[round(float(it.get("Ø")), 3)] = it.get("мат")
+        except (TypeError, ValueError):
+            pass
+
     by_id = {f["id"]: f for f in feats}
     for t in trs:
         tid = t["id"]
@@ -123,9 +132,11 @@ def check(plan, name=""):
             if tt is None:
                 note.append(f"{tid}: t и B из плана не выводятся")
             else:
-                lim = norms.tb_limit(d, group)
+                mat = tool_mat.get(round(float(d), 3)) or "быстрорез"
+                lim = norms.tb_limit(d, group, mat)
                 if lim is None:
-                    note.append(f"{tid}: таблица не покрывает Ø{d} / {group}")
+                    note.append(f"{tid}: таблица не покрывает сочетание "
+                                f"Ø{d} / {group} / {mat} — предел не проверяется")
                 elif tt * BB > lim + 1e-9:
                     msg = (f"{tid}: t×B = {tt * BB:.1f} мм² больше предела "
                            f"{lim} ({group}, Ø{d})")

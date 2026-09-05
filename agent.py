@@ -55,13 +55,21 @@ def block(code):
 
 def facts_11(plan):
     """Числа, которые агент НЕ должен считать сам: t, B, предел, запас."""
-    group = norms.material_group(plan.get("вход", {}).get("материал"))
+    vin = plan.get("вход", {})
+    group = norms.material_group(vin.get("материал"))
+    mats = {}
+    for it in (vin.get("инструмент") or []):
+        try:
+            mats[round(float(it.get("Ø")), 3)] = it.get("мат")
+        except (TypeError, ValueError):
+            pass
     by_id = {f["id"]: f for f in plan.get("фичи", [])}
     rows = []
     for tr in plan.get("переходы", []):
         t, B, basis = plan_check.tb_of(tr)
         d = tr.get("инструмент_Ø")
-        lim = norms.tb_limit(d, group) if group else None
+        mat = mats.get(round(float(d), 3)) if d else None
+        lim = norms.tb_limit(d, group, mat or "быстрорез") if group else None
         f = by_id.get(tr.get("фича")) or {}
         h = None
         if tr.get("Z_от") is not None and tr.get("Z_до") is not None:
@@ -71,9 +79,12 @@ def facts_11(plan):
             "Ø": d, "высота_среза": h, "слой": tr.get("слой"),
             "ходов": tr.get("рабочих_ходов"),
             "t": t, "B": B, "t×B": round(t * B, 2) if t and B else None,
-            "предел": lim, "оценка_t": basis,
+            "предел": lim, "оценка_t": basis, "материал_фрезы": mat,
         })
-    return {"группа_материала": group, "переходы": rows}
+    return {"группа_материала": group, "переходы": rows,
+            "примечание": ("предел = null означает, что ОН-1980 такое сочетание "
+                           "материала детали и материала фрезы НЕ НОРМИРУЕТ; "
+                           "подставлять число из соседней колонки нельзя")}
 
 
 PROMPT_11 = """Ты технолог-фрезеровщик. Работаешь по нормативу, а не по наитию.
