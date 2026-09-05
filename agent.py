@@ -243,6 +243,27 @@ def apply_15(plan, answer):
     return new
 
 
+def post_15(plan):
+    """Правило B11 выполнено? Возврат — список нарушений, пустой если да.
+
+    Признак блока — один и проверяется без модели, поэтому и проверяется без
+    модели. Прогон 55 показал, зачем: на 9 деталях из 12 агент правило применил,
+    а на 025, 027 и 031 просто не заметил окно и оставил полные обороты. Ошибка
+    молчаливая — воксельная сверка режимов не видит, машинное время ISV считает
+    по подачам, и в приёмке такая деталь выглядит безупречной.
+    """
+    by_id = {f["id"]: f for f in plan.get("фичи", [])}
+    bad = []
+    for tr in plan.get("переходы", []):
+        klass = (by_id.get(tr.get("фича")) or {}).get("класс")
+        want = norms.rpm_for(klass)
+        got = tr.get("обороты")
+        if got is None or abs(float(got) - want) > 1.0:
+            bad.append(f"{tr['id']}: класс «{klass}» требует S{want:g}, "
+                       f"в плане S{got}")
+    return bad
+
+
 STEPS = {
     11: {"название": "деление припуска на рабочие ходы",
          "блок": ["B06", "B04"],
@@ -250,8 +271,21 @@ STEPS = {
          "поле": "слой"},
     15: {"название": "обороты шпинделя", "блок": "B11",
          "факты": facts_15, "промпт": PROMPT_15, "патч": apply_15,
-         "поле": "обороты"},
+         "поле": "обороты", "пост": post_15},
 }
+
+
+def post(spec, plan):
+    """Постусловие шага, если оно у шага есть.
+
+    Отличие от `plan_check`: тот проверяет план целиком и на любом входе, а это
+    — выполнено ли правило ИМЕННО ЭТОГО шага. Разделение принципиальное: у
+    плана-заготовки шаг 15 честно лежит в «невыполнено», и объявлять его
+    нарушением плана нельзя, а вот шаг, который агент только что отработал,
+    обязан своё правило выполнить.
+    """
+    f = spec.get("пост")
+    return f(plan) if f else []
 
 
 def new_faults(before, after):
@@ -284,7 +318,7 @@ def run_step(step, plan, provider, model, dry=False, retries=1, answer_file=None
     if answer_file:
         answer = extract_json(io.open(answer_file, encoding="utf-8").read())
         cand = spec["патч"](plan, answer)
-        bad = new_faults(plan, cand)
+        bad = new_faults(plan, cand) + post(spec, cand)
         warn = plan_check.check(cand)[1]
         if bad:
             raise SystemExit("ответ из файла отклонён валидатором: "
@@ -306,7 +340,7 @@ def run_step(step, plan, provider, model, dry=False, retries=1, answer_file=None
         try:
             answer = extract_json(text)
             cand = spec["патч"](plan, answer)
-            bad = new_faults(plan, cand)
+            bad = new_faults(plan, cand) + post(spec, cand)
             warn = plan_check.check(cand)[1]
             if bad:
                 raise ValueError("валидатор: " + "; ".join(bad[:3]))
