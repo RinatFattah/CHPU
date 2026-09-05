@@ -254,6 +254,17 @@ STEPS = {
 }
 
 
+def new_faults(before, after):
+    """Отказы, которых до патча не было.
+
+    Отвергать патч за отказ, который уже был в плане, нельзя: у детали 033
+    вырез 1 x 1 мм не покрыт ни одним переходом с самого начала, и любое решение
+    агента по слою или оборотам отвергалось бы за чужую вину.
+    """
+    was = set(plan_check.check(before)[0])
+    return [m for m in plan_check.check(after)[0] if m not in was]
+
+
 def run_step(step, plan, provider, model, dry=False, retries=1, answer_file=None):
     """Один шаг: факты → промпт → ответ → патч → валидатор. Возврат: (план, запись)."""
     spec = STEPS[step]
@@ -273,7 +284,8 @@ def run_step(step, plan, provider, model, dry=False, retries=1, answer_file=None
     if answer_file:
         answer = extract_json(io.open(answer_file, encoding="utf-8").read())
         cand = spec["патч"](plan, answer)
-        bad, warn, _ = plan_check.check(cand)
+        bad = new_faults(plan, cand)
+        warn = plan_check.check(cand)[1]
         if bad:
             raise SystemExit("ответ из файла отклонён валидатором: "
                              + "; ".join(bad[:3]))
@@ -294,7 +306,8 @@ def run_step(step, plan, provider, model, dry=False, retries=1, answer_file=None
         try:
             answer = extract_json(text)
             cand = spec["патч"](plan, answer)
-            bad, warn, _ = plan_check.check(cand)
+            bad = new_faults(plan, cand)
+            warn = plan_check.check(cand)[1]
             if bad:
                 raise ValueError("валидатор: " + "; ".join(bad[:3]))
         except Exception as e:
@@ -352,6 +365,9 @@ def main():
                                encoding="utf-8"), ensure_ascii=False, indent=1)
     bad, warn, _ = plan_check.check(plan)
     log(f"план записан: {out} (отказов {len(bad)}, предупреждений {len(warn)})")
+    if bad:
+        log("отказы относятся к плану целиком, не обязательно к решениям агента "
+            "— сверьте с планом-заготовкой")
     return 1 if bad else 0
 
 
