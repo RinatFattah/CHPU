@@ -597,6 +597,13 @@ def find_up_faces(shape, bb, include_top=False):
 # С допуском 5 % те же 2.016 делятся на два слоя по 1.008.
 STEPDOWN_SLACK = 0.05
 
+# Ниже этой высоты съём считается нулевым и черновая операция не создаётся.
+# Порог был 1e-6 — машинный ноль, а не технологический: на детали 005 верх
+# материала над гранью отстоял от дна черновой на 2e-6 мм, проверка не
+# срабатывала, и рождалась операция из 34 кадров, снимающая ничего. Ноль
+# толщины у металла не бывает; 0.01 мм — уже величина, а не шум округления.
+ZERO_CUT = 0.01
+
 
 def layer_step(p, start_z, final_z, step=None):
     """Шаг слоя, разложенный по высоте ровно: уровни выходят одинаковыми.
@@ -610,8 +617,15 @@ def layer_step(p, start_z, final_z, step=None):
     if not p.get("even_stepdown", True):
         return step
     total = float(start_z) - float(final_z)
-    if total <= 1e-9 or step <= 1e-9 or total <= step:
+    if total <= 1e-9 or step <= 1e-9:
         return step
+    if total <= step:
+        # Шаг крупнее всей высоты среза: проход всё равно будет один, но
+        # ЗАПИСАННЫЙ шаг тогда врёт о том, как режется переход, и по нему
+        # нельзя ни сверять, ни рассуждать. Отдаём высоту — тот же один проход,
+        # но план говорит правду. Нашёл агент на FinishFace1 (шаг 1.5 при
+        # высоте 0.5), прогон 47_claude_cli.
+        return total
     n = max(1, int(math.ceil(total / step - STEPDOWN_SLACK)))
     # Шаг берём чуть БОЛЬШЕ точного частного, на последнем бите. Иначе
     # `PathUtils.depth_params` ловит двоичную неточность: число полных шагов оно
@@ -2204,7 +2218,7 @@ def make_roughing_ops(doc, job, tc, shape, p):
     for fc in ordered:
         if fc["kind"] == "planar":
             top = local_start(fc["region"])
-            if top is None or fc["final"] >= top - 1e-6:
+            if top is None or fc["final"] >= top - ZERO_CUT:
                 if top is None:
                     log(f"RoughFace (Z={fc['z']:.1f}): материала над гранью нет — "
                         f"пропущено")

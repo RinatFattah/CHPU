@@ -154,9 +154,87 @@ def apply_11(plan, answer):
     return new
 
 
+# ── Шаг 15: обороты шпинделя ─────────────────────────────────────────────────
+
+def facts_15(plan):
+    """Что нужно, чтобы решить про обороты: класс фичи, стратегия, зацепление."""
+    import math
+    by_id = {f["id"]: f for f in plan.get("фичи", [])}
+    rows = []
+    for tr in plan.get("переходы", []):
+        d = tr.get("инструмент_Ø")
+        n = tr.get("обороты")
+        f = by_id.get(tr.get("фича")) or {}
+        rows.append({
+            "переход": tr["id"], "класс": f.get("класс"),
+            "стратегия": tr.get("стратегия"), "Ø": d,
+            "наименьшая_ширина_фичи": f.get("наименьшая_ширина"),
+            "обороты": n,
+            "скорость_резания": (round(math.pi * d * n / 1000.0)
+                                 if d and n else None),
+        })
+    return {"материал": plan.get("вход", {}).get("материал"), "переходы": rows}
+
+
+PROMPT_15 = """Ты технолог-фрезеровщик. Работаешь по правилу, а не по наитию.
+
+ШАГ 15 АЛГОРИТМА: назначить обороты шпинделя каждому переходу.
+
+БЛОК, по которому принимается решение:
+--- начало блока B11 ---
+{block}
+--- конец блока B11 ---
+
+ЧИСЛА ПО ТЕКУЩЕЙ ДЕТАЛИ (посчитаны инструментами):
+{facts}
+
+ТРЕБОВАНИЯ:
+1. Решай ТОЛЬКО по признакам из блока. Своих значений скорости резания не
+   выдумывай: их неоткуда взять и нечем проверить.
+2. Обороты назначай из тех, что блок называет: 12000 или 7984.
+3. Полосы, контуры и проходы по средней линии — обычные обороты.
+4. Состав переходов не меняешь.
+
+ОТВЕТЬ СТРОГО ОДНИМ JSON-объектом, без текста вокруг:
+{{"обороты": {{"ИмяПерехода": число, ...}},
+  "обоснование": {{"ИмяПерехода": "правило и признак, коротко", ...}}}}
+
+Перечисляй только те переходы, которым МЕНЯЕШЬ обороты."""
+
+
+def apply_15(plan, answer):
+    """Патч шага 15 → новый план."""
+    new = copy.deepcopy(plan)
+    vals = answer.get("обороты") or {}
+    why = answer.get("обоснование") or {}
+    if not isinstance(vals, dict):
+        raise ValueError("поле «обороты» должно быть объектом")
+    by_id = {t["id"]: t for t in new["переходы"]}
+    unknown = set(vals) - set(by_id)
+    if unknown:
+        raise ValueError(f"в плане нет переходов: {', '.join(sorted(unknown))}")
+    for name, val in vals.items():
+        try:
+            v = float(val)
+        except (TypeError, ValueError):
+            raise ValueError(f"{name}: обороты «{val}» не число")
+        if v <= 0:
+            raise ValueError(f"{name}: обороты {v}")
+        tr = by_id[name]
+        tr["обороты"] = round(v, 1)
+        tr.setdefault("обоснование", []).append({
+            "шаг": 15, "блок": "B11", "правило": str(why.get(name, ""))[:300],
+            "значение": f"S{v:g}", "вид": "выбор"})
+    return new
+
+
 STEPS = {
     11: {"название": "деление припуска на рабочие ходы", "блок": "B06",
-         "факты": facts_11, "промпт": PROMPT_11, "патч": apply_11},
+         "факты": facts_11, "промпт": PROMPT_11, "патч": apply_11,
+         "поле": "слой"},
+    15: {"название": "обороты шпинделя", "блок": "B11",
+         "факты": facts_15, "промпт": PROMPT_15, "патч": apply_15,
+         "поле": "обороты"},
 }
 
 
@@ -181,8 +259,9 @@ def run_step(step, plan, provider, model, dry=False, retries=1, answer_file=None
         if bad:
             raise SystemExit("ответ из файла отклонён валидатором: "
                              + "; ".join(bad[:3]))
+        fld = spec.get("поле", "слой")
         changed = sum(1 for t, o in zip(cand["переходы"], plan["переходы"])
-                      if t.get("слой") != o.get("слой"))
+                      if t.get(fld) != o.get(fld))
         log(f"шаг {step}: ответ из {os.path.basename(answer_file)} — "
             f"изменено переходов {changed}, предупреждений {len(warn)}")
         return cand, {"шаг": step, "статус": "ок", "изменено": changed,
@@ -204,8 +283,9 @@ def run_step(step, plan, provider, model, dry=False, retries=1, answer_file=None
             last = str(e)[:400]
             log(f"шаг {step}: попытка {attempt + 1} отклонена — {last}")
             continue
+        fld = spec.get("поле", "слой")
         changed = sum(1 for t, o in zip(cand["переходы"], plan["переходы"])
-                      if t.get("слой") != o.get("слой"))
+                      if t.get(fld) != o.get(fld))
         log(f"шаг {step} ({spec['название']}): изменено переходов {changed}, "
             f"предупреждений {len(warn)}")
         return cand, {"шаг": step, "статус": "ок", "изменено": changed,
@@ -225,7 +305,8 @@ def main():
     ap.add_argument("--llm", default="claude",
                     choices=["claude", "gigachat", "openrouter"])
     ap.add_argument("--llm-model", default="")
-    ap.add_argument("--steps", default="11", help="через запятую, напр. 11")
+    ap.add_argument("--steps", default="11,15",
+                    help="через запятую в порядке алгоритма, напр. 11,15")
     ap.add_argument("--dry", action="store_true", help="только показать промпт")
     ap.add_argument("--answer", metavar="FILE",
                     help="взять решение из файла вместо вызова модели "
