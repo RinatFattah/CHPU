@@ -1340,6 +1340,10 @@ def make_clearance_ops(doc, job, shape, p, filled, peri_top, alw_xy, choose):
         for wire in wires:
             n += 1
             name = f"RoughClear{n}"
+            _why(p, name, 12, "B07",
+                 "полоса под обвод ведётся САМИМ путём обвода, обрезанным "
+                 "участками, двумя линиями: полоса шире фрезы ровно на припуск",
+                 f"{len(offs)} линии обвода, слой {step:g} мм")
             _feat(p, name, "полоса под обвод контура",
                   длина_линии=wire.Length, Z_от=z_top, Z_до=peri_top,
                   слой=step)
@@ -1908,6 +1912,10 @@ def make_roughing_ops(doc, job, tc, shape, p):
             op = make_surface_rough(doc, job, tcx, name, jm, face_idx, p,
                                     top, final_z, alw, single_pass, stepover)
             if op:
+                _why(p, name, 12, "B07",
+                     "3D-проход по поверхности — остаточный случай: грань не "
+                     "цилиндр с горизонтальной осью и не сводится к полосе",
+                     f"Ø{dx:g}, ширина зоны {width:.1f} мм")
                 return op, dx
             if dx != tries[-1][1]:
                 log(f"{name}: фреза Ø{dx:g} не дала траектории — пробую мельче")
@@ -2001,6 +2009,10 @@ def make_roughing_ops(doc, job, tc, shape, p):
         bulk, bulk_floor = make_bulk_ops(doc, job, tc, shape, p,
                                          alw_xy, alw_z, choose_tc)
         if bulk:
+            _why(p, bulk[0].Name, 7, "B04",
+                 "съём объёма над деталью — ПЕРВАЯ стадия: иначе его делают "
+                 "операции по граням, каждая заново проходя весь столб над "
+                 "своей гранью", "стадия 1 из 6")
             ops.extend(bulk)
             p["_bulk_floor"] = bulk_floor
             write_partial(job, ops, p, "снят объём над деталью")
@@ -2014,6 +2026,10 @@ def make_roughing_ops(doc, job, tc, shape, p):
         clr = make_clearance_ops(doc, job, shape, p, filled, peri_top,
                                  alw_xy, choose_tc)
         if clr:
+            _why(p, clr[0].Name, 7, "B04",
+                 "полоса под обвод очищается ДО контурного прохода: иначе обвод "
+                 "режет стоящий остаток боком, а сверка этого не показывает",
+                 "стадия 2 из 6")
             ops.extend(clr)
             write_partial(job, ops, p, "очищена полоса под обвод контура")
 
@@ -2065,9 +2081,16 @@ def make_roughing_ops(doc, job, tc, shape, p):
                     op = make_profile(doc, job, tcx, name, region, p,
                                       hole_top, bb.ZMin, alw_xy, side="Inside")
                 else:
+                    _why(p, name, 12, "B07",
+                         "вырез шире одного витка — карман витками по контуру, "
+                         "как заводской CAVITY_MILL",
+                         f"Ø{dx:g} по зоне {rb.XLength:.0f}×{rb.YLength:.0f} мм")
                     op = make_pocket(doc, job, tcx, name, region, p,
                                      hole_top, bb.ZMin, alw_xy)
             if not op:
+                _why(p, name, 12, "B07",
+                     "витки по контуру пути не дали — запасной путь, выборка "
+                     "с постоянной нагрузкой", f"Ø{dx:g}")
                 op = make_adaptive(doc, job, tcx, name, region, p,
                                    hole_top, bb.ZMin, alw_xy)
             if not op and width > dx + 0.2:
@@ -2249,6 +2272,10 @@ def make_roughing_ops(doc, job, tc, shape, p):
             fr = (fillet_frame(fc["face"], shape)
                   if p.get("fillet_profile", True) else None)
             if fr is not None:
+                _why(p, name, 12, "B07",
+                     "грань — цилиндр с горизонтальной осью: ход ПО СЕЧЕНИЮ и "
+                     "шаг вдоль ребра, а не 3D-проход сверху",
+                     f"R{fr[3]:.2f}, площадь {fc['area']:.0f} мм²")
                 tcx, dx = choose_tc(name, None)
                 ftol = float(p.get("fillet_tolerance", 0.01))
                 made = []
@@ -2351,6 +2378,9 @@ def make_roughing_ops(doc, job, tc, shape, p):
             # силуэт (filled) посчитаны выше — по ним же строилась полоса,
             # которую очистила стадия RoughClear.
             tcx, _ = choose_tc("RoughPerimeter", None)
+            _why(p, "RoughPerimeter", 7, "B04",
+                 "внешний контур ПОСЛЕДНИМ: пока он не пройден, деталь жёстко "
+                 "держится в раме заготовки", "стадия 6 из 6")
             op = make_profile(doc, job, tcx, "RoughPerimeter", filled, p,
                               peri_top, bb.ZMin, alw_xy)
             if op:
@@ -3405,6 +3435,32 @@ def mill(doc, feat, p, stock_solid=None):
     tools_map = {getattr(t, "ToolNumber", 0): t.Tool.Diameter.Value
                  for t in ([tc] + list(used.values()))}
     if p.get("_plan") is not None:
+        # Припуск проверяется по B05 на КАЖДОЙ операции, где он есть. Это
+        # «проверка», а не «выбор»: величину задаёт конфиг, блок лишь говорит,
+        # что она в норме. Смешивать их нельзя — иначе по обоснованию не
+        # отличить решение от контроля.
+        for _op in ops:
+            _alw = getattr(getattr(_op, "StockToLeave", None), "Value", None)
+            if _alw is None:
+                _alw = getattr(getattr(_op, "OffsetExtra", None), "Value", None)
+            _tc = getattr(_op, "ToolController", None)
+            _d = getattr(getattr(getattr(_tc, "Tool", None), "Diameter", None),
+                         "Value", None)
+            if _alw and _d:
+                _why(p, _op.Name, 8, "B05",
+                     "припуск под чистовую ≤ 0,2 Ø по ширине",
+                     f"{_alw:g} мм = {_alw / _d:.3f} Ø при пределе 0,200 Ø",
+                     вид="проверка")
+            # Чистовой проход. Обоснование честное и неприятное: этап
+            # обработки по B03 задаётся квалитетом и Ra, которых у нас нет,
+            # поэтому пара появляется по ГЛОБАЛЬНОМУ флагу, а не по требованию
+            # к этой поверхности. Пусть это будет видно в плане, а не в голове.
+            if _op.Name.startswith("Finish"):
+                _why(p, _op.Name, 3, "B03",
+                     "чистовой — пара к черновой по той же фиче и в тех же "
+                     "границах, припуск 0. ОСНОВАНИЕ НЕ С ЧЕРТЕЖА: квалитет и "
+                     "Ra неизвестны, пара создана глобальным флагом FINISH",
+                     f"пара к {_op.Name.replace('Finish', 'Rough', 1)}")
         try:
             pl = p["_plan"].collect(ops)
             dst = pl.dump(Plan.path_for(p["gcode_path"]))
