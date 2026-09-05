@@ -2309,10 +2309,20 @@ def make_roughing_ops(doc, job, tc, shape, p):
                     made.append(op)
                 fname = name.replace("Rough", "Finish", 1)
                 if op and fin and alw_z > 1e-6 and not skip(fname):
+                    fs = float(p.get("fillet_finish_feed", 0.5))
                     op2 = make_fillet_op(
                         doc, job, tcx, fr, fname, p, top, 0.0, ftol, ftol,
-                        blend=alw_z,
-                        feed_scale=float(p.get("fillet_finish_feed", 0.5)))
+                        blend=alw_z, feed_scale=fs)
+                    # Подача у этого прохода СВОЯ — план обязан её знать, иначе
+                    # он врёт о режиме, а пасс режимов пересчитает её ещё раз.
+                    p.setdefault("_op_feed", {})[fname] = (
+                        float(p["feed_rate"]) * fs)
+                    _why(p, fname, 14, "B12",
+                         "чистовой проход по криволинейной грани — половина "
+                         "рабочей подачи; черновая по той же грани и контурные "
+                         "чистовые идут на полной",
+                         f"F{float(p['feed_rate']) * fs:g} против "
+                         f"F{float(p['feed_rate']):g}")
                     if op2:
                         made.append(op2)
                 if made:
@@ -2987,7 +2997,7 @@ def _ramp(entry, target, track, angle_deg, min_len=0.5):
     return pts
 
 
-def apply_op_regimes(gcode, plan_ops, feed, rpm):
+def apply_op_regimes(gcode, plan_ops, feed, rpm, op_feed=None):
     """Подача и обороты ПО ОПЕРАЦИЯМ, из техплана.
 
     Технолог назначает режим на каждый участок (ОН-1980, этапы VI–IX), а у нас
@@ -3021,7 +3031,11 @@ def apply_op_regimes(gcode, plan_ops, feed, rpm):
             cur = m.group(1).strip()
             tr = ops.get(cur) or {}
             f_new = tr.get("подача")
-            scale = (float(f_new) / float(feed)) if f_new else 1.0
+            # Масштаб считается от подачи ЭТОЙ операции, а не от общей: проход
+            # по сечению скругления уже печатает половинную, и деление на общую
+            # ополовинило бы её второй раз (F1000 из плана дало бы F500).
+            f_own = float((op_feed or {}).get(cur) or feed)
+            scale = (float(f_new) / f_own) if f_new else 1.0
             out.append(line)
             want = float(tr.get("обороты") or rpm or 0) or None
             if want and cur_rpm and abs(want - cur_rpm) > 1e-6:
@@ -3557,13 +3571,24 @@ def mill(doc, feat, p, stock_solid=None):
                      "Ra неизвестны, пара создана глобальным флагом FINISH",
                      f"пара к {_op.Name.replace('Finish', 'Rough', 1)}")
         try:
-            pl = p["_plan"].collect(ops, p.get("_plan_ops"))
+            pl = p["_plan"].collect(ops, p.get("_plan_ops"),
+                                    p.get("_op_feed"))
+            # Подачу воркер РАЗЛИЧАЕТ и сам, без входного плана: чистовой проход
+            # по скруглению идёт на половинной (B12, как у завода). Раз
+            # результат шага в плане есть и обоснование к нему привязано,
+            # держать шаг в «невыполнено» нельзя — список врал бы в другую
+            # сторону. Проверка стоит здесь, а не в самом списке: тот пишется
+            # при настройке задания, когда операций ещё нет.
+            if any(abs(float(v) - feed) > 1e-6
+                   for v in (p.get("_op_feed") or {}).values()):
+                p["_plan"].done(14)
             dst = pl.dump(Plan.path_for(p["gcode_path"]))
             log(f"техплан: {pl.summary()} → {os.path.basename(dst)}")
         except Exception as e:
             log(f"warn: техплан не записан: {e}")
     body = export_gcode(job, ops, p["postprocessor"])
-    body = apply_op_regimes(body, p.get("_plan_ops"), feed, rpm)
+    body = apply_op_regimes(body, p.get("_plan_ops"), feed, rpm,
+                            p.get("_op_feed"))
     body = insert_tool_passports(body, tools_map, p.get("tool_catalog"))
     if p.get("safe_start_order", True):
         body = reorder_first_positioning(body)
