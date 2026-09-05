@@ -644,6 +644,9 @@ def make_adaptive(doc, job, tc, name, region_shape, p, start_z, final_z, allowan
     детали дают незамкнутый контур (Path.Area: «ccurve not closed»), и операция
     молча выдаёт пустую траекторию."""
     final_z = max(final_z, p.get("_floor_limit", final_z))  # не ниже стола
+    # Припуск тоже может прийти из техплана: шаг 8 алгоритма назначает его НА
+    # ПОВЕРХНОСТЬ, а не на деталь целиком (B05 — предел 0,2 Ø по ширине).
+    allowance = float(planned(p, name, "припуск_XY", allowance))
     region = doc.addObject("Part::Feature", f"Region{name}")
     region.Shape = region_shape
     doc.recompute()
@@ -797,6 +800,9 @@ def make_profile(doc, job, tc, name, region_shape, p, start_z, final_z, allowanc
     негде сделать винтовой заход, а контурному проходу заход не нужен —
     он идёт по воздуху вокруг заготовки и срезает выступающий материал."""
     final_z = max(final_z, p.get("_floor_limit", final_z))  # не ниже стола
+    # Припуск тоже может прийти из техплана: шаг 8 алгоритма назначает его НА
+    # ПОВЕРХНОСТЬ, а не на деталь целиком (B05 — предел 0,2 Ø по ширине).
+    allowance = float(planned(p, name, "припуск_XY", allowance))
     region = doc.addObject("Part::Feature", f"Region{name}")
     region.Shape = region_shape
     doc.recompute()
@@ -838,6 +844,9 @@ def make_surface_rough(doc, job, tc, name, model_obj, face_idx, p,
     заводская программа: у каждого элемента пара «черновая с припуском →
     чистовая» (`RADIYS_1_PR0.5` → `RADIYS_1_CHIST`)."""
     final_z = max(final_z, p.get("_floor_limit", final_z))  # не ниже стола
+    # Припуск тоже может прийти из техплана: шаг 8 алгоритма назначает его НА
+    # ПОВЕРХНОСТЬ, а не на деталь целиком (B05 — предел 0,2 Ø по ширине).
+    allowance = float(planned(p, name, "припуск_XY", allowance))
     import Path.Op.Surface as Surface
     op = Surface.Create(name, parentJob=job)
     op.ToolController = tc
