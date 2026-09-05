@@ -3001,6 +3001,11 @@ def apply_op_regimes(gcode, plan_ops, feed, rpm):
     begin = _re.compile(r"\(Begin operation: (.+?)\)")
     fnum = _re.compile(r"F(\d+\.?\d*)")
     out, scale, changed = [], 1.0, {}
+    # Обороты МОДАЛЬНЫ: выставленные один раз, они держатся до следующей смены.
+    # Поэтому мало снизить их на окне — надо вернуть на следующей операции,
+    # иначе вся остальная программа доедет на пониженных. Ведём текущее
+    # значение и печатаем строку только когда оно меняется.
+    cur_rpm = float(rpm) if rpm else None
     for line in gcode.splitlines(True):
         m = begin.search(line)
         if m:
@@ -3009,10 +3014,11 @@ def apply_op_regimes(gcode, plan_ops, feed, rpm):
             f_new = tr.get("подача")
             scale = (float(f_new) / float(feed)) if f_new else 1.0
             out.append(line)
-            s_new = tr.get("обороты")
-            if s_new and abs(float(s_new) - float(rpm)) > 1e-6:
-                out.append("S%g\n" % float(s_new))
-                changed.setdefault(cur, []).append("S%g" % float(s_new))
+            want = float(tr.get("обороты") or rpm or 0) or None
+            if want and cur_rpm and abs(want - cur_rpm) > 1e-6:
+                out.append("S%g\n" % want)
+                changed.setdefault(cur, []).append("S%g" % want)
+                cur_rpm = want
             if abs(scale - 1.0) > 1e-9:
                 changed.setdefault(cur, []).append("F x%.3f" % scale)
             continue
