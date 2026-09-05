@@ -31,8 +31,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from auto_fix import ask_llm, extract_json          # noqa: E402
 from cam import norms, plan_check                   # noqa: E402
 
-BLOCKS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                          "..", "База знаний", "Агент-технолог", "Блоки")
+# База грунтинга лежит В РЕПОЗИТОРИИ: она часть системы, а не заметка о ней, и
+# версионируется вместе с кодом, который по ней проверяет.
+BLOCKS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "knowledge")
 
 
 def log(msg):
@@ -148,7 +149,7 @@ STEPS = {
 }
 
 
-def run_step(step, plan, provider, model, dry=False, retries=1):
+def run_step(step, plan, provider, model, dry=False, retries=1, answer_file=None):
     """Один шаг: факты → промпт → ответ → патч → валидатор. Возврат: (план, запись)."""
     spec = STEPS[step]
     facts = spec["факты"](plan)
@@ -158,6 +159,23 @@ def run_step(step, plan, provider, model, dry=False, retries=1):
     if dry:
         print(prompt)
         return plan, {"шаг": step, "статус": "dry"}
+
+    # Готовый ответ из файла: тот же путь, что и у модели, — те же валидаторы,
+    # тот же патч. Нужен, когда решение принимает человек или агент, у которого
+    # нет доступа к CLI: `--dry` печатает промпт, ответ кладётся в файл.
+    if answer_file:
+        answer = extract_json(io.open(answer_file, encoding="utf-8").read())
+        cand = spec["патч"](plan, answer)
+        bad, warn, _ = plan_check.check(cand)
+        if bad:
+            raise SystemExit("ответ из файла отклонён валидатором: "
+                             + "; ".join(bad[:3]))
+        changed = sum(1 for t, o in zip(cand["переходы"], plan["переходы"])
+                      if t.get("слой") != o.get("слой"))
+        log(f"шаг {step}: ответ из {os.path.basename(answer_file)} — "
+            f"изменено переходов {changed}, предупреждений {len(warn)}")
+        return cand, {"шаг": step, "статус": "ок", "изменено": changed,
+                      "источник": answer_file, "ответ": answer}
 
     last = ""
     for attempt in range(retries + 1):
@@ -198,6 +216,9 @@ def main():
     ap.add_argument("--llm-model", default="")
     ap.add_argument("--steps", default="11", help="через запятую, напр. 11")
     ap.add_argument("--dry", action="store_true", help="только показать промпт")
+    ap.add_argument("--answer", metavar="FILE",
+                    help="взять решение из файла вместо вызова модели "
+                         "(проходит те же валидаторы)")
     a = ap.parse_args()
 
     plan = json.load(io.open(a.plan, encoding="utf-8"))
@@ -208,7 +229,8 @@ def main():
 
     journal = []
     for s in steps:
-        plan, rec = run_step(s, plan, a.llm, a.llm_model, a.dry)
+        plan, rec = run_step(s, plan, a.llm, a.llm_model, a.dry,
+                             answer_file=a.answer)
         journal.append(rec)
     if a.dry:
         return 0
