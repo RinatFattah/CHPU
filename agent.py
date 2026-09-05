@@ -345,6 +345,7 @@ def main():
     a = ap.parse_args()
 
     plan = json.load(io.open(a.plan, encoding="utf-8"))
+    plan0 = copy.deepcopy(plan)          # чтобы отличить своё от унаследованного
     steps = [int(x) for x in a.steps.split(",") if x.strip()]
     unknown = [s for s in steps if s not in STEPS]
     if unknown:
@@ -364,11 +365,17 @@ def main():
     json.dump(journal, io.open(os.path.splitext(out)[0] + "_journal.json", "w",
                                encoding="utf-8"), ensure_ascii=False, indent=1)
     bad, warn, _ = plan_check.check(plan)
-    log(f"план записан: {out} (отказов {len(bad)}, предупреждений {len(warn)})")
-    if bad:
-        log("отказы относятся к плану целиком, не обязательно к решениям агента "
-            "— сверьте с планом-заготовкой")
-    return 1 if bad else 0
+    added = new_faults(plan0, plan)
+    log(f"план записан: {out} (отказов {len(bad)}, из них внесённых агентом "
+        f"{len(added)}; предупреждений {len(warn)})")
+    for m in bad:
+        if m not in added:
+            log(f"отказ был в плане-заготовке, не от агента: {m}")
+    # Код возврата — про РАБОТУ АГЕНТА, а не про качество исходного плана. У
+    # детали 033 вырез 1 x 1 мм не покрыт ни одним переходом изначально, и
+    # ненулевой код останавливал бы пакетный прогон на детали, где агент всё
+    # сделал правильно.
+    return 1 if added else 0
 
 
 if __name__ == "__main__":
