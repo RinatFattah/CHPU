@@ -166,6 +166,8 @@ def generate_gcode_freecad(model_path: str, gcode_path: str) -> int:
         "finish": bool(getattr(config, "FINISH", False)),
         "finish_stepover": int(getattr(config, "FINISH_STEPOVER", 25)),
         "surface_keep_inside": getattr(config, "SURFACE_KEEP_INSIDE", True),
+        "surface_boundary_enforce": bool(
+            getattr(config, "SURFACE_BOUNDARY_ENFORCE", True)),
         "skip_formed_faces": bool(getattr(config, "SKIP_FORMED_FACES", True)),
         "formed_face_tol": float(getattr(config, "FORMED_FACE_TOL", 0.05)),
         "safe_start_order": bool(getattr(config, "SAFE_START_ORDER", True)),
