@@ -830,6 +830,21 @@ def make_profile(doc, job, tc, name, region_shape, p, start_z, final_z, allowanc
     return op if n > 2 else None
 
 
+def _b12_feed(p, name):
+    """Половинная подача чистового прохода по криволинейной грани (блок B12).
+
+    Записывается в план и доводится до кода пассом режимов — так правило живёт
+    в ОДНОМ месте, независимо от того, какой операцией построен проход.
+    """
+    f = float(p["feed_rate"]) * float(p.get("fillet_finish_feed", 0.5))
+    p.setdefault("_op_feed", {})[name] = f
+    _why(p, name, 14, "B12",
+         "чистовой проход по криволинейной грани — половина рабочей подачи; "
+         "черновая по той же грани и контурные чистовые идут на полной",
+         f"F{f:g} против F{float(p['feed_rate']):g}")
+    return f
+
+
 def make_surface_rough(doc, job, tc, name, model_obj, face_idx, p,
                        start_z, final_z, allowance, single_pass=False,
                        stepover=None):
@@ -1983,6 +1998,11 @@ def make_roughing_ops(doc, job, tc, shape, p):
                                 single_pass=True, stepover=fin_stepover)
         if op2:
             ops.append(op2)
+            # B12: чистовой проход по КРИВОЛИНЕЙНОЙ грани идёт на половинной
+            # подаче. Плоскость (FinishFace) — на полной: у завода верх стенки
+            # чистится на 2000, а скругления на 1000.
+            if name.startswith("FinishSlope"):
+                _b12_feed(p, name)
         else:
             log(f"{name}: пустая траектория — чистового прохода не будет")
 
@@ -2309,20 +2329,12 @@ def make_roughing_ops(doc, job, tc, shape, p):
                     made.append(op)
                 fname = name.replace("Rough", "Finish", 1)
                 if op and fin and alw_z > 1e-6 and not skip(fname):
-                    fs = float(p.get("fillet_finish_feed", 0.5))
                     op2 = make_fillet_op(
                         doc, job, tcx, fr, fname, p, top, 0.0, ftol, ftol,
-                        blend=alw_z, feed_scale=fs)
-                    # Подача у этого прохода СВОЯ — план обязан её знать, иначе
-                    # он врёт о режиме, а пасс режимов пересчитает её ещё раз.
-                    p.setdefault("_op_feed", {})[fname] = (
-                        float(p["feed_rate"]) * fs)
-                    _why(p, fname, 14, "B12",
-                         "чистовой проход по криволинейной грани — половина "
-                         "рабочей подачи; черновая по той же грани и контурные "
-                         "чистовые идут на полной",
-                         f"F{float(p['feed_rate']) * fs:g} против "
-                         f"F{float(p['feed_rate']):g}")
+                        blend=alw_z)
+                    # Подачу назначает блок, а доводит пасс режимов — общим
+                    # путём для обеих реализаций прохода.
+                    _b12_feed(p, fname)
                     if op2:
                         made.append(op2)
                 if made:
@@ -3015,6 +3027,12 @@ def apply_op_regimes(gcode, plan_ops, feed, rpm, op_feed=None):
     import re as _re
     ops = {k: v for k, v in (plan_ops or {}).items()
            if v.get("подача") or v.get("обороты")}
+    # Решения блока (сейчас это подача чистовых по скруглениям) применяются и
+    # без входного плана: правило принято воркером, а довести код до него может
+    # только этот пасс — у Path.Op.Surface своей подачи нет, она берётся из
+    # инструмента.
+    for k, f in (op_feed or {}).items():
+        ops.setdefault(k, {}).setdefault("подача", f)
     if not ops or not feed:
         return gcode
     begin = _re.compile(r"\(Begin operation: (.+?)\)")
@@ -3031,11 +3049,7 @@ def apply_op_regimes(gcode, plan_ops, feed, rpm, op_feed=None):
             cur = m.group(1).strip()
             tr = ops.get(cur) or {}
             f_new = tr.get("подача")
-            # Масштаб считается от подачи ЭТОЙ операции, а не от общей: проход
-            # по сечению скругления уже печатает половинную, и деление на общую
-            # ополовинило бы её второй раз (F1000 из плана дало бы F500).
-            f_own = float((op_feed or {}).get(cur) or feed)
-            scale = (float(f_new) / f_own) if f_new else 1.0
+            scale = (float(f_new) / float(feed)) if f_new else 1.0
             out.append(line)
             want = float(tr.get("обороты") or rpm or 0) or None
             if want and cur_rpm and abs(want - cur_rpm) > 1e-6:
@@ -3145,6 +3159,9 @@ def optimize_links(gcode, stock_map, vert_feed, clearance=1.0, air_cuts=False,
     # абсолютные величины нельзя.
     side_max, side_at, side_op, cur_op = 0.0, None, None, None
     side_over, side_lim_at = 0.0, None
+    # Худшей точки мало: она не отличает угловой лоскот от стенки во всю длину.
+    # Копим по операциям число кадров и длину хода, идущего боком.
+    side_hits = {}
 
     def head_of(code):
         h = _re.sub(r"\s*Z-?[\d.]+", "", code.split("F")[0]).strip()
@@ -3254,11 +3271,20 @@ def optimize_links(gcode, stock_map, vert_feed, clearance=1.0, air_cuts=False,
             # дуги и на обводе контура заезжает в тело детали — ложная тревога
             # на каждом скруглении угла.
             pts_probe = [(x, y), (nx_, ny_), _mid_point(b, x, y, nx_, ny_)]
+            worst = 0.0
             for px, py in pts_probe:
                 d = stock_map.top(px, py, pr) - zb
                 if d > lim_here and d - lim_here > side_over:
                     side_over, side_lim_at = d - lim_here, lim_here
                     side_max, side_at, side_op = d, (px, py, zb), cur_op
+                if d > lim_here:
+                    worst = max(worst, d)
+            if worst:
+                h = side_hits.setdefault(cur_op or "?",
+                                         {"кадров": 0, "мм": 0.0, "макс": 0.0})
+                h["кадров"] += 1
+                h["мм"] += math.hypot(nx_ - x, ny_ - y)
+                h["макс"] = max(h["макс"], worst)
 
         stock_map.cut(x, y, nx_, ny_, min(z, nz_), cur_r)
 
@@ -3270,6 +3296,10 @@ def optimize_links(gcode, stock_map, vert_feed, clearance=1.0, air_cuts=False,
             f"{side_max:.1f} мм при пороге {side_lim_at:.1f} для этой операции: "
             f"материал должна была снять более ранняя операция, и сверка такого "
             f"не покажет — она меряет тело детали")
+        log("боковой рез, объём беды: " + "; ".join(
+            f"{k} {v['кадров']} кадров, {v['мм']:.0f} мм хода, до {v['макс']:.1f} мм вглубь"
+            for k, v in sorted(side_hits.items(),
+                               key=lambda kv: -kv[1]["мм"])))
 
     if n_cut or n_all or n_air or n_ramp:
         log(f"подвод: {n_all} спусков целиком по воздуху, {n_cut} укорочено, "
