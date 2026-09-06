@@ -892,9 +892,16 @@ def make_surface_rough(doc, job, tc, name, model_obj, face_idx, p,
     # грани: зареза нет, зато вдоль края остаётся полоска в радиус фрезы —
     # поэтому вызывающий перебирает фрезы от крупной к мелкой.
     keep_in = bool(p.get("surface_keep_inside", False))
+    # Третья комбинация: граница РАСШИРЕНА на радиус И соблюдается. Без запрета
+    # (`surface_boundary_enforce: false` — прежнее поведение) сканирование идёт
+    # по габариту ЗАГОТОВКИ, и строчки, целиком лежащие вне грани, опускаются на
+    # дно прохода: на детали 025 это 82 и 93 мм хода по уровню полки сквозь
+    # неочищенный угол заготовки высотой 22.6 мм — боковой рез, которого сверка
+    # не видит.
     set_prop(op, "BoundaryAdjustment",
              FreeCAD.Units.Quantity(f"{0.0 if keep_in else tool_r} mm"))
-    set_prop(op, "BoundaryEnforcement", keep_in)
+    set_prop(op, "BoundaryEnforcement",
+             keep_in or bool(p.get("surface_boundary_enforce", True)))
     # шаг строчек на наклоне — свой, мельче: гребешки между строчками остаются
     # на самой поверхности детали (чистовой обработки нет)
     set_prop(op, "StepOver",
